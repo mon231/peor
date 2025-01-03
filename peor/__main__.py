@@ -14,7 +14,7 @@ def parse_arguments():
 
 def main():
     args = parse_arguments()
-    raise NotImplementedError('Tools is in WIP state')
+    raise NotImplementedError('Tool is in WIP state')
 
 
 if __name__ == '__main__':

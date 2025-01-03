@@ -16,5 +16,5 @@ setuptools.setup(
     long_description_content_type='text/markdown',
     url = "https://github.com/mon231/peor/",
     description = "PortableExecutable shellcodifier",
-    entry_points = {'console_scripts': ['peor=peor.main:main']}
+    entry_points = {'console_scripts': ['peor=peor.__main__:main']}
 )

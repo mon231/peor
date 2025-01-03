@@ -5,7 +5,7 @@ This project is made to create an embedded shellcode out of PE files. <br />
 *NOTE* that `PEOR` isn't made to easily shellcodify Windows-executables, <br />
 As we won't resolve imports for you. For such utility, use [pe2shellcode](https://github.com/hasherezade/pe_to_shellcode).
 
-## What can PERO do?
+## What can PEOR do?
 `PEOR` is the worst PE shellcodifier! <br />
 We do not resolve imports, nor optimize your PE-sections. <br />
 This project is intended to shellcodify PE files for embedded usage, <br />

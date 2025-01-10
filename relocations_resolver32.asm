@@ -4,75 +4,104 @@ address_of_shellcode:
     call get_eip
 
 get_eip:
-    pop ebx                     ; Get current EIP
+    pop ebx
 
 find_pe_address:
-    mov edi, ebx                ; Store EIP in EDI
+    mov edi, ebx
     add edi, address_of_pe - get_eip
 
-validate_pe_header:
-    cmp word [edi], 0x5A4D      ; Look for MZ signature
-    jne validate_pe_header      ; Keep looking (infinite) if not found PE
-    mov ebx, edi                ; Store PE base
+    mov ecx, edi
+    mov ebx, ecx
 
-skip_dos_header:
-    mov eax, [edi + 0x3C]       ; Get PE header offset
-    add edi, eax                ; Point to PE header
+    mov eax, 5A4Dh
+    cmp [ebx], ax
 
-process_relocs:
-    mov esi, [edi + 0xA0]       ; Get relocation table RVA
-    test esi, esi               ; Check if there is a relocation table
+    jnz bad_quit
+
+check_first_header:
+    mov esi, [ebx+3Ch]
+    add esi, ebx
+
+    mov [esp + 32], esi
+    cmp dword [esi], 4550h
+
+    jnz bad_quit
+
+check_second_header:
+    mov     eax, ebx
+    cdq
+
+    sub     eax, [esi+34h]
+    mov     ecx, eax
+    mov     [esp+24], eax
+    sbb     edx, 0
+    or      ecx, edx
+
+    mov     [esp+28], edx
     jz pe_entry_jumper
 
-    add esi, ebx                ; Get VA of reloc table
+    cmp     dword [esi+0A4h], 0
+    jz pe_entry_jumper
 
-reloc_block:
-    mov ecx, [esi]              ; Get block RVA
-    test ecx, ecx               ; Check if this is the last block
-    jz pe_entry_jumper          ; If RVA is 0, we're done with all blocks
+    mov     esi, [esi+0A0h]
+    add     esi, ebx
+    mov     eax, [esi+4]
+    lea     ecx, [esi+4]
+    mov     [esp+16], ecx
 
-    push esi                    ; Save pointer to current block
-    mov edx, ecx                ; Save block RVA
+    test    eax, eax
+    jz pe_entry_jumper
+    nop
 
-    mov ecx, [esi + 4]          ; Get block size
-    add esi, 8                  ; Skip to first entry
-    sub ecx, 8                  ; Adjust count
+iteration:
+    mov     edx, [esi]
+    lea     edi, [eax-8]
+    shr     edi, 1
+    mov     [esp+20], edx
+    mov     edx, 0
+    jz iterate
 
-next_reloc:
-    movzx eax, word [esi]       ; Get relocation entry
+inner_iteration:
+    movzx   eax, word [esi+edx*2+8]
+    mov cx, ax
+    shr cx, 0Ch
+    cmp cx, 3
+    jz relocate
 
-    push ecx                    ; Save count
-    mov ecx, eax                ; Save full entry
-    shr ecx, 12                 ; Get relocation type
-    cmp ecx, 3                  ; Check if IMAGE_REL_BASED_HIGHLOW
-    pop ecx                     ; Restore count
-    jne skip_reloc
+    cmp cx, 0Ah
+    jnz inner_iter
 
-    and eax, 0x0FFF             ; Mask to get offset
-    add eax, edx                ; Add block RVA
-    add eax, ebx                ; Add base address
+relocate:
+    mov ecx, [esp+24]
+    and eax, 0FFFh
+    add eax, [esp+20]
+    add eax, ebx
+    add [eax], ecx
+    mov ecx, [esp+28]
+    adc [eax+4], ecx
 
-    test eax, eax               ; Check if eax is not null
-    jz skip_reloc               ; Skip if eax is null
+inner_iter:
+    inc edx
+    cmp edx, edi
+    jb inner_iteration
+    mov ecx, [esp+16]
 
-    test eax, 0xFFFFF000        ; Check if eax is within a valid range
-    jnz skip_reloc              ; Skip if eax is out of range
+iterate:
+    add     esi, [ecx]
+    mov     eax, [esi+4]
+    lea     ecx, [esi+4]
+    mov     [esp+16], ecx
 
-    mov edx, [eax]              ; Get value to fix
-    add edx, ebx                ; Add delta
-    mov [eax], edx              ; Write fixed-up value
+    test    eax, eax
+    jnz iteration
 
-skip_reloc:
-    add esi, 2                ; Next entry
-    sub ecx, 2                ; Decrease count
-    jnz next_reloc            ; Process next if not done
-
-    pop esi                   ; Restore block pointer
-    add esi, [esi + 4]        ; Move to next block using current block's size
-    jmp reloc_block           ; Process next block
+bad_quit:
+    hlt
 
 pe_entry_jumper:
-    mov eax, [edi + 0x28]     ; Get the address of the entry point (RVA)
+    ; TODO: use correct stuff
+    mov esi, [esp + 20h]
+    mov eax, [esi + 28h]     ; Get the address of the entry point (RVA)
     add eax, ebx              ; Convert to VA
     jmp eax                   ; Jump to the entry point of the PE
 

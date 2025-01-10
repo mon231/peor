@@ -13,96 +13,93 @@ find_pe_address:
     mov ecx, edi
     mov ebx, ecx
 
-    mov eax, 5A4Dh
-    cmp [ebx], ax
-
-    jnz bad_quit
+    ; Check DOS header magic (MZ)
+    mov ax, 5A4Dh      ; Fix: Changed eax to ax to match size of comparison
+    cmp word [ebx], ax ; Fix: Added word size specifier
 
 check_first_header:
     mov esi, [ebx+3Ch]
     add esi, ebx
 
-    mov [esp + 32], esi
-    cmp dword [esi], 4550h
-
+    ; Fix: Removed unnecessary store to stack
+    cmp dword [esi], 4550h    ; "PE\0\0" signature
     jnz bad_quit
 
 check_second_header:
     mov     eax, ebx
     cdq
 
-    sub     eax, [esi+34h]
+    sub     eax, [esi+34h]    ; ImageBase
     mov     ecx, eax
-    mov     [esp+24], eax
+    mov     [esp+24], eax     ; Delta
     sbb     edx, 0
     or      ecx, edx
 
-    mov     [esp+28], edx
-    jz pe_entry_jumper
+    mov     [esp+28], edx     ; High part of delta
+    jz      pe_entry_jumper
 
-    cmp     dword [esi+0A4h], 0
-    jz pe_entry_jumper
+    ; Check if we have relocation directory
+    mov     eax, [esi+0A0h]   ; Fix: Load relocation directory RVA first
+    test    eax, eax          ; Fix: Check if relocation directory exists
+    jz      pe_entry_jumper
 
-    mov     esi, [esi+0A0h]
-    add     esi, ebx
-    mov     eax, [esi+4]
+    add     eax, ebx          ; Convert RVA to VA
+    mov     esi, eax
+    mov     eax, [esi+4]      ; Size of block
     lea     ecx, [esi+4]
     mov     [esp+16], ecx
 
     test    eax, eax
-    jz pe_entry_jumper
-    nop
+    jz      pe_entry_jumper
 
 iteration:
-    mov     edx, [esi]
+    mov     edx, [esi]        ; RVA of block
     lea     edi, [eax-8]
     shr     edi, 1
     mov     [esp+20], edx
-    mov     edx, 0
-    jz iterate
+    xor     edx, edx          ; Fix: Use xor for clarity
+    jz      iterate
 
 inner_iteration:
     movzx   eax, word [esi+edx*2+8]
-    mov cx, ax
-    shr cx, 0Ch
-    cmp cx, 3
-    jz relocate
+    mov     cx, ax
+    shr     cx, 0Ch
+    cmp     cx, 3
+    jz      relocate
 
-    cmp cx, 0Ah
-    jnz inner_iter
+    cmp     cx, 0Ah
+    jnz     inner_iter
 
 relocate:
-    mov ecx, [esp+24]
-    and eax, 0FFFh
-    add eax, [esp+20]
-    add eax, ebx
-    add [eax], ecx
-    mov ecx, [esp+28]
-    adc [eax+4], ecx
+    mov     ecx, [esp+24]
+    and     eax, 0FFFh
+    add     eax, [esp+20]
+    add     eax, ebx
+    add     [eax], ecx
+    mov     ecx, [esp+28]
+    adc     [eax+4], ecx
 
 inner_iter:
-    inc edx
-    cmp edx, edi
-    jb inner_iteration
-    mov ecx, [esp+16]
+    inc     edx
+    cmp     edx, edi
+    jb      inner_iteration
+    mov     ecx, [esp+16]
 
 iterate:
-    add     esi, [ecx]
-    mov     eax, [esi+4]
+    add     esi, [ecx]        ; Move to next block
+    mov     eax, [esi+4]      ; Size of next block
     lea     ecx, [esi+4]
     mov     [esp+16], ecx
 
     test    eax, eax
-    jnz iteration
+    jnz     iteration
+
+pe_entry_jumper:
+    mov     eax, [esi+28h]    ; Get AddressOfEntryPoint
+    add     eax, ebx          ; Convert RVA to VA
+    jmp     eax               ; Jump to entry point
 
 bad_quit:
     hlt
-
-pe_entry_jumper:
-    ; TODO: use correct stuff
-    mov esi, [esp + 20h]
-    mov eax, [esi + 28h]     ; Get the address of the entry point (RVA)
-    add eax, ebx              ; Convert to VA
-    jmp eax                   ; Jump to the entry point of the PE
 
 address_of_pe:

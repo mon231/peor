@@ -8,7 +8,7 @@ README_PATH = CURRENT_FOLDER / 'README.md'
 
 setuptools.setup(
     name = "peor",
-    version = "0.0.2",
+    version = "1.0.0",
     author = "Ariel Tubul",
     packages = setuptools.find_packages(),
     long_description=README_PATH.read_text(),

@@ -1,89 +1,94 @@
 BITS 64
 
-address_of_shellcode:
+shellcode_start:
     call get_rip
 
 get_rip:
-    pop rbx                     ; Get current RIP
+    pop rbx                  ; RBX = current address
 
-find_pe_address:
-    mov rdi, rbx                ; Store RIP in RDI
-    add rdi, address_of_pe - get_rip
+find_pe_base:
+    lea rdi, [rbx + (address_of_pe - get_rip)]
+    mov rbx, rdi             ; RBX = PE base address
 
-validate_pe_header:
-    cmp word [rdi], 0x5A4D      ; Look for MZ signature
-    jne error                   ; Exit if PE not found
-    mov rbx, rdi                ; Store PE base
+    ; Verify DOS header ("MZ")
+    cmp word [rbx], 0x5A4D
+    jnz bad_quit
 
-skip_dos_header:
-    mov eax, [rdi + 0x3C]       ; Get PE header offset (still 32-bit)
-    add rdi, rax                ; Point to PE header
+    ; Locate PE header
+    mov esi, [rbx + 0x3C]    ; e_lfanew offset (32-bit)
+    add rsi, rbx             ; RSI = PE header VA
 
-    ; Validate PE signature
-    cmp dword [rdi], 0x00004550 ; "PE\0\0" signature
-    jne error                   ; Exit if invalid PE
+    ; Verify PE signature
+    cmp dword [rsi], 0x4550  ; "PE\0\0"
+    jnz bad_quit
 
-    ; Validate 64-bit PE
-    cmp word [rdi + 0x4], 0x8664  ; Machine type should be AMD64
-    jne error
+    ; Calculate delta (RBX - ImageBase)
+    mov rax, [rsi + 0x30]    ; ImageBase (64-bit at offset 0x30)
+    mov rdi, rbx
+    sub rdi, rax             ; RDI = delta
+    test rdi, rdi
+    jz entry_point           ; Skip relocations if delta=0
 
-process_relocs:
-    mov rsi, [rdi + 0xB0]       ; Get relocation table RVA (note offset change for PE64)
-    test rsi, rsi               ; Check if there is a relocation table
-    jz pe_entry_jumper
+    ; Get relocation directory
+    mov eax, [rsi + 0xB8]    ; Reloc table RVA (offset 0xB8 in PE64)
+    test eax, eax
+    jz entry_point           ; No relocations? Jump to entry
+    add rax, rbx             ; RAX = relocation table VA
+    mov rsi, rax             ; RSI = relocation table
 
-    add rsi, rbx                ; Get VA of reloc table
+process_blocks:
+    ; Read block header
+    mov edx, [rsi]           ; Page RVA (32-bit)
+    mov ecx, [rsi + 4]       ; Block size (32-bit)
+    add rsi, 8               ; Move to entries
 
-reloc_block:
-    mov ecx, [rsi]              ; Get block RVA (still 32-bit)
-    test ecx, ecx               ; Check if this is the last block
-    jz pe_entry_jumper          ; If RVA is 0, we're done with all blocks
+    test ecx, ecx            ; End of relocations?
+    jz entry_point
 
-    push rsi                    ; Save pointer to current block
-    mov edx, ecx                ; Save block RVA
+    ; Calculate number of entries
+    sub ecx, 8
+    shr ecx, 1
+    jz process_blocks        ; No entries? Next block
 
-    mov ecx, [rsi + 4]          ; Get block size
-    add rsi, 8                  ; Skip to first entry
-    sub ecx, 8                  ; Adjust count
-    shr ecx, 1                  ; Convert byte count to entry count (each entry is 2 bytes)
+process_entries:
+    lodsw                    ; AX = relocation entry
+    test ax, ax
+    jz process_blocks        ; End of block
 
-next_reloc:
-    movzx eax, word [rsi]       ; Get relocation entry
-    mov edx, [rsp]              ; Restore block RVA from stack
-    mov edx, [rdx]              ; Get actual RVA value
+    ; Extract type/offset
+    movzx r8d, ax
+    mov r9w, r8w             ; Save original value
+    and r8d, 0x0FFF          ; Offset
+    shr r9w, 12              ; Type
 
-    push rcx                    ; Save count
-    mov ecx, eax                ; Save full entry
-    shr ecx, 12                 ; Get relocation type
-    cmp ecx, 10                 ; Check if IMAGE_REL_BASED_DIR64 (type 10)
-    pop rcx                     ; Restore count
-    jne skip_reloc
+    ; Handle IMAGE_REL_BASED_DIR64 (type 10)
+    cmp r9b, 0xA
+    jne skip_entry
 
-    and eax, 0x0FFF             ; Mask to get offset
-    add eax, edx                ; Add block RVA
-    mov rdx, rbx                ; Get base address in rdx
-    add rdx, rax                ; Add offset to base to get relocation address
+    ; Calculate target address: RBX + Page RVA + Offset
+    lea r10, [rbx + rdx]     ; Page VA
+    add r10, r8              ; Target VA
 
-    mov rax, [rdx]              ; Get value to fix (64-bit)
-    add rax, rbx                ; Add delta
-    mov [rdx], rax              ; Write fixed-up value (64-bit)
+    ; Apply delta to QWORD at target
+    add [r10], rdi
 
-skip_reloc:
-    add rsi, 2                  ; Next entry
-    dec ecx                     ; Decrease count
-    jnz next_reloc              ; Process next if not done
+skip_entry:
+    dec ecx
+    jnz process_entries
+    jmp process_blocks
 
-    pop rsi                     ; Restore block pointer
-    mov ecx, [rsi + 4]          ; Get block size
-    add rsi, rcx                ; Move to next block
-    jmp reloc_block            ; Process next block
+entry_point:
+    ; Re-acquire PE header
+    mov esi, [rbx + 0x3C]    ; e_lfanew offset
+    add rsi, rbx             ; RSI = PE header VA
 
-pe_entry_jumper:
-    mov eax, [rdi + 0x28]       ; Get the address of the entry point (RVA)
-    add rax, rbx                ; Convert to VA using 64-bit addition
-    jmp rax                     ; Jump to the entry point of the PE
+    ; Get entry point and jump
+    mov eax, [rsi + 0x28]    ; AddressOfEntryPoint (32-bit RVA)
+    add rax, rbx             ; Convert to VA
+    jmp rax
 
-error:
-    int3                        ; Break for debugging
+bad_quit:
+    hlt                      ; Halt on error
 
 address_of_pe:
+    ; PE file appended here

@@ -4,102 +4,88 @@ address_of_shellcode:
     call get_eip
 
 get_eip:
-    pop ebx
+    pop ebx                   ; EBX = current address
 
 find_pe_address:
     mov edi, ebx
     add edi, address_of_pe - get_eip
+    mov ebx, edi              ; EBX = PE base address
 
-    mov ecx, edi
-    mov ebx, ecx
-
-    ; Check DOS header magic (MZ)
-    mov ax, 5A4Dh      ; Fix: Changed eax to ax to match size of comparison
-    cmp word [ebx], ax ; Fix: Added word size specifier
-
-check_first_header:
-    mov esi, [ebx+3Ch]
-    add esi, ebx
-
-    ; Fix: Removed unnecessary store to stack
-    cmp dword [esi], 4550h    ; "PE\0\0" signature
+    ; Verify DOS header
+    cmp word [ebx], 0x5A4D    ; "MZ" check
     jnz bad_quit
 
-check_second_header:
-    mov     eax, ebx
-    cdq
+    ; Locate PE header
+    mov esi, [ebx + 0x3C]     ; e_lfanew offset
+    add esi, ebx              ; ESI = PE header VA
+    cmp dword [esi], 0x4550   ; "PE\0\0" check
+    jnz bad_quit
 
-    sub     eax, [esi+34h]    ; ImageBase
-    mov     ecx, eax
-    mov     [esp+24], eax     ; Delta
-    sbb     edx, 0
-    or      ecx, edx
+    ; Calculate delta (actual_base - preferred_base)
+    mov eax, ebx
+    sub eax, [esi + 0x34]     ; Subtract ImageBase
+    mov edi, eax              ; EDI = delta
+    test edi, edi
+    jz pe_entry_jumper        ; Skip relocs if delta=0
 
-    mov     [esp+28], edx     ; High part of delta
-    jz      pe_entry_jumper
+    ; Get relocation table
+    mov eax, [esi + 0xA0]     ; Reloc table RVA
+    test eax, eax
+    jz pe_entry_jumper        ; No relocs? Jump to entry
+    add eax, ebx              ; Convert to VA
+    mov esi, eax              ; ESI = reloc table VA
 
-    ; Check if we have relocation directory
-    mov     eax, [esi+0A0h]   ; Fix: Load relocation directory RVA first
-    test    eax, eax          ; Fix: Check if relocation directory exists
-    jz      pe_entry_jumper
+process_blocks:
+    mov edx, [esi]            ; Page RVA
+    mov ecx, [esi + 4]        ; Block size
+    add esi, 8                ; Point to entries
 
-    add     eax, ebx          ; Convert RVA to VA
-    mov     esi, eax
-    mov     eax, [esi+4]      ; Size of block
-    lea     ecx, [esi+4]
-    mov     [esp+16], ecx
+    test ecx, ecx             ; End of relocs?
+    jz pe_entry_jumper
 
-    test    eax, eax
-    jz      pe_entry_jumper
+    ; Calculate number of entries
+    sub ecx, 8
+    shr ecx, 1
+    jz process_blocks         ; Empty block? Skip
 
-iteration:
-    mov     edx, [esi]        ; RVA of block
-    lea     edi, [eax-8]
-    shr     edi, 1
-    mov     [esp+20], edx
-    xor     edx, edx          ; Fix: Use xor for clarity
-    jz      iterate
+process_entries:
+    lodsw                     ; Get relocation entry
+    test ax, ax
+    jz process_blocks         ; End of block
 
-inner_iteration:
-    movzx   eax, word [esi+edx*2+8]
-    mov     cx, ax
-    shr     cx, 0Ch
-    cmp     cx, 3
-    jz      relocate
+    ; Extract type/offset
+    movzx eax, ax
+    mov ebp, eax
+    and eax, 0x0FFF           ; Offset
+    shr ebp, 12               ; Type
 
-    cmp     cx, 0Ah
-    jnz     inner_iter
+    cmp ebp, 3                ; IMAGE_REL_BASED_HIGHLOW?
+    jne skip_entry
 
-relocate:
-    mov     ecx, [esp+24]
-    and     eax, 0FFFh
-    add     eax, [esp+20]
-    add     eax, ebx
-    add     [eax], ecx
-    mov     ecx, [esp+28]
-    adc     [eax+4], ecx
+    ; Calculate target address
+    lea ebp, [ebx + edx]      ; Page VA
+    add ebp, eax              ; Target VA
 
-inner_iter:
-    inc     edx
-    cmp     edx, edi
-    jb      inner_iteration
-    mov     ecx, [esp+16]
+    ; Apply delta to DWORD at target
+    add [ebp], edi
 
-iterate:
-    add     esi, [ecx]        ; Move to next block
-    mov     eax, [esi+4]      ; Size of next block
-    lea     ecx, [esi+4]
-    mov     [esp+16], ecx
-
-    test    eax, eax
-    jnz     iteration
+skip_entry:
+    dec ecx
+    jnz process_entries
+    jmp process_blocks
 
 pe_entry_jumper:
-    mov     eax, [esi+28h]    ; Get AddressOfEntryPoint
-    add     eax, ebx          ; Convert RVA to VA
-    jmp     eax               ; Jump to entry point
+    ; Re-acquire PE header
+    mov esi, [ebx + 0x3C]     ; e_lfanew offset
+    add esi, ebx              ; ESI = PE header VA
+
+    ; Get entry point RVA
+    mov eax, [esi + 0x28]     ; AddressOfEntryPoint
+    add eax, ebx              ; Convert to VA
+    jmp eax                   ; Transfer control
 
 bad_quit:
-    hlt
+    hlt                       ; Crash gracefully
 
 address_of_pe:
+    ; PE data appended here

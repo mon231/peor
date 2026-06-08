@@ -5,3 +5,12 @@ __pycache__/
 build/
 venv/
 dist/
+
+# VS test build output
+tests/Win_x86/
+tests/Win_x64/
+
+# VS intermediate build artifacts (obj, tlog, pdb, ...)
+tests/**/Release/
+tests/**/x64/
+tests/**/*.user

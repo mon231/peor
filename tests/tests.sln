@@ -11,6 +11,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "03_winapi_messagebox", "03_
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "04_crt_printf_rand", "04_crt_printf_rand\04_crt_printf_rand.vcxproj", "{44444444-4444-4444-4444-444444444444}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "test_loader", "test_loader\test_loader.vcxproj", "{55555555-5555-5555-5555-555555555555}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Win32 = Debug|Win32
@@ -51,6 +53,14 @@ Global
 		{44444444-4444-4444-4444-444444444444}.Release|Win32.Build.0 = Release|Win32
 		{44444444-4444-4444-4444-444444444444}.Release|x64.ActiveCfg = Release|x64
 		{44444444-4444-4444-4444-444444444444}.Release|x64.Build.0 = Release|x64
+		{55555555-5555-5555-5555-555555555555}.Debug|Win32.ActiveCfg = Debug|Win32
+		{55555555-5555-5555-5555-555555555555}.Debug|Win32.Build.0 = Debug|Win32
+		{55555555-5555-5555-5555-555555555555}.Debug|x64.ActiveCfg = Debug|x64
+		{55555555-5555-5555-5555-555555555555}.Debug|x64.Build.0 = Debug|x64
+		{55555555-5555-5555-5555-555555555555}.Release|Win32.ActiveCfg = Release|Win32
+		{55555555-5555-5555-5555-555555555555}.Release|Win32.Build.0 = Release|Win32
+		{55555555-5555-5555-5555-555555555555}.Release|x64.ActiveCfg = Release|x64
+		{55555555-5555-5555-5555-555555555555}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

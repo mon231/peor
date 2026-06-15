@@ -4,33 +4,37 @@ This project is made to create embedded-shellcodes out of PE files. <br />
 *NOTE* that `PEOR` isn't made to easily shellcodify Windows usermode-executables, <br />
 As it won't resolve imports for you. For such features, use [pe2shellcode](https://github.com/hasherezade/pe_to_shellcode).
 
-## What can PEOR do?
-`PEOR` is the worst PE shellcodifier! ¡El peor del mundo! <br />
-It won't resolve your imports, nor optimize your PE-sections. <br />
-`PEOR` is intended to shellcodify PE-files for embedded usage, <br />
-Thus not using allocations / setting page-protections for sections. <br />
-You can use `PEOR` to shellcodify kernel modules, but `PEOR` won't resolve imports for you. <br />
-You can use it to shellcodify uefi applications, but `PEOR` won't locate the EFI_SYSTEM_TABLE nor provide a image_handle to the entrypoint. <br />
-You can use `PEOR` to write a simple piece of code, that compiles into a PE-file, and make a shellcode out of it. <br />
-The resulted shellcode can be executed on any machine (as long as it has a x86/x64 cpu).
+PEOR can not (and should not) be used for any cyber-related project. <br />
+Use legally, for development/educational purposes only. <br />
+The project is made for you to be able to create c code, compile it to PE, and execute on any embedded env (i.e. linux/bare-metal/windows-usermode/...)
 
-Advantages over normal pe-shellcodifiers:
-- you can write your embedded-code once and execute it anywhere (windows usermode/kernel, linux, uefi, embedded-flash devices, ...)
+## Test Projects
 
-Disadvanteges over normal pe-shellcodifiers:
-- we only support embedded-code, thus custom features like `implicit imports` and `exceptions` are not supported by the shellcodifier, and should be implemented by the user, within the shellcode scope
-- we can't trust the existence of allocation functions (like `VirtualAlloc` or `ExAllocatePoolWithTag`), thus the whole PE-file is resolved (including the bss sections!), highly increasing the shellcode size
-- we can't assume that `PAGE-PROTECTION` concept even exists, thus `PEOR` assumes that the whole shellcode is mapped to `RWX` memory
+The `tests/` folder contains a Visual Studio 2022 solution (`tests.sln`) with four C projects:
 
-## How to use PEOR?
-Simply provide a PE-file whose code fits to your target platform (i.e. do not access `CR3` register from usermode context) and has no exceptions / implicit-imports. <br />
-You may use exceptionless cpp-code using [`etl`](https://github.com/ETLCPP/etl), or rust-code with custom allocator. <br />
-Simply install `PEOR` using `pip`:
-```bash
-pip install --upgrade peor
+| Project | Description |
+|---|---|
+| `01_simple_calc` | Importless, custom `main` entrypoint (no CRT). Runs a 0–99 accumulation loop. |
+| `02_relocs_functions` | Importless, custom entrypoint, multiple functions, r/w static globals, global pointer (`&g_value`) that forces a `.reloc` section. Built with `/DYNAMICBASE`. |
+| `03_winapi_messagebox` | Custom entrypoint (no CRT startup), Windows subsystem. Calls `MessageBoxA` then `ExitProcess`. Links `user32.lib` + `kernel32.lib`. |
+| `04_crt_printf_rand` | Standard CRT entrypoint (`mainCRTStartup → main`). Seeds `rand` with `time(NULL)` and `printf`s the result. |
+
+### Build (from a Visual Studio Developer Command Prompt)
+
+```bat
+rem x86
+msbuild tests\tests.sln /p:Configuration=Release /p:Platform=Win32
+
+rem x64
+msbuild tests\tests.sln /p:Configuration=Release /p:Platform=x64
 ```
 
-Then use it with an input PE-file:
-```bash
-peor -i my_pe.exe -o my_shellcode.bin
+Debug builds:
+
+```bat
+msbuild tests\tests.sln /p:Configuration=Debug /p:Platform=Win32
+msbuild tests\tests.sln /p:Configuration=Debug /p:Platform=x64
 ```
+
+Output binaries land in each project's subfolder under `Win32\<Config>\` or `x64\<Config>\`.
+

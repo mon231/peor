@@ -1,91 +1,77 @@
-BITS 32
+; x86 (32-bit) relocation resolver - position-independent shellcode
+; Assembled by keystone (KS_ARCH_X86 / KS_MODE_32 / KS_OPT_SYNTAX_NASM).
+;
+; Locates the PE image appended immediately after this shellcode (_pe_start),
+; applies IMAGE_REL_BASED_HIGHLOW (type 3) base relocations, then JMPs to
+; the PE entry point.  Handles delta=0 (no relocs) and missing reloc table.
+;
+; NOTE: 0x7E7E7E7E is a placeholder patched by setup.py with (shellcode_size - 5).
 
-address_of_shellcode:
-    call get_eip
+    call _base
+_base:
+    pop ebx                              ; EBX = runtime address of _base
+    lea edi, [ebx + 0x7E7E7E7E]         ; PATCHED: EDI = PE image base
+    mov ebx, edi                         ; EBX = PE base
 
-get_eip:
-    pop ebx                   ; EBX = current address
+    cmp word [ebx], 0x5A4D               ; DOS "MZ" magic
+    jnz _exit
 
-find_pe_address:
-    mov edi, ebx
-    add edi, address_of_pe - get_eip
-    mov ebx, edi              ; EBX = PE base address
+    mov esi, [ebx + 0x3C]                ; e_lfanew
+    add esi, ebx                         ; NT headers
+    cmp dword [esi], 0x4550              ; "PE\0\0"
+    jnz _exit
 
-    ; Verify DOS header
-    cmp word [ebx], 0x5A4D    ; "MZ" check
-    jnz bad_quit
-
-    ; Locate PE header
-    mov esi, [ebx + 0x3C]     ; e_lfanew offset
-    add esi, ebx              ; ESI = PE header VA
-    cmp dword [esi], 0x4550   ; "PE\0\0" check
-    jnz bad_quit
-
-    ; Calculate delta (actual_base - preferred_base)
     mov eax, ebx
-    sub eax, [esi + 0x34]     ; Subtract ImageBase
-    mov edi, eax              ; EDI = delta
+    sub eax, [esi + 0x34]                ; delta = actual_base - ImageBase (PE32: NT+0x34)
+    mov edi, eax
     test edi, edi
-    jz pe_entry_jumper        ; Skip relocs if delta=0
+    jz _jmp_ep                           ; delta=0, no relocation needed
 
-    ; Get relocation table
-    mov eax, [esi + 0xA0]     ; Reloc table RVA
+    mov eax, [esi + 0xA0]                ; DataDir[5].VA (BaseReloc at NT+0xA0 for PE32)
     test eax, eax
-    jz pe_entry_jumper        ; No relocs? Jump to entry
-    add eax, ebx              ; Convert to VA
-    mov esi, eax              ; ESI = reloc table VA
+    jz _jmp_ep
+    add eax, ebx
+    mov esi, eax                         ; ESI = first IMAGE_BASE_RELOCATION block
 
-process_blocks:
-    mov edx, [esi]            ; Page RVA
-    mov ecx, [esi + 4]        ; Block size
-    add esi, 8                ; Point to entries
-
-    test ecx, ecx             ; End of relocs?
-    jz pe_entry_jumper
-
-    ; Calculate number of entries
+_block:
+    mov edx, [esi]                       ; block.VirtualAddress
+    mov ecx, [esi + 4]                   ; block.SizeOfBlock
+    add esi, 8
+    test ecx, ecx
+    jz _jmp_ep                           ; null block = end sentinel
     sub ecx, 8
-    shr ecx, 1
-    jz process_blocks         ; Empty block? Skip
+    shr ecx, 1                           ; number of 16-bit entries
+    jz _block
 
-process_entries:
-    lodsw                     ; Get relocation entry
+_entry:
+    lodsw                                ; AX = next entry, ESI += 2
     test ax, ax
-    jz process_blocks         ; End of block
+    jz _block                            ; type 0 (ABS padding) -> done with block
 
-    ; Extract type/offset
     movzx eax, ax
     mov ebp, eax
-    and eax, 0x0FFF           ; Offset
-    shr ebp, 12               ; Type
+    and eax, 0x0FFF                      ; lower 12 bits = page offset
+    shr ebp, 0x0c                        ; upper 4 bits = reloc type
+    cmp ebp, 3                           ; IMAGE_REL_BASED_HIGHLOW
+    jnz _next_entry
 
-    cmp ebp, 3                ; IMAGE_REL_BASED_HIGHLOW?
-    jne skip_entry
+    lea ebp, [ebx + edx]                 ; page VA = PE_base + block.VirtualAddress
+    add ebp, eax                         ; target address
+    add [ebp], edi                       ; patch DWORD at target += delta
 
-    ; Calculate target address
-    lea ebp, [ebx + edx]      ; Page VA
-    add ebp, eax              ; Target VA
-
-    ; Apply delta to DWORD at target
-    add [ebp], edi
-
-skip_entry:
+_next_entry:
     dec ecx
-    jnz process_entries
-    jmp process_blocks
+    jnz _entry
+    jmp _block
 
-pe_entry_jumper:
-    ; Re-acquire PE header
-    mov esi, [ebx + 0x3C]     ; e_lfanew offset
-    add esi, ebx              ; ESI = PE header VA
+_jmp_ep:
+    mov esi, [ebx + 0x3C]
+    add esi, ebx
+    mov eax, [esi + 0x28]                ; AddressOfEntryPoint (NT+0x28)
+    add eax, ebx
+    jmp eax
 
-    ; Get entry point RVA
-    mov eax, [esi + 0x28]     ; AddressOfEntryPoint
-    add eax, ebx              ; Convert to VA
-    jmp eax                   ; Transfer control
+_exit:
+    hlt
 
-bad_quit:
-    hlt                       ; Crash gracefully
-
-address_of_pe:
-    ; PE data appended here
+_pe_start:

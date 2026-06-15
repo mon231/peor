@@ -64,7 +64,13 @@ def _poll_and_dismiss_msgbox(title: str, timeout: float = 10.0) -> dict:
             break
         hwnd_child = user32.FindWindowExA(hwnd, hwnd_child, b"Static", None)
 
-    user32.PostMessageA(hwnd, _WM_COMMAND, _IDOK, 0)
+    # Click the OK button directly — more reliable than posting WM_COMMAND to the dialog.
+    # SendMessageA is synchronous so the button-click is fully processed before we return.
+    hwnd_ok = user32.FindWindowExA(hwnd, None, b"Button", None)
+    if hwnd_ok:
+        user32.SendMessageA(hwnd_ok, 0x00F5, 0, 0)  # BM_CLICK
+    else:
+        user32.SendMessageA(hwnd, _WM_COMMAND, _IDOK, 0)
     return result
 
 

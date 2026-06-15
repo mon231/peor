@@ -1,159 +1,28 @@
-; imports_resolver64.asm
-; x64 import resolver using MASM syntax and Windows API structs
+; x64 (64-bit) usermode import resolver - position-independent shellcode
+; Assembled by keystone (KS_ARCH_X86 / KS_MODE_64 / KS_OPT_SYNTAX_NASM).
+;
+; Algorithm:
+;   1. PEB walk (GS:[0x60]) -> kernel32 base
+;   2. Scan kernel32 export table for GetProcAddress (into R12), then get LoadLibraryA (into R13)
+;   3. Scan forward from current IP for "MZ" + "PE" signature -> PE base in R14
+;   4. Walk IMAGE_IMPORT_DESCRIPTOR; for each DLL: LLA then GPA each thunk into IAT (R15)
+;   5. Restore non-volatile regs + JMP RAX (terminal bytes stripped by peor)
+;
+; Register map (non-volatile, callee-saved across CALL):
+;   RBX = kernel32 base (phase 1/2), then current DLL module handle (phase 4)
+;   RBP = kernel32 export directory VA (phase 2)
+;   R12 = GetProcAddress VA
+;   R13 = LoadLibraryA VA
+;   R14 = PE image base
+;   R15 = current IAT slot pointer
+;   RSI = INT/FT walk pointer
+;   RDI = current IMAGE_IMPORT_DESCRIPTOR pointer
+;
+; Keystone notes:
+;   - [gs:0x60] not supported: use "db 0x65" prefix before "mov rax, [0x60]"
+;   - "db 'string'" not supported: use comma-separated char literals
+;   - "js near label" not supported: use bare "js label"
 
-; Windows structures
-LIST_ENTRY64 STRUCT
-    Flink   QWORD ?
-    Blink   QWORD ?
-LIST_ENTRY64 ENDS
-
-UNICODE_STRING64 STRUCT
-    Length        WORD ?
-    MaximumLength WORD ?
-    _padding      DWORD ?
-    Buffer        QWORD ?
-UNICODE_STRING64 ENDS
-
-PEB64 STRUCT
-    InheritedAddressSpace    BYTE ?
-    ReadImageFileExecOptions BYTE ?
-    BeingDebugged            BYTE ?
-    BitField                 BYTE ?
-    Padding0                 DWORD ?
-    Mutant                   QWORD ?
-    ImageBaseAddress         QWORD ?
-    Ldr                      QWORD ?
-    ProcessParameters        QWORD ?
-    ; Remaining fields omitted for brevity
-PEB64 ENDS
-
-PEB_LDR_DATA64 STRUCT
-    Length                          DWORD ?
-    Initialized                     DWORD ?
-    SsHandle                        QWORD ?
-    InLoadOrderModuleList           LIST_ENTRY64 <>
-    InMemoryOrderModuleList         LIST_ENTRY64 <>
-    InInitializationOrderModuleList LIST_ENTRY64 <>
-    EntryInProgress                 QWORD ?
-PEB_LDR_DATA64 ENDS
-
-LDR_DATA_TABLE_ENTRY64 STRUCT
-    InLoadOrderLinks                LIST_ENTRY64 <>
-    InMemoryOrderLinks              LIST_ENTRY64 <>
-    InInitializationOrderLinks      LIST_ENTRY64 <>
-    DllBase                         QWORD ?
-    EntryPoint                      QWORD ?
-    SizeOfImage                     QWORD ?
-    FullDllName                     UNICODE_STRING64 <>
-    BaseDllName                     UNICODE_STRING64 <>
-LDR_DATA_TABLE_ENTRY64 ENDS
-
-IMAGE_DOS_HEADER STRUCT
-    e_magic    WORD ?
-    e_cblp     WORD ?
-    e_cp       WORD ?
-    e_crlc     WORD ?
-    e_cparhdr  WORD ?
-    e_minalloc WORD ?
-    e_maxalloc WORD ?
-    e_ss       WORD ?
-    e_sp       WORD ?
-    e_csum     WORD ?
-    e_ip       WORD ?
-    e_cs       WORD ?
-    e_lfarlc   WORD ?
-    e_ovno     WORD ?
-    e_res      WORD 4 DUP(?)
-    e_oemid    WORD ?
-    e_oeminfo  WORD ?
-    e_res2     WORD 10 DUP(?)
-    e_lfanew   DWORD ?
-IMAGE_DOS_HEADER ENDS
-
-IMAGE_FILE_HEADER STRUCT
-    Machine              WORD ?
-    NumberOfSections     WORD ?
-    TimeDateStamp        DWORD ?
-    PointerToSymbolTable DWORD ?
-    NumberOfSymbols      DWORD ?
-    SizeOfOptionalHeader WORD ?
-    Characteristics      WORD ?
-IMAGE_FILE_HEADER ENDS
-
-IMAGE_DATA_DIRECTORY STRUCT
-    VirtualAddress DWORD ?
-    Size           DWORD ?
-IMAGE_DATA_DIRECTORY ENDS
-
-IMAGE_OPTIONAL_HEADER64 STRUCT
-    Magic                       WORD ?
-    MajorLinkerVersion          BYTE ?
-    MinorLinkerVersion          BYTE ?
-    SizeOfCode                  DWORD ?
-    SizeOfInitializedData       DWORD ?
-    SizeOfUninitializedData     DWORD ?
-    AddressOfEntryPoint         DWORD ?
-    BaseOfCode                  DWORD ?
-    ImageBase                   QWORD ?
-    SectionAlignment            DWORD ?
-    FileAlignment               DWORD ?
-    MajorOperatingSystemVersion WORD ?
-    MinorOperatingSystemVersion WORD ?
-    MajorImageVersion           WORD ?
-    MinorImageVersion           WORD ?
-    MajorSubsystemVersion       WORD ?
-    MinorSubsystemVersion       WORD ?
-    Win32VersionValue           DWORD ?
-    SizeOfImage                 DWORD ?
-    SizeOfHeaders               DWORD ?
-    CheckSum                    DWORD ?
-    Subsystem                   WORD ?
-    DllCharacteristics          WORD ?
-    SizeOfStackReserve          QWORD ?
-    SizeOfStackCommit           QWORD ?
-    SizeOfHeapReserve           QWORD ?
-    SizeOfHeapCommit            QWORD ?
-    LoaderFlags                 DWORD ?
-    NumberOfRvaAndSizes         DWORD ?
-    DataDirectory               IMAGE_DATA_DIRECTORY 16 DUP(<>)
-IMAGE_OPTIONAL_HEADER64 ENDS
-
-IMAGE_NT_HEADERS64 STRUCT
-    Signature      DWORD ?
-    FileHeader     IMAGE_FILE_HEADER <>
-    OptionalHeader IMAGE_OPTIONAL_HEADER64 <>
-IMAGE_NT_HEADERS64 ENDS
-
-IMAGE_EXPORT_DIRECTORY STRUCT
-    Characteristics       DWORD ?
-    TimeDateStamp         DWORD ?
-    MajorVersion          WORD ?
-    MinorVersion          WORD ?
-    Name                  DWORD ?
-    Base                  DWORD ?
-    NumberOfFunctions     DWORD ?
-    NumberOfNames         DWORD ?
-    AddressOfFunctions    DWORD ?
-    AddressOfNames        DWORD ?
-    AddressOfNameOrdinals DWORD ?
-IMAGE_EXPORT_DIRECTORY ENDS
-
-IMAGE_IMPORT_DESCRIPTOR STRUCT
-    OriginalFirstThunk DWORD ?
-    TimeDateStamp      DWORD ?
-    ForwarderChain     DWORD ?
-    Name               DWORD ?
-    FirstThunk         DWORD ?
-IMAGE_IMPORT_DESCRIPTOR ENDS
-
-; Constants
-IMAGE_DIRECTORY_ENTRY_EXPORT     EQU 0
-IMAGE_DIRECTORY_ENTRY_IMPORT     EQU 1
-IMAGE_ORDINAL_FLAG64             EQU 8000000000000000h
-
-.code
-_start PROC
-    ; Save registers
     push rsi
     push rdi
     push rbx
@@ -162,170 +31,157 @@ _start PROC
     push r13
     push r14
     push r15
+    sub rsp, 0x28                       ; 32-byte shadow + 8 align (8 pushes=64 -> RSP 0 mod 16)
 
-    ; Get PEB from gs:[60h]
-    mov rax, gs:[60h]
-    ASSUME rax:PTR PEB64
+    ; PEB walk -> kernel32 base in RBX
+    ; "mov rax, [gs:0x60]" encoded as GS-prefix (0x65) + "mov rax, [0x60]"
+    db 0x65
+    mov rax, [0x60]                     ; RAX = PEB
+    mov rax, [rax + 0x18]              ; PEB.Ldr
+    mov rsi, [rax + 0x20]              ; InMemoryOrderModuleList.Flink
+    mov rsi, [rsi]                      ; skip: exe
+    mov rsi, [rsi]                      ; skip: ntdll -> next = kernel32
+    mov rbx, [rsi + 0x20]              ; kernel32 DllBase (InMemoryOrder+0x20 = struct+0x30)
 
-    ; Get Ldr
-    mov rax, [rax].Ldr
-    ASSUME rax:PTR PEB_LDR_DATA64
+    ; Locate kernel32 export directory
+    mov eax, [rbx + 0x3C]              ; e_lfanew (32-bit, zero-extends)
+    add rax, rbx                        ; NT headers VA
+    mov eax, [rax + 0x88]              ; DataDir[0].VA = Export dir RVA (PE64: NT+0x88)
+    add rax, rbx                        ; Export dir VA
+    mov rbp, rax                        ; RBP = export dir
+    mov ecx, [rax + 0x18]              ; NumberOfNames
+    mov edx, [rax + 0x20]              ; AddressOfNames RVA
+    add rdx, rbx                        ; AddressOfNames VA
 
-    ; Get first module in memory order list
-    mov rsi, [rax].InMemoryOrderModuleList.Flink
-    ASSUME rsi:PTR LDR_DATA_TABLE_ENTRY64
+    ; Embed "GetProcAddress\0" via CALL/POP
+    call _gpa_str
+    db 'G','e','t','P','r','o','c','A','d','d','r','e','s','s',0
+_gpa_str:
+    pop rdi                             ; RDI = pointer to "GetProcAddress"
 
-    ; Skip first module (executable)
-    mov rsi, [rsi].InMemoryOrderLinks.Flink
-    ASSUME rsi:PTR LDR_DATA_TABLE_ENTRY64
-
-    ; Skip second module (ntdll.dll)
-    mov rsi, [rsi].InMemoryOrderLinks.Flink
-    ASSUME rsi:PTR LDR_DATA_TABLE_ENTRY64
-
-    ; Get kernel32.dll base address
-    mov rbx, [rsi].DllBase
-    ASSUME rbx:PTR IMAGE_DOS_HEADER
-
-    ; Find kernel32.dll export directory
-    mov edx, [rbx].e_lfanew
-    add rdx, rbx
-    ASSUME rdx:PTR IMAGE_NT_HEADERS64
-
-    ; Get export directory RVA
-    mov eax, [rdx].OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT * SIZE IMAGE_DATA_DIRECTORY].VirtualAddress
-    add rax, rbx
-    ASSUME rax:PTR IMAGE_EXPORT_DIRECTORY
-
-    ; Save export directory info
-    push rax                     ; Save export directory base
-    mov ecx, [rax].NumberOfNames ; Get number of function names
-    mov rbp, [rax].AddressOfNames ; Get function names array RVA
-    add rbp, rbx                 ; Get function names array address
-
-find_getprocaddress:
-    ; Find GetProcAddress by name
+_gpa_loop:
     dec ecx
-    mov esi, [rbp + rcx*4]       ; Get function name RVA
-    add rsi, rbx                 ; Get function name address
-    lea rdi, [gpa_name]
-    push rcx                     ; Save counter
-    mov ecx, 13                  ; Length of "GetProcAddress"
-    rep cmpsb
+    js _done                            ; exhausted all names (keystone uses near form)
+    mov esi, [rdx + rcx * 4]           ; name RVA (32-bit)
+    add rsi, rbx                        ; name VA
+    push rsi
+    push rcx
+    push rdx
+    push rdi
+    mov ecx, 0x0f                       ; len("GetProcAddress\0") = 15
+    cld
+    repe cmpsb
+    pop rdi
+    pop rdx
     pop rcx
-    jne find_getprocaddress
-
-    ; Get function ordinal and address
-    pop rax                      ; Restore export directory base
-    mov rsi, [rax].AddressOfNameOrdinals ; Get ordinal array RVA
-    add rsi, rbx                 ; Get ordinal array address
-    movzx ecx, WORD PTR [rsi + rcx*2] ; Get function ordinal
-    mov rsi, [rax].AddressOfFunctions ; Get function addresses array RVA
-    add rsi, rbx                 ; Get function addresses array address
-    mov eax, [rsi + rcx*4]       ; Get function RVA
-    add rax, rbx                 ; Get GetProcAddress address
-    mov [gpa_addr], rax          ; Save GetProcAddress address
-
-    ; Find LoadLibraryA
-    lea rcx, [lla_name]          ; First parameter - function name
-    mov rdx, rbx                 ; Second parameter - kernel32 base
-    call rax                     ; Call GetProcAddress
-    mov [lla_addr], rax          ; Save LoadLibraryA address
-
-    ; Process imports
-    call get_base                ; Get current module base
-get_base:
     pop rsi
-    sub rsi, offset get_base
-    ASSUME rsi:PTR IMAGE_DOS_HEADER
+    jnz _gpa_loop
 
-    ; Get import directory
-    mov eax, [rsi].e_lfanew
-    add rax, rsi
-    ASSUME rax:PTR IMAGE_NT_HEADERS64
+    ; Name matched: resolve ordinal -> function address
+    mov esi, [rbp + 0x24]              ; AddressOfNameOrdinals RVA
+    add rsi, rbx
+    movzx ecx, word [rsi + rcx * 2]    ; ordinal = NameOrdinals[match_index]
+    mov esi, [rbp + 0x1C]              ; AddressOfFunctions RVA
+    add rsi, rbx
+    mov eax, [rsi + rcx * 4]           ; function RVA
+    add rax, rbx                        ; function VA = GetProcAddress
+    mov r12, rax                        ; R12 = GetProcAddress
 
-    ; Get import directory RVA
-    mov eax, [rax].OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT * SIZE IMAGE_DATA_DIRECTORY].VirtualAddress
+    ; GetProcAddress(kernel32, "LoadLibraryA") -> R13
+    call _lla_str
+    db 'L','o','a','d','L','i','b','r','a','r','y','A',0
+_lla_str:
+    pop rdx                             ; RDX = "LoadLibraryA" (arg2)
+    mov rcx, rbx                        ; RCX = kernel32 handle (arg1)
+    call r12                            ; GetProcAddress(kernel32, "LoadLibraryA")
+    mov r13, rax                        ; R13 = LoadLibraryA VA
+
+    ; Scan forward from current IP for PE image (MZ + valid PE sig)
+    call _here
+_here:
+    pop rsi                             ; RSI = runtime address of this pop
+    add rsi, 0x100                      ; skip ahead past reloc/PE blob start
+
+_scan_mz:
+    inc rsi
+    cmp word [rsi], 0x5A4D              ; "MZ" ?
+    jnz _scan_mz
+    mov eax, [rsi + 0x3C]              ; e_lfanew
+    lea rdx, [rsi + rax]               ; NT headers VA
+    cmp dword [rdx], 0x4550            ; "PE\0\0" ?
+    jnz _scan_mz
+
+    mov r14, rsi                        ; R14 = PE image base
+
+    ; Walk IMAGE_IMPORT_DESCRIPTOR table
+    mov eax, [rsi + 0x3C]
+    add rax, rsi                        ; NT headers VA
+    mov eax, [rax + 0x90]              ; DataDir[1].VA = Import dir RVA (PE64: NT+0x90)
     test eax, eax
-    jz imports_done
+    jz _done
+    add rax, r14                        ; Import dir VA
+    mov rdi, rax                        ; RDI = current IMAGE_IMPORT_DESCRIPTOR
 
-    add rax, rsi
-    mov [imp_dir], rax
-    ASSUME rax:PTR IMAGE_IMPORT_DESCRIPTOR
-
-process_imports:
-    mov rax, [imp_dir]
-    ASSUME rax:PTR IMAGE_IMPORT_DESCRIPTOR
-
-    ; Check if we reached the end of import descriptors
-    mov edx, [rax].Name
-    test edx, edx
-    jz imports_done
-
-    ; Load DLL
-    add rdx, rsi                 ; Get DLL name address
-    mov rcx, rdx                 ; First parameter - DLL name
-    call [lla_addr]              ; Call LoadLibraryA
+_desc_loop:
+    mov eax, [rdi + 0x0C]              ; Name RVA
+    test eax, eax
+    jz _done                            ; null descriptor = end of table
+    add rax, r14                        ; Name VA
+    mov rcx, rax                        ; arg1: dll name string
+    call r13                            ; LoadLibraryA(dll_name) -> RAX = module handle
     test rax, rax
-    jz next_dll
+    jz _next_desc
+    mov rbx, rax                        ; RBX = module handle
 
-    mov r12, rax                 ; Save DLL base
+    ; Choose INT (OriginalFirstThunk) or fall back to FT (FirstThunk)
+    mov esi, [rdi]                      ; OriginalFirstThunk RVA (32-bit)
+    test rsi, rsi
+    jz _use_ft
+    add rsi, r14                        ; RSI = INT VA
+    mov eax, [rdi + 0x10]              ; FirstThunk RVA
+    add rax, r14                        ; IAT VA
+    mov r15, rax                        ; R15 = IAT ptr
+    jmp _thunk_loop
 
-    ; Get import lookup table
-    mov rax, [imp_dir]
-    mov edx, [rax].OriginalFirstThunk
-    test edx, edx
-    jz use_first_thunk
-    add rdx, rsi
-    jmp process_functions
+_use_ft:
+    mov esi, [rdi + 0x10]              ; FirstThunk RVA
+    add rsi, r14
+    mov r15, rsi                        ; R15 = IAT ptr (same as INT ptr)
 
-use_first_thunk:
-    mov edx, [rax].FirstThunk
-    add rdx, rsi
-
-process_functions:
-    mov rax, [rdx]               ; Get function ordinal/name RVA
+_thunk_loop:
+    mov rax, [rsi]                      ; 64-bit thunk entry
     test rax, rax
-    jz next_dll
+    jz _next_desc                       ; null = end of thunk array
 
-    test rax, IMAGE_ORDINAL_FLAG64 ; Check if import by ordinal
-    jnz import_by_ordinal
+    test rax, rax                       ; check sign bit (bit 63 = ordinal flag in x64 thunks)
+    js _by_ordinal
 
-    ; Import by name
-    add rax, rsi
-    add rax, 2                   ; Skip hint
-    mov rcx, rax                 ; First parameter - function name
-    mov rdx, r12                 ; Second parameter - DLL base
-    call [gpa_addr]              ; Call GetProcAddress
-    jmp save_function
+    ; Import by name: RAX = RVA of IMAGE_IMPORT_BY_NAME
+    add rax, r14                        ; VA of IMAGE_IMPORT_BY_NAME
+    add rax, 2                          ; skip Hint WORD -> function name string
+    mov rdx, rax                        ; arg2: name string
+    mov rcx, rbx                        ; arg1: module handle
+    call r12                            ; GetProcAddress(module, name) -> RAX
+    jmp _save_func
 
-import_by_ordinal:
-    and rax, 0FFFFh              ; Get ordinal number
-    mov rcx, rax                 ; First parameter - ordinal
-    mov rdx, r12                 ; Second parameter - DLL base
-    call [gpa_addr]              ; Call GetProcAddress
+_by_ordinal:
+    and rax, 0x0000FFFF                 ; low 16 bits = ordinal number
+    mov rdx, rax                        ; arg2: ordinal
+    mov rcx, rbx                        ; arg1: module handle
+    call r12                            ; GetProcAddress(module, ordinal) -> RAX
 
-save_function:
-    mov rcx, [imp_dir]
-    mov r13d, [rcx].FirstThunk   ; Get IAT RVA
-    add r13, rsi                 ; Get IAT address
+_save_func:
+    mov [r15], rax                      ; write resolved address to IAT slot (64-bit)
+    add rsi, 8                          ; advance INT ptr (64-bit entry = 8 bytes)
+    add r15, 8                          ; advance IAT ptr
+    jmp _thunk_loop
 
-    ; Calculate offset in IAT
-    mov r14, rdx
-    sub r14, r13
-    add r13, r14
+_next_desc:
+    add rdi, 0x14                       ; next IMAGE_IMPORT_DESCRIPTOR (20 bytes)
+    jmp _desc_loop
 
-    mov [r13], rax               ; Save function address
-    add rdx, 8                   ; Next import lookup entry
-    add r13, 8                   ; Next IAT entry
-    jmp process_functions
-
-next_dll:
-    add QWORD PTR [imp_dir], SIZE IMAGE_IMPORT_DESCRIPTOR ; Next import descriptor
-    jmp process_imports
-
-imports_done:
-    ; Restore registers
+_done:
+    add rsp, 0x28
     pop r15
     pop r14
     pop r13
@@ -334,15 +190,4 @@ imports_done:
     pop rbx
     pop rdi
     pop rsi
-    ret
-_start ENDP
-
-.data
-    gpa_name db 'GetProcAddress', 0
-    lla_name db 'LoadLibraryA', 0
-    align 8
-    gpa_addr dq 0
-    lla_addr dq 0
-    imp_dir  dq 0
-
-END
+    jmp rax                             ; terminal bytes (ff e0) - stripped by peor

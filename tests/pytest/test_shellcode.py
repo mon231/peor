@@ -1,3 +1,4 @@
+import re
 import time
 import ctypes
 import subprocess
@@ -122,3 +123,30 @@ def test_03_winapi_messagebox(arch, tmp_path):
         f"[{arch}] MessageBox text: expected {_MSGBOX_TEXT!r}, got {msgbox['text']!r}"
     )
     assert proc.returncode == 0, f"[{arch}] expected exit code 0, got {proc.returncode}"
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_04_crt_printf_rand(arch, tmp_path):
+    win_dir = ARCH_DIRS[arch]
+    pe_path = win_dir / "04_crt_printf_rand.exe"
+    loader_path = win_dir / "test_loader.exe"
+    _skip_if_missing(loader_path, pe_path)
+
+    shellcode_path = tmp_path / f"04_crt_printf_rand_{arch}.bin"
+    dump_memory_layout(PE(str(pe_path)), shellcode_path, resolve_imports=True)
+
+    result = subprocess.run(
+        [str(loader_path), str(shellcode_path)],
+        capture_output=True,
+        timeout=10,
+    )
+
+    stdout = result.stdout.decode(errors="replace").strip()
+    assert result.returncode == 0, (
+        f"[{arch}] expected exit code 0, got {result.returncode}\n"
+        f"stdout: {stdout}\n"
+        f"stderr: {result.stderr.decode(errors='replace')}"
+    )
+    assert re.fullmatch(r"Random: \d+", stdout), (
+        f"[{arch}] unexpected stdout: {stdout!r}"
+    )

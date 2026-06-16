@@ -136,10 +136,26 @@ def dump_memory_layout(pe: PE, output_file: Path, ignore_imports: bool = False,
         else:
             raise ValueError("Unsupported PE type")
 
-    # Layout: imports_resolver (tail stripped) | relocs_resolver | PE_image
+    # Layout: imports_resolver (tail stripped) | relocs_resolver | [align pad] | PE_image
     # The imports resolver falls through into the relocs resolver which applies
     # base relocations and JMPs to the PE entry point.
-    output_file.write_bytes(imports + relocs + ram_layout)
+    #
+    # The PE image must be 16-byte aligned within the shellcode buffer so that
+    # MOVDQA/MOVAPS instructions in the PE's code section can access .rdata without
+    # an alignment fault.  VirtualAlloc always returns a 64KB-aligned address, so
+    # we only need to ensure the prefix length is a multiple of 16.
+    align_pad = (-len(imports) - len(relocs)) % 16
+    if align_pad and relocs:
+        # Patch the PE-offset disp32 field inside the relocs resolver so it still
+        # lands on the PE after the extra NOP bytes.
+        # RELOCS_64 layout: e8...(5) 5b(1) 48 8d bb <disp32>(4) -> disp32 at byte 9
+        # RELOCS_32 layout: e8...(5) 5b(1) 8d bb    <disp32>(4) -> disp32 at byte 8
+        off_idx = 9 if pe.PE_TYPE == OPTIONAL_HEADER_MAGIC_PE_PLUS else 8
+        relocs = bytearray(relocs)
+        old = int.from_bytes(relocs[off_idx:off_idx + 4], 'little')
+        relocs[off_idx:off_idx + 4] = (old + align_pad).to_bytes(4, 'little')
+        relocs = bytes(relocs)
+    output_file.write_bytes(imports + relocs + (b'\x90' * align_pad) + bytes(ram_layout))
 
 
 def parse_arguments():

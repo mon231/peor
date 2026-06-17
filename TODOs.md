@@ -8,8 +8,15 @@ Attempt to add tests that would run correctly on CI/CD too.
 
 ## REFACTOR
 
+- [ ] **CI/CD fixup**
+  the ci/cd should SKIP test number 3
+
 - [ ] **create CCP exceptions test**
   create a new test-case where a visual-studio project cpp compiles with SEH-exceptions instead of cpp-exceptions, then use peor and ensure it supports SEH-based cpp types
+
+- [ ] **simpler versioning**
+  I want the setup.py to find the project's version in ci/cd (the ci/cd tags are named as the version, e.g. tag "v1.0.0" is package-version "1.0.0")
+  If no version is specified, use "0.0.1". NOTE users are installing it from pypi server, and it should be supported for them too, they do NOT have ci/cd variables of peor's version
 
 - [ ] **Collapse PE-type dispatch into lookup table**
   `dump_memory_layout` repeats `if pe.PE_TYPE == ...` four times...
@@ -40,16 +47,21 @@ Attempt to add tests that would run correctly on CI/CD too.
 - [ ] **support certificate-signed PE file**
   create a test for it
 
-- [ ] **support windows-PE embedded resources**
-  create a test for it
+- [ ] **pytest coverage ci/cd**
+  create a pytest coverage-report in ci/cd
 
 - [ ] **PE embedded resources — test coverage**
+  support windows-PE embedded resources
   `.rsrc` section is already included via the section loop.
   Verify resource RVAs survive relocation correctly; add a test PE that reads its own string resource at runtime.
 
 ---
 
 ## FAR FUTURE
+
+- [*] **cpp project builds**
+  ensure the output format of each compiled project is Win_x86 for the 32bit-version, and Win_x64 for the 64bit version.
+  add post-build steps that executes peor and creates shellcode for each project, after building it's PE file
 
 - [ ] **Linux/WSL libc test**
   Compile a PE that calls libc `write()` to stdout, run on WSL via the shellcode loader. Needs a Linux-hosted test_loader and a clear spec for what "PE targeting Linux" means (MinGW? custom subsystem?). Defer until spec is written.

@@ -1,3 +1,4 @@
+import os
 import re
 import time
 import ctypes
@@ -98,6 +99,7 @@ def test_shellcode_exit_code(arch, test_name, expected, tmp_path):
     )
 
 
+@pytest.mark.skipif(bool(os.getenv("CI")), reason="MessageBox requires an interactive desktop, skipped in CI")
 @pytest.mark.parametrize("arch", ["x86", "x64"])
 def test_03_winapi_messagebox(arch, tmp_path):
     win_dir = ARCH_DIRS[arch]

@@ -150,3 +150,99 @@ def test_04_crt_printf_rand(arch, tmp_path):
     assert re.fullmatch(r"Random: \d+", stdout), (
         f"[{arch}] unexpected stdout: {stdout!r}"
     )
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_05_dll_entry(arch, tmp_path):
+    """DLL shellcode: DllMain calls ExitProcess(42) on DLL_PROCESS_ATTACH."""
+    win_dir = ARCH_DIRS[arch]
+    pe_path = win_dir / "05_dll_entry.dll"
+    loader_path = win_dir / "test_loader.exe"
+    _skip_if_missing(loader_path, pe_path)
+
+    shellcode_path = tmp_path / f"05_dll_entry_{arch}.bin"
+    dump_memory_layout(PE(str(pe_path)), shellcode_path, resolve_imports=True)
+
+    result = subprocess.run(
+        [str(loader_path), str(shellcode_path)],
+        capture_output=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 42, (
+        f"[{arch}] expected exit code 42 from DllMain, got {result.returncode}\n"
+        f"stdout: {result.stdout.decode(errors='replace')}\n"
+        f"stderr: {result.stderr.decode(errors='replace')}"
+    )
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_06_stripped_relocs(arch, tmp_path):
+    """EXE with /FIXED (no .reloc section): reloc resolver must skip relocation and jump to OEP."""
+    win_dir = ARCH_DIRS[arch]
+    pe_path = win_dir / "06_stripped_relocs.exe"
+    loader_path = win_dir / "test_loader.exe"
+    _skip_if_missing(loader_path, pe_path)
+
+    shellcode_path = tmp_path / f"06_stripped_relocs_{arch}.bin"
+    dump_memory_layout(PE(str(pe_path)), shellcode_path)
+
+    result = subprocess.run(
+        [str(loader_path), str(shellcode_path)],
+        capture_output=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 99, (
+        f"[{arch}] expected exit code 99, got {result.returncode}\n"
+        f"stdout: {result.stdout.decode(errors='replace')}\n"
+        f"stderr: {result.stderr.decode(errors='replace')}"
+    )
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_07_cpp_exceptions(arch, tmp_path):
+    """C++ EXE with try/catch: x64 requires RtlAddFunctionTable for SEH unwind tables."""
+    win_dir = ARCH_DIRS[arch]
+    pe_path = win_dir / "07_cpp_exceptions.exe"
+    loader_path = win_dir / "test_loader.exe"
+    _skip_if_missing(loader_path, pe_path)
+
+    shellcode_path = tmp_path / f"07_cpp_exceptions_{arch}.bin"
+    dump_memory_layout(PE(str(pe_path)), shellcode_path, resolve_imports=True)
+
+    result = subprocess.run(
+        [str(loader_path), str(shellcode_path)],
+        capture_output=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 77, (
+        f"[{arch}] expected exit code 77, got {result.returncode}\n"
+        f"stdout: {result.stdout.decode(errors='replace')}\n"
+        f"stderr: {result.stderr.decode(errors='replace')}"
+    )
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_08_cpp_thread(arch, tmp_path):
+    """C++ EXE with std::thread: thread sets result=42, main returns it."""
+    win_dir = ARCH_DIRS[arch]
+    pe_path = win_dir / "08_cpp_thread.exe"
+    loader_path = win_dir / "test_loader.exe"
+    _skip_if_missing(loader_path, pe_path)
+
+    shellcode_path = tmp_path / f"08_cpp_thread_{arch}.bin"
+    dump_memory_layout(PE(str(pe_path)), shellcode_path, resolve_imports=True)
+
+    result = subprocess.run(
+        [str(loader_path), str(shellcode_path)],
+        capture_output=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 42, (
+        f"[{arch}] expected exit code 42, got {result.returncode}\n"
+        f"stdout: {result.stdout.decode(errors='replace')}\n"
+        f"stderr: {result.stderr.decode(errors='replace')}"
+    )

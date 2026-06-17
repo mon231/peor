@@ -1,9 +1,11 @@
-; x86 (32-bit) relocation resolver - position-independent shellcode
+; x86 (32-bit) relocation resolver with DLL-entry support
 ; Assembled by keystone (KS_ARCH_X86 / KS_MODE_32 / KS_OPT_SYNTAX_NASM).
 ;
-; Locates the PE image appended immediately after this shellcode (_pe_start),
-; applies IMAGE_REL_BASED_HIGHLOW (type 3) base relocations, then JMPs to
-; the PE entry point.  Handles delta=0 (no relocs) and missing reloc table.
+; Extension over the bare reloc resolver:
+;   * Detects DLL images (IMAGE_FILE_DLL) and calls DllMain with the
+;     standard DLL_PROCESS_ATTACH arguments instead of jumping to the entry
+;     point directly.
+;   * Correctly handles PEs with no .reloc section (DataDir[5].VA == 0).
 ;
 ; NOTE: 0x7E7E7E7E is a placeholder patched by setup.py with (shellcode_size - 5).
 
@@ -67,8 +69,21 @@ _next_entry:
 _jmp_ep:
     mov esi, [ebx + 0x3C]
     add esi, ebx
-    mov eax, [esi + 0x28]                ; AddressOfEntryPoint (NT+0x28)
-    add eax, ebx
+    mov eax, [esi + 0x28]               ; AddressOfEntryPoint (NT+0x28)
+    add eax, ebx                         ; EAX = OEP VA
+
+    ; Check IMAGE_FILE_DLL (bit 13 of Characteristics at NT+0x16)
+    test word [esi + 0x16], 0x2000
+    jz _exe_entry
+
+    ; DLL: call DllMain(hinstDLL, DLL_PROCESS_ATTACH, NULL) -- stdcall callee cleans args
+    push 0                               ; arg3: lpvReserved = NULL
+    push 1                               ; arg2: DLL_PROCESS_ATTACH
+    push ebx                             ; arg1: hinstDLL = PE base
+    call eax                             ; DllMain(base, 1, NULL)
+    hlt                                  ; DllMain should call ExitProcess; if not, halt
+
+_exe_entry:
     jmp eax
 
 _exit:

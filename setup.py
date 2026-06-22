@@ -20,8 +20,8 @@ README_PATH = CURRENT_FOLDER / 'README.md'
 ASM_DIR = CURRENT_FOLDER / 'asm'
 SHELLCODES_PY = CURRENT_FOLDER / 'peor' / '_shellcodes.py'
 
-# Magic placeholder used in reloc-resolver ASM to mark where the PE offset goes.
-# After assembly the actual (shellcode_size - 5) is patched in.
+# Matches `PE_OFFSET_PLACEHOLDER equ 0x7E7E7E7E` in relocations_resolver{32,64}.asm.
+# After assembly, setup.py patches these bytes with the actual (shellcode_size - 5).
 _PE_OFFSET_PLACEHOLDER = b'\x7e\x7e\x7e\x7e'
 
 

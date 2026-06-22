@@ -7,12 +7,14 @@
 ;     point directly.
 ;   * Correctly handles PEs with no .reloc section (DataDir[5].VA == 0).
 ;
-; NOTE: 0x7E7E7E7E is a placeholder patched by setup.py with (shellcode_size - 5).
+; PE_OFFSET_PLACEHOLDER is patched by setup.py with (shellcode_size - 5).
+; The name must match _PE_OFFSET_PLACEHOLDER in setup.py.
+%define PE_OFFSET_PLACEHOLDER 0x7E7E7E7E
 
     call _base
 _base:
     pop ebx                              ; EBX = runtime address of _base
-    lea edi, [ebx + 0x7E7E7E7E]         ; PATCHED: EDI = PE image base
+    lea edi, [ebx + PE_OFFSET_PLACEHOLDER] ; PATCHED: EDI = PE image base
     mov ebx, edi                         ; EBX = PE base
 
     cmp word [ebx], 0x5A4D               ; DOS "MZ" magic

@@ -1,8 +1,18 @@
+import os
 import struct
 import setuptools
 from pathlib import Path
 from setuptools.command.build_py import build_py as _build_py
 from setuptools.command.develop import develop as _develop
+
+
+def _get_version():
+    # CI/CD tags are named "vX.Y.Z"; GITHUB_REF is "refs/tags/vX.Y.Z" on a release.
+    # PyPI users install without CI variables, so fall back to 0.0.1.
+    ref = os.environ.get('GITHUB_REF', '')
+    if ref.startswith('refs/tags/v'):
+        return ref[len('refs/tags/v'):]
+    return '0.0.1'
 
 
 CURRENT_FOLDER = Path(__file__).parent
@@ -75,7 +85,7 @@ class develop(_develop):
 
 setuptools.setup(
     name='peor',
-    version='1.0.0',
+    version=_get_version(),
     author='Ariel Tubul',
     packages=setuptools.find_packages(),
     long_description=README_PATH.read_text(),

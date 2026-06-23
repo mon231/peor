@@ -25,6 +25,10 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "09_resources", "09_resource
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "10_tls_callbacks", "10_tls_callbacks\10_tls_callbacks.vcxproj", "{AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "11_cpp_exceptions", "11_cpp_exceptions\11_cpp_exceptions.vcxproj", "{CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "12_seh_exceptions", "12_seh_exceptions\12_seh_exceptions.vcxproj", "{DDDDDDDD-DDDD-DDDD-DDDD-DDDDDDDDDDDD}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Win32 = Debug|Win32
@@ -121,6 +125,22 @@ Global
 		{AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA}.Release|Win32.Build.0 = Release|Win32
 		{AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA}.Release|x64.ActiveCfg = Release|x64
 		{AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA}.Release|x64.Build.0 = Release|x64
+		{CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC}.Debug|Win32.ActiveCfg = Debug|Win32
+		{CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC}.Debug|Win32.Build.0 = Debug|Win32
+		{CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC}.Debug|x64.ActiveCfg = Debug|x64
+		{CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC}.Debug|x64.Build.0 = Debug|x64
+		{CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC}.Release|Win32.ActiveCfg = Release|Win32
+		{CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC}.Release|Win32.Build.0 = Release|Win32
+		{CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC}.Release|x64.ActiveCfg = Release|x64
+		{CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC}.Release|x64.Build.0 = Release|x64
+		{DDDDDDDD-DDDD-DDDD-DDDD-DDDDDDDDDDDD}.Debug|Win32.ActiveCfg = Debug|Win32
+		{DDDDDDDD-DDDD-DDDD-DDDD-DDDDDDDDDDDD}.Debug|Win32.Build.0 = Debug|Win32
+		{DDDDDDDD-DDDD-DDDD-DDDD-DDDDDDDDDDDD}.Debug|x64.ActiveCfg = Debug|x64
+		{DDDDDDDD-DDDD-DDDD-DDDD-DDDDDDDDDDDD}.Debug|x64.Build.0 = Debug|x64
+		{DDDDDDDD-DDDD-DDDD-DDDD-DDDDDDDDDDDD}.Release|Win32.ActiveCfg = Release|Win32
+		{DDDDDDDD-DDDD-DDDD-DDDD-DDDDDDDDDDDD}.Release|Win32.Build.0 = Release|Win32
+		{DDDDDDDD-DDDD-DDDD-DDDD-DDDDDDDDDDDD}.Release|x64.ActiveCfg = Release|x64
+		{DDDDDDDD-DDDD-DDDD-DDDD-DDDDDDDDDDDD}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

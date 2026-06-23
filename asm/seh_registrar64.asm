@@ -56,7 +56,7 @@ _raft_loop:
     push r10
     push rcx                              ; save export dir
     mov rsi, rax                          ; RSI = name VA in ntdll
-    mov ecx, 20                           ; len("RtlAddFunctionTable\0") = 20
+    mov ecx, 0x14                         ; len("RtlAddFunctionTable\0") = 20
     cld
     repe cmpsb
     pop rcx                               ; restore export dir
@@ -89,7 +89,7 @@ _raft_loop:
     mov eax, [r9 + 0xA4]                 ; DataDir[3].Size
     xor edx, edx
     push rcx                              ; save arg1; RSP = 0 (mod 16)
-    mov ecx, 12
+    mov ecx, 0xc
     div ecx                               ; EAX = Size / 12 = EntryCount
     mov edx, eax                          ; arg2: EntryCount
     pop rcx                               ; restore arg1; RSP = 8 (mod 16)

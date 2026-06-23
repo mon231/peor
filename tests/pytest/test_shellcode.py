@@ -348,3 +348,55 @@ def test_10_tls_callbacks(arch, tmp_path):
         f"stdout: {result.stdout.decode(errors='replace')}\n"
         f"stderr: {result.stderr.decode(errors='replace')}"
     )
+
+
+@pytest.mark.parametrize("arch", ["x64"])
+def test_11_cpp_exceptions(arch, tmp_path):
+    """C++ EXE with typed throw/catch: typed catch must return 123; catch(...) returns 456; no-catch 789."""
+    win_dir = ARCH_DIRS[arch]
+    pe_path = win_dir / "11_cpp_exceptions.exe"
+    loader_path = win_dir / "test_loader.exe"
+    _skip_if_missing(loader_path, pe_path)
+
+    shellcode_path = tmp_path / f"11_cpp_exceptions_{arch}.bin"
+    dump_memory_layout(PE(str(pe_path)), shellcode_path, resolve_imports=True)
+
+    result = subprocess.run(
+        [str(loader_path), str(shellcode_path)],
+        capture_output=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 123, (
+        f"[{arch}] expected exit code 123 (typed catch fired), got {result.returncode}\n"
+        f"  456 = catch(...) fired (type matching broken)\n"
+        f"  789 = no exception caught at all\n"
+        f"stdout: {result.stdout.decode(errors='replace')}\n"
+        f"stderr: {result.stderr.decode(errors='replace')}"
+    )
+
+
+@pytest.mark.parametrize("arch", ["x64"])
+def test_12_seh_exceptions(arch, tmp_path):
+    """C++ EXE compiled with /EHa (SEH-integrated): typed catch must fire and return 123."""
+    win_dir = ARCH_DIRS[arch]
+    pe_path = win_dir / "12_seh_exceptions.exe"
+    loader_path = win_dir / "test_loader.exe"
+    _skip_if_missing(loader_path, pe_path)
+
+    shellcode_path = tmp_path / f"12_seh_exceptions_{arch}.bin"
+    dump_memory_layout(PE(str(pe_path)), shellcode_path, resolve_imports=True)
+
+    result = subprocess.run(
+        [str(loader_path), str(shellcode_path)],
+        capture_output=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 123, (
+        f"[{arch}] expected exit code 123 (typed catch fired), got {result.returncode}\n"
+        f"  456 = catch(...) fired (type matching broken — cxx_eh_fixer not working with /EHa)\n"
+        f"  789 = no exception caught at all\n"
+        f"stdout: {result.stdout.decode(errors='replace')}\n"
+        f"stderr: {result.stderr.decode(errors='replace')}"
+    )

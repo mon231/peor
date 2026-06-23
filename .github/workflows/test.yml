@@ -25,7 +25,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e .
-          pip install pytest
+          pip install pytest pytest-cov
 
       - name: Build test suite (x86)
         working-directory: tests
@@ -35,5 +35,11 @@ jobs:
         working-directory: tests
         run: msbuild tests.sln /p:Configuration=Release /p:Platform=x64 /nologo /verbosity:minimal
 
-      - name: Run pytest
-        run: pytest tests/pytest/ -v
+      - name: Run pytest with coverage
+        run: pytest tests/pytest/ -v --cov=peor --cov-report=xml --cov-report=term-missing
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml

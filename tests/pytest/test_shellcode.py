@@ -1,6 +1,8 @@
 import os
 import re
 import time
+import struct
+import shutil
 import ctypes
 import subprocess
 from pathlib import Path
@@ -275,24 +277,31 @@ def test_09_resources(arch, tmp_path):
 
 
 def _sign_pe(source_path: Path, dest_path: Path) -> bool:
-    """Sign a PE copy using PowerShell New-SelfSignedCertificate. Returns False on failure."""
-    import shutil
+    """Append a dummy WIN_CERTIFICATE to a PE copy to exercise the security directory.
+
+    Uses only Python stdlib so the test runs on any OS without PowerShell.
+    DataDir[4] (IMAGE_DIRECTORY_ENTRY_SECURITY) stores a file offset (not an RVA);
+    we append a minimal WIN_CERTIFICATE structure past the last section and record it.
+    """
     shutil.copy2(source_path, dest_path)
-    ps = (
-        f'$cert = New-SelfSignedCertificate -DnsName "peor-test" -Type CodeSigning'
-        f' -CertStoreLocation Cert:\\CurrentUser\\My;'
-        f' $null = Set-AuthenticodeSignature -FilePath "{dest_path}" -Certificate $cert;'
-        f' $cert | Remove-Item -Force -ErrorAction SilentlyContinue'
-    )
     try:
-        r = subprocess.run(
-            ["powershell", "-NonInteractive", "-Command", ps],
-            capture_output=True, timeout=30,
-        )
-        if r.returncode != 0:
-            return False
-        pe = PE(str(dest_path))
-        dirs = pe.OPTIONAL_HEADER.DATA_DIRECTORY
+        pe_bytes = bytearray(dest_path.read_bytes())
+        e_lfanew = struct.unpack_from('<I', pe_bytes, 0x3c)[0]
+        pe_magic = struct.unpack_from('<H', pe_bytes, e_lfanew + 24)[0]
+        # DataDirectory array starts at: e_lfanew + 4 (sig) + 20 (file hdr) + 96 or 112 (opt hdr fields)
+        dir_array_off = e_lfanew + 24 + (96 if pe_magic == 0x10b else 112)
+        sec_dir_off   = dir_array_off + 4 * 8  # DataDir[4]
+
+        # Minimal WIN_CERTIFICATE: dwLength | wRevision=0x0200 | wCertificateType=0x0002 | data
+        dummy_data = b'\x00' * 16
+        win_cert   = struct.pack('<IHH', 8 + len(dummy_data), 0x0200, 0x0002) + dummy_data
+
+        cert_file_offset = len(pe_bytes)           # security dir stores a file offset, not RVA
+        pe_bytes.extend(win_cert)
+        struct.pack_into('<II', pe_bytes, sec_dir_off, cert_file_offset, len(win_cert))
+        dest_path.write_bytes(bytes(pe_bytes))
+
+        dirs = PE(str(dest_path)).OPTIONAL_HEADER.DATA_DIRECTORY
         return len(dirs) > 4 and dirs[4].VirtualAddress != 0
     except Exception:
         return False
@@ -307,8 +316,7 @@ def test_certificate_signed_pe(arch, tmp_path):
     _skip_if_missing(loader_path, pe_path)
 
     signed_path = tmp_path / f"02_relocs_functions_signed_{arch}.exe"
-    if not _sign_pe(pe_path, signed_path):
-        pytest.skip("Could not sign PE (PowerShell/certificate unavailable)")
+    assert _sign_pe(pe_path, signed_path), 'failed singing the PE file'
 
     shellcode_path = tmp_path / f"02_relocs_signed_{arch}.bin"
     dump_memory_layout(PE(str(signed_path)), shellcode_path)

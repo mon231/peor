@@ -17,9 +17,19 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: 'pip'
 
       - name: Set up MSBuild
         uses: microsoft/setup-msbuild@v2
+
+      - name: Cache test binaries
+        id: cache-test-binaries
+        uses: actions/cache@v4
+        with:
+          path: |
+            tests/Win_x86
+            tests/Win_x64
+          key: test-binaries-${{ hashFiles('tests/**/*.cpp', 'tests/**/*.c', 'tests/**/*.vcxproj', 'tests/tests.sln') }}
 
       - name: Install Python dependencies
         run: |
@@ -28,10 +38,12 @@ jobs:
           pip install pytest pytest-cov
 
       - name: Build test suite (x86)
+        if: steps.cache-test-binaries.outputs.cache-hit != 'true'
         working-directory: tests
         run: msbuild tests.sln /p:Configuration=Release /p:Platform=Win32 /nologo /verbosity:minimal
 
       - name: Build test suite (x64)
+        if: steps.cache-test-binaries.outputs.cache-hit != 'true'
         working-directory: tests
         run: msbuild tests.sln /p:Configuration=Release /p:Platform=x64 /nologo /verbosity:minimal
 

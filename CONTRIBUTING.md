@@ -15,3 +15,5 @@ NOTE to add a test to any feature added, and ensure your code matches the conven
     1. add an "opt out" flag wherever the added asm file isn't required (i.e. imports resolver is NOT really required, the PE can solve them by itself. the relocs resolver IS required - as the PE needs it to execute opcodes correctly)
     1. by default all features are usable in all implemented platforms, unless the user specified he doesn't want them in his binary
 1. update the `README.md` when adding a new feature/test-case
+1. remove unused variables / code lines. our goal is to have the highest test-coverage possible
+1. remove unused files, we don't want the repo to be bloated

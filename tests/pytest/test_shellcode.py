@@ -216,7 +216,7 @@ def test_07_cpp_exceptions(arch, tmp_path):
     result = subprocess.run(
         [str(loader_path), str(shellcode_path)],
         capture_output=True,
-        timeout=10,
+        timeout=30,  # x86 WER processing takes 6-9s on unhandled exceptions
     )
 
     assert result.returncode == 77, (
@@ -245,6 +245,82 @@ def test_08_cpp_thread(arch, tmp_path):
 
     assert result.returncode == 42, (
         f"[{arch}] expected exit code 42, got {result.returncode}\n"
+        f"stdout: {result.stdout.decode(errors='replace')}\n"
+        f"stderr: {result.stderr.decode(errors='replace')}"
+    )
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_09_resources(arch, tmp_path):
+    """C++ EXE with embedded string resource: reads via __ImageBase HMODULE, returns 42 on match."""
+    win_dir = ARCH_DIRS[arch]
+    pe_path = win_dir / "09_resources.exe"
+    loader_path = win_dir / "test_loader.exe"
+    _skip_if_missing(loader_path, pe_path)
+
+    shellcode_path = tmp_path / f"09_resources_{arch}.bin"
+    dump_memory_layout(PE(str(pe_path)), shellcode_path, resolve_imports=True)
+
+    result = subprocess.run(
+        [str(loader_path), str(shellcode_path)],
+        capture_output=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 42, (
+        f"[{arch}] expected exit code 42 (resource read OK), got {result.returncode}\n"
+        f"stdout: {result.stdout.decode(errors='replace')}\n"
+        f"stderr: {result.stderr.decode(errors='replace')}"
+    )
+
+
+def _sign_pe(source_path: Path, dest_path: Path) -> bool:
+    """Sign a PE copy using PowerShell New-SelfSignedCertificate. Returns False on failure."""
+    import shutil
+    shutil.copy2(source_path, dest_path)
+    ps = (
+        f'$cert = New-SelfSignedCertificate -DnsName "peor-test" -Type CodeSigning'
+        f' -CertStoreLocation Cert:\\CurrentUser\\My;'
+        f' $null = Set-AuthenticodeSignature -FilePath "{dest_path}" -Certificate $cert;'
+        f' $cert | Remove-Item -Force -ErrorAction SilentlyContinue'
+    )
+    try:
+        r = subprocess.run(
+            ["powershell", "-NonInteractive", "-Command", ps],
+            capture_output=True, timeout=30,
+        )
+        if r.returncode != 0:
+            return False
+        pe = PE(str(dest_path))
+        dirs = pe.OPTIONAL_HEADER.DATA_DIRECTORY
+        return len(dirs) > 4 and dirs[4].VirtualAddress != 0
+    except Exception:
+        return False
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_certificate_signed_pe(arch, tmp_path):
+    """peor must produce correct shellcode from an Authenticode-signed PE."""
+    win_dir = ARCH_DIRS[arch]
+    pe_path = win_dir / "02_relocs_functions.exe"
+    loader_path = win_dir / "test_loader.exe"
+    _skip_if_missing(loader_path, pe_path)
+
+    signed_path = tmp_path / f"02_relocs_functions_signed_{arch}.exe"
+    if not _sign_pe(pe_path, signed_path):
+        pytest.skip("Could not sign PE (PowerShell/certificate unavailable)")
+
+    shellcode_path = tmp_path / f"02_relocs_signed_{arch}.bin"
+    dump_memory_layout(PE(str(signed_path)), shellcode_path)
+
+    result = subprocess.run(
+        [str(loader_path), str(shellcode_path)],
+        capture_output=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 90, (
+        f"[{arch}] signed PE: expected exit code 90, got {result.returncode}\n"
         f"stdout: {result.stdout.decode(errors='replace')}\n"
         f"stderr: {result.stderr.decode(errors='replace')}"
     )

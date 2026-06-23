@@ -1,12 +1,17 @@
 import argparse
 from pathlib import Path
 from pefile import PE, OPTIONAL_HEADER_MAGIC_PE, OPTIONAL_HEADER_MAGIC_PE_PLUS
-from peor._shellcodes import RELOCS_32, RELOCS_64, IMPORTS_32_UM, IMPORTS_64_UM
+from peor._shellcodes import (
+    RELOCS_32, RELOCS_64,
+    IMPORTS_32_UM, IMPORTS_64_UM,
+    ENTRYPOINT_32, ENTRYPOINT_64,
+    SEH_REGISTRAR_64,
+)
 
 # Trailing bytes that terminate each import resolver so it falls through into the
 # relocs resolver. We strip them at output time.
-#   x86: 0xC3 (RET)  →  stripped → falls through to RELOCS_32
-#   x64: 0xFF 0xE0 (JMP RAX)  →  stripped → falls through to RELOCS_64
+#   x86: 0xC3 (RET)         → stripped → falls through to RELOCS_32
+#   x64: 0xFF 0xE0 (JMP RAX) → stripped → falls through to RELOCS_64
 _IMPORTS_TAIL_32 = b'\xc3'
 _IMPORTS_TAIL_64 = b'\xff\xe0'
 
@@ -19,12 +24,14 @@ _NATIVE_SUBSYSTEM = 1                           # Windows native (kernel-mode dr
 #   PE32  (0x10B): 96  bytes  (PECOFF spec §3.4.1)
 #   PE32+ (0x20B): 112 bytes  (PECOFF spec §3.4.2)
 # disp32_off: byte index of the LEA disp32 field inside the assembled relocs resolver
-#   RELOCS_32: e8..(5) 5b(1) 8d bb <disp32>(4)  →  disp32 at byte 8
-#   RELOCS_64: e8..(5) 5b(1) 48 8d bb <disp32>(4)  →  disp32 at byte 9
+#   RELOCS_32: e8..(5) 5b(1) 8d bb <disp32>(4)       → disp32 at byte 8
+#   RELOCS_64: e8..(5) 5b(1) 48 8d bb <disp32>(4)    → disp32 at byte 9
 _SHELLCODES = {
     OPTIONAL_HEADER_MAGIC_PE: {
         'relocs':           RELOCS_32,
         'imports':          IMPORTS_32_UM,
+        'entrypoint':       ENTRYPOINT_32,
+        'seh':              None,             # x86 has no RUNTIME_FUNCTION table
         'tail':             _IMPORTS_TAIL_32,
         'dir_array_offset': 96,
         'disp32_off':       8,
@@ -32,6 +39,8 @@ _SHELLCODES = {
     OPTIONAL_HEADER_MAGIC_PE_PLUS: {
         'relocs':           RELOCS_64,
         'imports':          IMPORTS_64_UM,
+        'entrypoint':       ENTRYPOINT_64,
+        'seh':              SEH_REGISTRAR_64,
         'tail':             _IMPORTS_TAIL_64,
         'dir_array_offset': 112,
         'disp32_off':       9,
@@ -45,19 +54,24 @@ def _strip_tail(shellcode: bytes, tail: bytes) -> bytes:
     return shellcode
 
 
-def dump_memory_layout(pe: PE, output_file: Path, ignore_imports: bool = False,
-                       resolve_imports: bool = False):
+def _has_exception_table(pe: PE) -> bool:
+    dirs = pe.OPTIONAL_HEADER.DATA_DIRECTORY
+    return len(dirs) > 3 and dirs[3].VirtualAddress != 0
+
+
+def _validate_pe(pe: PE) -> dict:
     subsystem = pe.OPTIONAL_HEADER.Subsystem
     if subsystem in _EFI_SUBSYSTEMS:
         raise ValueError(f"EFI PE (subsystem {subsystem}) is not yet supported")
     if subsystem == _NATIVE_SUBSYSTEM:
         raise ValueError(f"Kernel-mode PE (subsystem {subsystem}) is not yet supported")
-
     entry = _SHELLCODES.get(pe.PE_TYPE)
     if entry is None:
         raise ValueError(f"Unsupported PE type: 0x{pe.PE_TYPE:04X}")
+    return entry
 
-    # Build in-memory PE image
+
+def _build_ram_layout(pe: PE) -> bytearray:
     ram_layout = bytearray()
     ram_layout.extend(pe.get_data(0, pe.OPTIONAL_HEADER.SizeOfHeaders))
     for section in pe.sections:
@@ -66,31 +80,46 @@ def dump_memory_layout(pe: PE, output_file: Path, ignore_imports: bool = False,
         ram_layout.extend(section.get_data())
     while len(ram_layout) < pe.OPTIONAL_HEADER.SizeOfImage:
         ram_layout.append(0)
+    return ram_layout
 
-    if ignore_imports:
-        # Zero DataDirectory[1] (IMPORT) so the PE has no import table at runtime.
-        # Optional header starts at e_lfanew + 4 (PE sig) + 20 (file header) = e_lfanew + 24.
-        opt_off = pe.DOS_HEADER.e_lfanew + 24
-        import_entry_off = opt_off + entry['dir_array_offset'] + 1 * 8  # index 1, 8 bytes each
-        ram_layout[import_entry_off:import_entry_off + 8] = b'\x00' * 8
 
-    relocs = entry['relocs']
-    imports = b''
-    if resolve_imports:
-        imports = _strip_tail(entry['imports'], entry['tail'])
+def _zero_import_dir(ram_layout: bytearray, pe: PE, entry: dict) -> None:
+    # Optional header starts at e_lfanew + 4 (PE sig) + 20 (file header) = e_lfanew + 24.
+    opt_off = pe.DOS_HEADER.e_lfanew + 24
+    import_entry_off = opt_off + entry['dir_array_offset'] + 1 * 8  # DataDir[1], 8 bytes each
+    ram_layout[import_entry_off:import_entry_off + 8] = b'\x00' * 8
 
-    # Layout: imports_resolver (tail stripped) | relocs_resolver | [align pad] | PE_image
+
+def _build_shellcode_chain(pe: PE, entry: dict, resolve_imports: bool) -> bytes:
+    # Chain order: [imports] → relocs → [seh] → entrypoint → [align_pad]
+    imports    = _strip_tail(entry['imports'], entry['tail']) if resolve_imports else b''
+    relocs     = entry['relocs']
+    seh        = entry['seh'] if (entry['seh'] and _has_exception_table(pe)) else b''
+    entrypoint = entry['entrypoint']
+
     # PE image must be 16-byte aligned in the buffer for MOVDQA/MOVAPS safety.
-    # VirtualAlloc returns 64KB-aligned memory, so only the prefix length matters.
-    align_pad = (-len(imports) - len(relocs)) % 16
-    if align_pad and relocs:
-        off_idx = entry['disp32_off']
-        relocs = bytearray(relocs)
-        old = int.from_bytes(relocs[off_idx:off_idx + 4], 'little')
-        relocs[off_idx:off_idx + 4] = (old + align_pad).to_bytes(4, 'little')
-        relocs = bytes(relocs)
+    align_pad = (-len(imports) - len(relocs) - len(seh) - len(entrypoint)) % 16
 
-    output_file.write_bytes(imports + relocs + (b'\x90' * align_pad) + bytes(ram_layout))
+    # Patch the disp32 in the relocs resolver.
+    # setup.py bakes in disp32 = len(relocs_assembled) - 5 (PE follows relocs standalone).
+    # At runtime we add the remaining shellcodes + alignment padding.
+    extra  = len(seh) + len(entrypoint) + align_pad
+    off    = entry['disp32_off']
+    relocs = bytearray(relocs)
+    old    = int.from_bytes(relocs[off:off + 4], 'little')
+    relocs[off:off + 4] = (old + extra).to_bytes(4, 'little')
+
+    return imports + bytes(relocs) + seh + entrypoint + (b'\x90' * align_pad)
+
+
+def dump_memory_layout(pe: PE, output_file: Path, ignore_imports: bool = False,
+                       resolve_imports: bool = False):
+    entry      = _validate_pe(pe)
+    ram_layout = _build_ram_layout(pe)
+    if ignore_imports:
+        _zero_import_dir(ram_layout, pe, entry)
+    prefix = _build_shellcode_chain(pe, entry, resolve_imports)
+    output_file.write_bytes(prefix + bytes(ram_layout))
 
 
 def parse_arguments():

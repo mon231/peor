@@ -6,6 +6,7 @@ from peor._shellcodes import (
     IMPORTS_32_UM, IMPORTS_64_UM,
     ENTRYPOINT_32, ENTRYPOINT_64,
     SEH_REGISTRAR_64,
+    TLS_CALLBACKS_32, TLS_CALLBACKS_64,
 )
 
 # Trailing bytes that terminate each import resolver so it falls through into the
@@ -31,7 +32,8 @@ _SHELLCODES = {
         'relocs':           RELOCS_32,
         'imports':          IMPORTS_32_UM,
         'entrypoint':       ENTRYPOINT_32,
-        'seh':              None,             # x86 has no RUNTIME_FUNCTION table
+        'seh':              None,               # x86 has no RUNTIME_FUNCTION table
+        'tls':              TLS_CALLBACKS_32,
         'tail':             _IMPORTS_TAIL_32,
         'dir_array_offset': 96,
         'disp32_off':       8,
@@ -41,6 +43,7 @@ _SHELLCODES = {
         'imports':          IMPORTS_64_UM,
         'entrypoint':       ENTRYPOINT_64,
         'seh':              SEH_REGISTRAR_64,
+        'tls':              TLS_CALLBACKS_64,
         'tail':             _IMPORTS_TAIL_64,
         'dir_array_offset': 112,
         'disp32_off':       9,
@@ -57,6 +60,20 @@ def _strip_tail(shellcode: bytes, tail: bytes) -> bytes:
 def _has_exception_table(pe: PE) -> bool:
     dirs = pe.OPTIONAL_HEADER.DATA_DIRECTORY
     return len(dirs) > 3 and dirs[3].VirtualAddress != 0
+
+
+def _has_tls_callbacks(pe: PE) -> bool:
+    dirs = pe.OPTIONAL_HEADER.DATA_DIRECTORY
+    if len(dirs) <= 9 or dirs[9].VirtualAddress == 0:
+        return False
+    tls_rva = dirs[9].VirtualAddress
+    # AddressOfCallBacks: offset 0x0C in IMAGE_TLS_DIRECTORY32, 0x18 in IMAGE_TLS_DIRECTORY64
+    if pe.PE_TYPE == OPTIONAL_HEADER_MAGIC_PE:
+        cb_off, ptr_size = 0x0C, 4
+    else:
+        cb_off, ptr_size = 0x18, 8
+    raw = pe.get_data(tls_rva + cb_off, ptr_size)
+    return int.from_bytes(raw, 'little') != 0
 
 
 def _validate_pe(pe: PE) -> dict:
@@ -91,25 +108,26 @@ def _zero_import_dir(ram_layout: bytearray, pe: PE, entry: dict) -> None:
 
 
 def _build_shellcode_chain(pe: PE, entry: dict, resolve_imports: bool) -> bytes:
-    # Chain order: [imports] → relocs → [seh] → entrypoint → [align_pad]
+    # Chain order: [imports] → relocs → [seh] → [tls] → entrypoint → [align_pad]
     imports    = _strip_tail(entry['imports'], entry['tail']) if resolve_imports else b''
     relocs     = entry['relocs']
     seh        = entry['seh'] if (entry['seh'] and _has_exception_table(pe)) else b''
+    tls        = entry['tls'] if (entry['tls'] and _has_tls_callbacks(pe)) else b''
     entrypoint = entry['entrypoint']
 
     # PE image must be 16-byte aligned in the buffer for MOVDQA/MOVAPS safety.
-    align_pad = (-len(imports) - len(relocs) - len(seh) - len(entrypoint)) % 16
+    align_pad = (-len(imports) - len(relocs) - len(seh) - len(tls) - len(entrypoint)) % 16
 
     # Patch the disp32 in the relocs resolver.
     # setup.py bakes in disp32 = len(relocs_assembled) - 5 (PE follows relocs standalone).
     # At runtime we add the remaining shellcodes + alignment padding.
-    extra  = len(seh) + len(entrypoint) + align_pad
+    extra  = len(seh) + len(tls) + len(entrypoint) + align_pad
     off    = entry['disp32_off']
     relocs = bytearray(relocs)
     old    = int.from_bytes(relocs[off:off + 4], 'little')
     relocs[off:off + 4] = (old + extra).to_bytes(4, 'little')
 
-    return imports + bytes(relocs) + seh + entrypoint + (b'\x90' * align_pad)
+    return imports + bytes(relocs) + seh + tls + entrypoint + (b'\x90' * align_pad)
 
 
 def dump_memory_layout(pe: PE, output_file: Path, ignore_imports: bool = False,

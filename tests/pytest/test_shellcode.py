@@ -248,3 +248,27 @@ def test_08_cpp_thread(arch, tmp_path):
         f"stdout: {result.stdout.decode(errors='replace')}\n"
         f"stderr: {result.stderr.decode(errors='replace')}"
     )
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_10_tls_callbacks(arch, tmp_path):
+    """C++ EXE with TLS callback: callback sets g_result=88, main returns it via a C++ static-local."""
+    win_dir = ARCH_DIRS[arch]
+    pe_path = win_dir / "10_tls_callbacks.exe"
+    loader_path = win_dir / "test_loader.exe"
+    _skip_if_missing(loader_path, pe_path)
+
+    shellcode_path = tmp_path / f"10_tls_callbacks_{arch}.bin"
+    dump_memory_layout(PE(str(pe_path)), shellcode_path, resolve_imports=True)
+
+    result = subprocess.run(
+        [str(loader_path), str(shellcode_path)],
+        capture_output=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 88, (
+        f"[{arch}] expected exit code 88 (TLS callback ran), got {result.returncode}\n"
+        f"stdout: {result.stdout.decode(errors='replace')}\n"
+        f"stderr: {result.stderr.decode(errors='replace')}"
+    )

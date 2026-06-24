@@ -133,6 +133,11 @@
   <ItemGroup>
     <ClCompile Include="main.c" />
   </ItemGroup>
+  <ItemDefinitionGroup>
+    <PostBuildEvent>
+      <Command>peor -i "$(TargetPath)" -o "$(OutDir)$(TargetName).shellcode"</Command>
+    </PostBuildEvent>
+  </ItemDefinitionGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>

@@ -1,50 +1,68 @@
+import struct
 import argparse
 from pathlib import Path
 from pefile import PE, OPTIONAL_HEADER_MAGIC_PE, OPTIONAL_HEADER_MAGIC_PE_PLUS
-from peor._shellcodes import RELOCS_32, RELOCS_64, IMPORTS_32_UM, IMPORTS_64_UM
+from peor._shellcodes import (
+    RELOCS_32, RELOCS_64,
+    IMPORTS_32_UM, IMPORTS_64_UM,
+    ENTRYPOINT_32, ENTRYPOINT_64,
+    SEH_REGISTRAR_32, SEH_REGISTRAR_64,
+    TLS_CALLBACKS_32, TLS_CALLBACKS_64,
+    CXX_EH_FIXER_64,
+)
 
-# PE Magic numbers for different architectures
-OPTIONAL_HEADER_MAGIC_ARM = 0x10B3    # ARM
-OPTIONAL_HEADER_MAGIC_ARM64 = 0x20B3  # ARM64
+# Trailing bytes that terminate each import resolver so it falls through into the
+# relocs resolver. We strip them at output time.
+#   x86: 0xC3 (RET)         → stripped → falls through to RELOCS_32
+#   x64: 0xFF 0xE0 (JMP RAX) → stripped → falls through to RELOCS_64
+_IMPORTS_TAIL_32 = b'\xc3'
+_IMPORTS_TAIL_64 = b'\xff\xe0'
 
-# ARM relocation shellcode (Thumb mode)
-RELOCS_ARM = bytes.fromhex('00482DE900B08DE2000050E30000A0131A0050E3F0FF1F0A0000A0E30090BDE8')
+# Magic placeholders in cxx_eh_fixer64.asm replaced at build time by peor.
+# PE_SIZE_MAGIC: peor patches to pe.OPTIONAL_HEADER.SizeOfImage.
+# IAT_RVA_MAGIC: peor patches to the IAT-entry RVA for the hooked function.
+_CXX_EH_PE_SIZE_MAGIC_64 = b'\x78\x56\x34\x12'  # 0x12345678 LE (in ADD RCX, imm32)
+_CXX_EH_IAT_RVA_MAGIC_64 = b'\x21\x43\x65\x87'  # 0x87654321 LE (in LEA RDX, [RBX+disp32])
 
-# ARM64 relocation shellcode
-RELOCS_ARM64 = bytes.fromhex('FD7BBFA9FD030091E0031F2AF30300AAE0000010E1000054E2031F2A21000054E003102AE0000010E100005420008052E0030091C0035FD6')
+# Windows PE Subsystem values that peor does not yet support.
+_EFI_SUBSYSTEMS = frozenset({10, 11, 12, 13})  # EFI_APPLICATION / BOOT_SERVICE / RUNTIME / ROM
+_NATIVE_SUBSYSTEM = 1                           # Windows native (kernel-mode drivers)
 
-# Import resolver shellcodes — resolve the PE's import table via PEB walking
-# (LoadLibraryA / GetProcAddress).
-#
-# Chaining convention: each resolver ends with a trailing "terminal" byte/sequence
-# that is stripped at output time so execution falls through into the relocs resolver:
-#   x86/x86-KM: trailing 0xC3 (RET) is stripped → falls through to RELOCS_32
-#   x64/x64-KM: trailing 0xFF 0xE0 (JMP RAX) is stripped → falls through to RELOCS_64
-#
-# Output layout: imports[:-tail] + relocs + PE_image
-# The test_loader calls the buffer once; imports resolver falls through to relocs
-# resolver which then applies base relocations and JMPs to the PE entry point.
-
-# IMPORTS_32_UM and IMPORTS_64_UM are imported from peor._shellcodes (assembled at install time)
-IMPORTS_ARM_UM   = bytes.fromhex('')  # Placeholder for ARM usermode import resolver
-IMPORTS_ARM64_UM = bytes.fromhex('')  # Placeholder for ARM64 usermode import resolver
-
-# Import resolution shellcode - kernelmode
-IMPORTS_32_KM = bytes.fromhex('60BB7803000089D88B403C01D88B7878895DE003F88B48248B582C8B701C03DF03FB03F7FCB9130000004939C975F58B5DCC8B5E3603DE668B0C4E8B5E2803DE8B048E01D8A3000000008B3D040000005368000000008B1D00000000FFD7A3080000008D45E2E8000000005E2D000000008B463C01F08B8080000000A3100000008B3D100000008B0F85C90F84A30000008D0C368B3D080000005157FFD785C00F8488000000894424048B3D1000000083C70C8B4F0485C90F8469000000034C24048B3D040000005051FFD7894424088B7C240483C70485C90F8442000000034C24048B3D040000005051FFD7EB1C25FFFF00008B3D040000005051FFD78B4C24088B3D100000008B4F1003CE894C240C034E1C8901834C240C04834424080483C704E9B9FFFFFF83C714E958FFFFFF61C3')
-IMPORTS_64_KM = bytes.fromhex('565756534154415541564157488B6C24104865488B306548AD488D68184889E64883C6204889F0488B00488B40204889C3488B5B204889DF488B3B4C8B6B084C8B63184C89E9488D3D130000004C89E2B90D0000004839C8750A49FFC1E2E04C89E1EB894C8B43304889DF4C29F94885FF74554C8B43384885C0744B4801D84889C64C8B0E4C8B4E084983C6084885C9743883E908D1E974EC66414139C074E54489C84181E0FF0F00004181F80A750A4C8D14114D01C0490132FFC975D1EB8B4C8B43284801D8FFE0')
-IMPORTS_ARM_KM   = bytes.fromhex('')  # Placeholder for ARM kernelmode import resolver
-IMPORTS_ARM64_KM = bytes.fromhex('')  # Placeholder for ARM64 kernelmode import resolver
-
-# Import resolution shellcode - EFI
-IMPORTS_32_EFI   = bytes.fromhex('')  # Placeholder for x86 EFI import resolver
-IMPORTS_64_EFI   = bytes.fromhex('')  # Placeholder for x64 EFI import resolver
-IMPORTS_ARM_EFI  = bytes.fromhex('')  # Placeholder for ARM EFI import resolver
-IMPORTS_ARM64_EFI = bytes.fromhex('') # Placeholder for ARM64 EFI import resolver
-
-# Trailing bytes that terminate each import resolver instead of chaining.
-# We strip them so the resolver falls through into the relocs resolver.
-_IMPORTS_TAIL_32 = b'\xc3'       # RET
-_IMPORTS_TAIL_64 = b'\xff\xe0'   # JMP RAX
+# Per-architecture shellcode table.
+# dir_array_offset: bytes from the optional-header start to the DataDirectory array
+#   PE32  (0x10B): 96  bytes  (PECOFF spec §3.4.1)
+#   PE32+ (0x20B): 112 bytes  (PECOFF spec §3.4.2)
+# disp32_off: byte index of the LEA disp32 field inside the assembled relocs resolver
+#   RELOCS_32: e8..(5) 5b(1) 8d bb <disp32>(4)       → disp32 at byte 8
+#   RELOCS_64: e8..(5) 5b(1) 48 8d bb <disp32>(4)    → disp32 at byte 9
+_SHELLCODES = {
+    OPTIONAL_HEADER_MAGIC_PE: {
+        'relocs':           RELOCS_32,
+        'imports':          IMPORTS_32_UM,
+        'entrypoint':       ENTRYPOINT_32,
+        'seh':              SEH_REGISTRAR_32,
+        'seh_always':       True,               # x86 uses FS:[0] SEH chains — always needed
+        'tls':              TLS_CALLBACKS_32,
+        'tail':             _IMPORTS_TAIL_32,
+        'dir_array_offset': 96,
+        'disp32_off':       8,
+    },
+    OPTIONAL_HEADER_MAGIC_PE_PLUS: {
+        'relocs':           RELOCS_64,
+        'imports':          IMPORTS_64_UM,
+        'entrypoint':       ENTRYPOINT_64,
+        'seh':              SEH_REGISTRAR_64,
+        'seh_always':       False,              # x64: only needed when .pdata (DataDir[3]) is present
+        'tls':              TLS_CALLBACKS_64,
+        'cxx_eh_fixer':     CXX_EH_FIXER_64,
+        'cxx_eh_import':    b'RtlPcToFileHeader',
+        'cxx_pe_size_magic': _CXX_EH_PE_SIZE_MAGIC_64,
+        'cxx_iat_rva_magic': _CXX_EH_IAT_RVA_MAGIC_64,
+        'tail':             _IMPORTS_TAIL_64,
+        'dir_array_offset': 112,
+        'disp32_off':       9,
+    },
+}
 
 
 def _strip_tail(shellcode: bytes, tail: bytes) -> bytes:
@@ -53,109 +71,123 @@ def _strip_tail(shellcode: bytes, tail: bytes) -> bytes:
     return shellcode
 
 
-def dump_memory_layout(pe: PE, output_file: Path, ignore_imports: bool = False,
-                       resolve_imports: bool = False, kernel_mode: bool = False,
-                       efi_mode: bool = False):
+def _find_iat_rva(pe: PE, func_name: bytes) -> int | None:
+    """Return the RVA of the IAT slot for func_name, or None if not imported."""
+    if not hasattr(pe, 'DIRECTORY_ENTRY_IMPORT'):
+        return None
+    for entry in pe.DIRECTORY_ENTRY_IMPORT:
+        for imp in entry.imports:
+            if imp.name == func_name:
+                return imp.address - pe.OPTIONAL_HEADER.ImageBase
+    return None
+
+
+def _has_exception_table(pe: PE) -> bool:
+    dirs = pe.OPTIONAL_HEADER.DATA_DIRECTORY
+    return len(dirs) > 3 and dirs[3].VirtualAddress != 0
+
+
+def _has_tls_callbacks(pe: PE) -> bool:
+    dirs = pe.OPTIONAL_HEADER.DATA_DIRECTORY
+    if len(dirs) <= 9 or dirs[9].VirtualAddress == 0:
+        return False
+    tls_rva = dirs[9].VirtualAddress
+    # AddressOfCallBacks: offset 0x0C in IMAGE_TLS_DIRECTORY32, 0x18 in IMAGE_TLS_DIRECTORY64
+    if pe.PE_TYPE == OPTIONAL_HEADER_MAGIC_PE:
+        cb_off, ptr_size = 0x0C, 4
+    else:
+        cb_off, ptr_size = 0x18, 8
+    raw = pe.get_data(tls_rva + cb_off, ptr_size)
+    return int.from_bytes(raw, 'little') != 0
+
+
+def _validate_pe(pe: PE) -> dict:
+    subsystem = pe.OPTIONAL_HEADER.Subsystem
+    if subsystem in _EFI_SUBSYSTEMS:
+        raise ValueError(f"EFI PE (subsystem {subsystem}) is not yet supported")
+    if subsystem == _NATIVE_SUBSYSTEM:
+        raise ValueError(f"Kernel-mode PE (subsystem {subsystem}) is not yet supported")
+    entry = _SHELLCODES.get(pe.PE_TYPE)
+    if entry is None:
+        raise ValueError(f"Unsupported PE type: 0x{pe.PE_TYPE:04X}")
+    return entry
+
+
+def _build_ram_layout(pe: PE) -> bytearray:
     ram_layout = bytearray()
-
-    # PE header (identical on disk and in memory for the header region)
     ram_layout.extend(pe.get_data(0, pe.OPTIONAL_HEADER.SizeOfHeaders))
-
-    # Sections at their virtual addresses
     for section in pe.sections:
         while len(ram_layout) < section.VirtualAddress:
             ram_layout.append(0)
         ram_layout.extend(section.get_data())
-
-    # Pad to SizeOfImage
     while len(ram_layout) < pe.OPTIONAL_HEADER.SizeOfImage:
         ram_layout.append(0)
+    return ram_layout
 
-    # Zero the IMAGE_DIRECTORY_ENTRY_IMPORT entry so the PE image has no import
-    # table for the shellcode runtime to stumble over.
-    if ignore_imports:
-        # DataDirectory[1] (IMPORT) sits at a fixed offset inside the optional header.
-        # Optional header starts at: e_lfanew + 4 (PE sig) + 20 (file header)
-        opt_off = pe.DOS_HEADER.e_lfanew + 24
-        # DataDirectory array offset within optional header:
-        #   PE32  (0x10B): 96 bytes
-        #   PE32+ (0x20B): 112 bytes
-        if pe.PE_TYPE == OPTIONAL_HEADER_MAGIC_PE:
-            dir_array_off = opt_off + 96
+
+def _zero_import_dir(ram_layout: bytearray, pe: PE, entry: dict) -> None:
+    # Optional header starts at e_lfanew + 4 (PE sig) + 20 (file header) = e_lfanew + 24.
+    opt_off = pe.DOS_HEADER.e_lfanew + 24
+    import_entry_off = opt_off + entry['dir_array_offset'] + 1 * 8  # DataDir[1], 8 bytes each
+    ram_layout[import_entry_off:import_entry_off + 8] = b'\x00' * 8
+
+
+def _build_shellcode_chain(pe: PE, entry: dict, resolve_imports: bool) -> bytes:
+    # Chain order: [imports] → relocs → [cxx_eh_fixer] → [seh] → [tls] → entrypoint → [pad]
+    # cxx_eh_fixer (x64 only) hooks RtlPcToFileHeader in the IAT so that
+    # _CxxThrowException gets the correct ImageBase for typed C++ exceptions.
+    # x86 does not need it: 32-bit ThrowInfo − NULL = ThrowInfo, so the frame
+    # handler reconstructs the pointer correctly without a hook.
+    imports    = _strip_tail(entry['imports'], entry['tail']) if resolve_imports else b''
+    relocs     = entry['relocs']
+    seh        = entry['seh'] if (entry['seh'] and (entry.get('seh_always') or _has_exception_table(pe))) else b''
+    tls        = entry['tls'] if (entry['tls'] and _has_tls_callbacks(pe)) else b''
+    entrypoint = entry['entrypoint']
+
+    if resolve_imports and entry.get('cxx_eh_fixer') is not None and entry.get('cxx_eh_import') is not None:
+        iat_rva = _find_iat_rva(pe, entry['cxx_eh_import'])
+        if iat_rva is not None:
+            fixer = bytearray(entry['cxx_eh_fixer'])
+            soi   = pe.OPTIONAL_HEADER.SizeOfImage
+            pe_size_magic = entry['cxx_pe_size_magic']
+            iat_rva_magic = entry['cxx_iat_rva_magic']
+            if fixer.count(pe_size_magic) != 1:
+                raise RuntimeError(f"PE_SIZE_MAGIC {pe_size_magic.hex()} not unique in cxx_eh_fixer")
+            if fixer.count(iat_rva_magic) != 1:
+                raise RuntimeError(f"IAT_RVA_MAGIC {iat_rva_magic.hex()} not unique in cxx_eh_fixer")
+            idx = fixer.find(pe_size_magic)
+            fixer[idx:idx + 4] = struct.pack('<I', soi)
+            idx = fixer.find(iat_rva_magic)
+            fixer[idx:idx + 4] = struct.pack('<I', iat_rva)
+            cxx_fixer = bytes(fixer)
         else:
-            dir_array_off = opt_off + 112
-        import_entry_off = dir_array_off + 1 * 8  # entry index 1, 8 bytes per entry
-        ram_layout[import_entry_off:import_entry_off + 8] = b'\x00' * 8
-
-    imports = b''
-    relocs  = b''
-
-    if resolve_imports:
-        if efi_mode:
-            if pe.PE_TYPE == OPTIONAL_HEADER_MAGIC_PE:
-                relocs = RELOCS_32; imports = IMPORTS_32_EFI
-            elif pe.PE_TYPE == OPTIONAL_HEADER_MAGIC_PE_PLUS:
-                relocs = RELOCS_64; imports = IMPORTS_64_EFI
-            elif pe.PE_TYPE == OPTIONAL_HEADER_MAGIC_ARM:
-                relocs = RELOCS_ARM; imports = IMPORTS_ARM_EFI
-            elif pe.PE_TYPE == OPTIONAL_HEADER_MAGIC_ARM64:
-                relocs = RELOCS_ARM64; imports = IMPORTS_ARM64_EFI
-            else:
-                raise ValueError("Unsupported PE type")
-        elif kernel_mode:
-            if pe.PE_TYPE == OPTIONAL_HEADER_MAGIC_PE:
-                relocs = RELOCS_32; imports = _strip_tail(IMPORTS_32_KM, _IMPORTS_TAIL_32)
-            elif pe.PE_TYPE == OPTIONAL_HEADER_MAGIC_PE_PLUS:
-                relocs = RELOCS_64; imports = _strip_tail(IMPORTS_64_KM, _IMPORTS_TAIL_64)
-            elif pe.PE_TYPE == OPTIONAL_HEADER_MAGIC_ARM:
-                relocs = RELOCS_ARM; imports = IMPORTS_ARM_KM
-            elif pe.PE_TYPE == OPTIONAL_HEADER_MAGIC_ARM64:
-                relocs = RELOCS_ARM64; imports = IMPORTS_ARM64_KM
-            else:
-                raise ValueError("Unsupported PE type")
-        else:
-            if pe.PE_TYPE == OPTIONAL_HEADER_MAGIC_PE:
-                relocs = RELOCS_32; imports = _strip_tail(IMPORTS_32_UM, _IMPORTS_TAIL_32)
-            elif pe.PE_TYPE == OPTIONAL_HEADER_MAGIC_PE_PLUS:
-                relocs = RELOCS_64; imports = _strip_tail(IMPORTS_64_UM, _IMPORTS_TAIL_64)
-            elif pe.PE_TYPE == OPTIONAL_HEADER_MAGIC_ARM:
-                relocs = RELOCS_ARM; imports = IMPORTS_ARM_UM
-            elif pe.PE_TYPE == OPTIONAL_HEADER_MAGIC_ARM64:
-                relocs = RELOCS_ARM64; imports = IMPORTS_ARM64_UM
-            else:
-                raise ValueError("Unsupported PE type")
+            cxx_fixer = b''
     else:
-        if pe.PE_TYPE == OPTIONAL_HEADER_MAGIC_PE:
-            relocs = RELOCS_32
-        elif pe.PE_TYPE == OPTIONAL_HEADER_MAGIC_PE_PLUS:
-            relocs = RELOCS_64
-        elif pe.PE_TYPE == OPTIONAL_HEADER_MAGIC_ARM:
-            relocs = RELOCS_ARM
-        elif pe.PE_TYPE == OPTIONAL_HEADER_MAGIC_ARM64:
-            relocs = RELOCS_ARM64
-        else:
-            raise ValueError("Unsupported PE type")
+        cxx_fixer = b''
 
-    # Layout: imports_resolver (tail stripped) | relocs_resolver | [align pad] | PE_image
-    # The imports resolver falls through into the relocs resolver which applies
-    # base relocations and JMPs to the PE entry point.
-    #
-    # The PE image must be 16-byte aligned within the shellcode buffer so that
-    # MOVDQA/MOVAPS instructions in the PE's code section can access .rdata without
-    # an alignment fault.  VirtualAlloc always returns a 64KB-aligned address, so
-    # we only need to ensure the prefix length is a multiple of 16.
-    align_pad = (-len(imports) - len(relocs)) % 16
-    if align_pad and relocs:
-        # Patch the PE-offset disp32 field inside the relocs resolver so it still
-        # lands on the PE after the extra NOP bytes.
-        # RELOCS_64 layout: e8...(5) 5b(1) 48 8d bb <disp32>(4) -> disp32 at byte 9
-        # RELOCS_32 layout: e8...(5) 5b(1) 8d bb    <disp32>(4) -> disp32 at byte 8
-        off_idx = 9 if pe.PE_TYPE == OPTIONAL_HEADER_MAGIC_PE_PLUS else 8
-        relocs = bytearray(relocs)
-        old = int.from_bytes(relocs[off_idx:off_idx + 4], 'little')
-        relocs[off_idx:off_idx + 4] = (old + align_pad).to_bytes(4, 'little')
-        relocs = bytes(relocs)
-    output_file.write_bytes(imports + relocs + (b'\x90' * align_pad) + bytes(ram_layout))
+    # PE image must be 16-byte aligned in the buffer for MOVDQA/MOVAPS safety.
+    align_pad = (-len(imports) - len(relocs) - len(cxx_fixer) - len(seh) - len(tls) - len(entrypoint)) % 16
+
+    # Patch the disp32 in the relocs resolver.
+    # setup.py bakes in disp32 = len(relocs_assembled) - 5 (PE follows relocs standalone).
+    # At runtime we add the remaining shellcodes + alignment padding.
+    extra  = len(cxx_fixer) + len(seh) + len(tls) + len(entrypoint) + align_pad
+    off    = entry['disp32_off']
+    relocs = bytearray(relocs)
+    old    = int.from_bytes(relocs[off:off + 4], 'little')
+    relocs[off:off + 4] = (old + extra).to_bytes(4, 'little')
+
+    return imports + bytes(relocs) + cxx_fixer + seh + tls + entrypoint + (b'\x90' * align_pad)
+
+
+def dump_memory_layout(pe: PE, output_file: Path, ignore_imports: bool = False,
+                       resolve_imports: bool = False):
+    entry      = _validate_pe(pe)
+    ram_layout = _build_ram_layout(pe)
+    if ignore_imports:
+        _zero_import_dir(ram_layout, pe, entry)
+    prefix = _build_shellcode_chain(pe, entry, resolve_imports)
+    output_file.write_bytes(prefix + bytes(ram_layout))
 
 
 def parse_arguments():
@@ -163,8 +195,6 @@ def parse_arguments():
     parser.add_argument('-i', '--input-file',      required=True, type=Path, help='Path to a PE-file')
     parser.add_argument('-m', '--ignore-imports',  action='store_true',      help='Zero the import directory in the output')
     parser.add_argument('-r', '--resolve-imports', action='store_true',      help='Prepend import resolver shellcode')
-    parser.add_argument('-k', '--kernel-mode',     action='store_true',      help='Use kernel-mode import resolver')
-    parser.add_argument('-e', '--efi-mode',        action='store_true',      help='Use EFI import resolver')
     parser.add_argument('-o', '--output-file',     required=True, type=Path, help='Path to output shellcode file')
     return parser.parse_args()
 
@@ -175,19 +205,9 @@ def main():
     if args.ignore_imports and args.resolve_imports:
         print("Error: --ignore-imports and --resolve-imports are mutually exclusive")
         return
-    if args.kernel_mode and not args.resolve_imports:
-        print("Error: --kernel-mode requires --resolve-imports")
-        return
-    if args.efi_mode and not args.resolve_imports:
-        print("Error: --efi-mode requires --resolve-imports")
-        return
-    if args.kernel_mode and args.efi_mode:
-        print("Error: --kernel-mode and --efi-mode are mutually exclusive")
-        return
 
     pe = PE(str(args.input_file))
-    dump_memory_layout(pe, args.output_file, args.ignore_imports,
-                       args.resolve_imports, args.kernel_mode, args.efi_mode)
+    dump_memory_layout(pe, args.output_file, args.ignore_imports, args.resolve_imports)
 
 
 if __name__ == '__main__':

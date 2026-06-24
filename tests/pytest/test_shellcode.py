@@ -1,5 +1,8 @@
+import os
 import re
 import time
+import struct
+import shutil
 import ctypes
 import subprocess
 from pathlib import Path
@@ -98,6 +101,7 @@ def test_shellcode_exit_code(arch, test_name, expected, tmp_path):
     )
 
 
+@pytest.mark.skipif(bool(os.getenv("CI")), reason="MessageBox requires an interactive desktop, skipped in CI")
 @pytest.mark.parametrize("arch", ["x86", "x64"])
 def test_03_winapi_messagebox(arch, tmp_path):
     win_dir = ARCH_DIRS[arch]
@@ -214,7 +218,7 @@ def test_07_cpp_exceptions(arch, tmp_path):
     result = subprocess.run(
         [str(loader_path), str(shellcode_path)],
         capture_output=True,
-        timeout=10,
+        timeout=30,  # x86 WER processing takes 6-9s on unhandled exceptions
     )
 
     assert result.returncode == 77, (
@@ -243,6 +247,164 @@ def test_08_cpp_thread(arch, tmp_path):
 
     assert result.returncode == 42, (
         f"[{arch}] expected exit code 42, got {result.returncode}\n"
+        f"stdout: {result.stdout.decode(errors='replace')}\n"
+        f"stderr: {result.stderr.decode(errors='replace')}"
+    )
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_09_resources(arch, tmp_path):
+    """C++ EXE with embedded string resource: reads via __ImageBase HMODULE, returns 42 on match."""
+    win_dir = ARCH_DIRS[arch]
+    pe_path = win_dir / "09_resources.exe"
+    loader_path = win_dir / "test_loader.exe"
+    _skip_if_missing(loader_path, pe_path)
+
+    shellcode_path = tmp_path / f"09_resources_{arch}.bin"
+    dump_memory_layout(PE(str(pe_path)), shellcode_path, resolve_imports=True)
+
+    result = subprocess.run(
+        [str(loader_path), str(shellcode_path)],
+        capture_output=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 42, (
+        f"[{arch}] expected exit code 42 (resource read OK), got {result.returncode}\n"
+        f"stdout: {result.stdout.decode(errors='replace')}\n"
+        f"stderr: {result.stderr.decode(errors='replace')}"
+    )
+
+
+def _sign_pe(source_path: Path, dest_path: Path) -> bool:
+    """Append a dummy WIN_CERTIFICATE to a PE copy to exercise the security directory.
+
+    Uses only Python stdlib so the test runs on any OS without PowerShell.
+    DataDir[4] (IMAGE_DIRECTORY_ENTRY_SECURITY) stores a file offset (not an RVA);
+    we append a minimal WIN_CERTIFICATE structure past the last section and record it.
+    """
+    shutil.copy2(source_path, dest_path)
+    try:
+        pe_bytes = bytearray(dest_path.read_bytes())
+        e_lfanew = struct.unpack_from('<I', pe_bytes, 0x3c)[0]
+        pe_magic = struct.unpack_from('<H', pe_bytes, e_lfanew + 24)[0]
+        # DataDirectory array starts at: e_lfanew + 4 (sig) + 20 (file hdr) + 96 or 112 (opt hdr fields)
+        dir_array_off = e_lfanew + 24 + (96 if pe_magic == 0x10b else 112)
+        sec_dir_off   = dir_array_off + 4 * 8  # DataDir[4]
+
+        # Minimal WIN_CERTIFICATE: dwLength | wRevision=0x0200 | wCertificateType=0x0002 | data
+        dummy_data = b'\x00' * 16
+        win_cert   = struct.pack('<IHH', 8 + len(dummy_data), 0x0200, 0x0002) + dummy_data
+
+        cert_file_offset = len(pe_bytes)           # security dir stores a file offset, not RVA
+        pe_bytes.extend(win_cert)
+        struct.pack_into('<II', pe_bytes, sec_dir_off, cert_file_offset, len(win_cert))
+        dest_path.write_bytes(bytes(pe_bytes))
+
+        dirs = PE(str(dest_path)).OPTIONAL_HEADER.DATA_DIRECTORY
+        return len(dirs) > 4 and dirs[4].VirtualAddress != 0
+    except Exception:
+        return False
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_certificate_signed_pe(arch, tmp_path):
+    """peor must produce correct shellcode from an Authenticode-signed PE."""
+    win_dir = ARCH_DIRS[arch]
+    pe_path = win_dir / "02_relocs_functions.exe"
+    loader_path = win_dir / "test_loader.exe"
+    _skip_if_missing(loader_path, pe_path)
+
+    signed_path = tmp_path / f"02_relocs_functions_signed_{arch}.exe"
+    assert _sign_pe(pe_path, signed_path), 'failed singing the PE file'
+
+    shellcode_path = tmp_path / f"02_relocs_signed_{arch}.bin"
+    dump_memory_layout(PE(str(signed_path)), shellcode_path)
+
+    result = subprocess.run(
+        [str(loader_path), str(shellcode_path)],
+        capture_output=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 90, (
+        f"[{arch}] signed PE: expected exit code 90, got {result.returncode}\n"
+        f"stdout: {result.stdout.decode(errors='replace')}\n"
+        f"stderr: {result.stderr.decode(errors='replace')}"
+    )
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_10_tls_callbacks(arch, tmp_path):
+    """C++ EXE with TLS callback: callback sets g_result=88, main returns it via a C++ static-local."""
+    win_dir = ARCH_DIRS[arch]
+    pe_path = win_dir / "10_tls_callbacks.exe"
+    loader_path = win_dir / "test_loader.exe"
+    _skip_if_missing(loader_path, pe_path)
+
+    shellcode_path = tmp_path / f"10_tls_callbacks_{arch}.bin"
+    dump_memory_layout(PE(str(pe_path)), shellcode_path, resolve_imports=True)
+
+    result = subprocess.run(
+        [str(loader_path), str(shellcode_path)],
+        capture_output=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 88, (
+        f"[{arch}] expected exit code 88 (TLS callback ran), got {result.returncode}\n"
+        f"stdout: {result.stdout.decode(errors='replace')}\n"
+        f"stderr: {result.stderr.decode(errors='replace')}"
+    )
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_11_cpp_exceptions(arch, tmp_path):
+    """C++ EXE with typed throw/catch: typed catch must return 123; catch(...) returns 456; no-catch 789."""
+    win_dir = ARCH_DIRS[arch]
+    pe_path = win_dir / "11_cpp_exceptions.exe"
+    loader_path = win_dir / "test_loader.exe"
+    _skip_if_missing(loader_path, pe_path)
+
+    shellcode_path = tmp_path / f"11_cpp_exceptions_{arch}.bin"
+    dump_memory_layout(PE(str(pe_path)), shellcode_path, resolve_imports=True)
+
+    result = subprocess.run(
+        [str(loader_path), str(shellcode_path)],
+        capture_output=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 123, (
+        f"[{arch}] expected exit code 123 (typed catch fired), got {result.returncode}\n"
+        f"  456 = catch(...) fired (type matching broken)\n"
+        f"  789 = no exception caught at all\n"
+        f"stdout: {result.stdout.decode(errors='replace')}\n"
+        f"stderr: {result.stderr.decode(errors='replace')}"
+    )
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_12_seh_exceptions(arch, tmp_path):
+    """C++ EXE compiled with /EHa (SEH-integrated): typed catch must fire and return 123."""
+    win_dir = ARCH_DIRS[arch]
+    pe_path = win_dir / "12_seh_exceptions.exe"
+    loader_path = win_dir / "test_loader.exe"
+    _skip_if_missing(loader_path, pe_path)
+
+    shellcode_path = tmp_path / f"12_seh_exceptions_{arch}.bin"
+    dump_memory_layout(PE(str(pe_path)), shellcode_path, resolve_imports=True)
+
+    result = subprocess.run(
+        [str(loader_path), str(shellcode_path)],
+        capture_output=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 123, (
+        f"[{arch}] expected exit code 123 (typed catch fired), got {result.returncode}\n"
+        f"  456 = catch(...) fired (type matching broken — cxx_eh_fixer not working with /EHa)\n"
+        f"  789 = no exception caught at all\n"
         f"stdout: {result.stdout.decode(errors='replace')}\n"
         f"stderr: {result.stderr.decode(errors='replace')}"
     )

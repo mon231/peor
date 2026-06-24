@@ -15,7 +15,7 @@
 
     pushad
     mov ebp, esp
-    sub esp, 8                          ; [ebp-4] = GPA ptr, [ebp-8] = LLA ptr
+    sub esp, 0x08                       ; [ebp-4] = GPA ptr, [ebp-8] = LLA ptr
 
     ; PEB walk -> kernel32 base in EBX
     ; "mov eax, [fs:0x30]" encoded as FS-prefix (0x64) + "mov eax, [0x30]"
@@ -141,7 +141,7 @@ _thunk_loop:
     push ecx                            ; save IAT ptr
     push edx                            ; save INT ptr
     add eax, esi                        ; VA of IMAGE_IMPORT_BY_NAME
-    add eax, 2                          ; skip Hint WORD -> function name
+    add eax, 0x02                       ; skip Hint WORD -> function name
     push eax                            ; arg2: name string
     push ebx                            ; arg1: module handle
     call [ebp - 4]                      ; GetProcAddress(module, name) -> EAX
@@ -161,8 +161,8 @@ _by_ordinal:
 
 _save_func:
     mov [ecx], eax                      ; write resolved address to IAT slot
-    add edx, 4                          ; advance INT ptr
-    add ecx, 4                          ; advance IAT ptr
+    add edx, 0x04                       ; advance INT ptr (4-byte thunk entry)
+    add ecx, 0x04                       ; advance IAT ptr
     jmp _thunk_loop
 
 _next_desc:

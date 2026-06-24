@@ -1,3 +1,5 @@
+import os
+import re
 import struct
 import setuptools
 from pathlib import Path
@@ -5,14 +7,43 @@ from setuptools.command.build_py import build_py as _build_py
 from setuptools.command.develop import develop as _develop
 
 
+def _get_version():
+    # CI/CD tags are named "vX.Y.Z"; GITHUB_REF is "refs/tags/vX.Y.Z" on a release.
+    # PyPI users install without CI variables, so fall back to 0.0.1.
+    ref = os.environ.get('GITHUB_REF', '')
+    if ref.startswith('refs/tags/v'):
+        return ref[len('refs/tags/v'):]
+    return '0.0.1'
+
+
 CURRENT_FOLDER = Path(__file__).parent
 README_PATH = CURRENT_FOLDER / 'README.md'
 ASM_DIR = CURRENT_FOLDER / 'asm'
 SHELLCODES_PY = CURRENT_FOLDER / 'peor' / '_shellcodes.py'
 
-# Magic placeholder used in reloc-resolver ASM to mark where the PE offset goes.
-# After assembly the actual (shellcode_size - 5) is patched in.
+# Matches `%define PE_OFFSET_PLACEHOLDER 0x7E7E7E7E` in relocations_resolver{32,64}.asm.
+# After assembly, setup.py patches these bytes with the actual (shellcode_size - 5).
 _PE_OFFSET_PLACEHOLDER = b'\x7e\x7e\x7e\x7e'
+
+
+def _preprocess_asm(src):
+    """Strip %define lines and substitute their names inline.
+
+    Keystone NASM mode does not support %define; we handle it ourselves so
+    asm sources can use named constants as the CONTRIBUTING guidelines require.
+    """
+    defines = {}
+    lines = []
+    for line in src.split('\n'):
+        m = re.match(r'\s*%define\s+(\w+)\s+(\S+)', line)
+        if m:
+            defines[m.group(1)] = m.group(2)
+        else:
+            lines.append(line)
+    src = '\n'.join(lines)
+    for name in sorted(defines, key=len, reverse=True):
+        src = re.sub(r'\b' + re.escape(name) + r'\b', defines[name], src)
+    return src
 
 
 def _assemble_shellcodes():
@@ -22,7 +53,7 @@ def _assemble_shellcodes():
     def assemble(asm_path, arch, mode, patch_pe_offset=False):
         ks = keystone.Ks(arch, mode)
         ks.syntax = keystone.KS_OPT_SYNTAX_NASM
-        src = Path(asm_path).read_text(encoding='utf-8')
+        src = _preprocess_asm(Path(asm_path).read_text())
         encoding, _ = ks.asm(src)
         if encoding is None:
             raise RuntimeError(f"keystone assembly failed for {asm_path}")
@@ -40,19 +71,60 @@ def _assemble_shellcodes():
 
         return bytes(result)
 
-    r32 = assemble(ASM_DIR / 'relocations_resolver32.asm', keystone.KS_ARCH_X86, keystone.KS_MODE_32, patch_pe_offset=True)
-    r64 = assemble(ASM_DIR / 'relocations_resolver64.asm', keystone.KS_ARCH_X86, keystone.KS_MODE_64, patch_pe_offset=True)
-    i32 = assemble(ASM_DIR / 'imports_resolver32.asm',     keystone.KS_ARCH_X86, keystone.KS_MODE_32)
-    i64 = assemble(ASM_DIR / 'imports_resolver64.asm',     keystone.KS_ARCH_X86, keystone.KS_MODE_64)
+    r32  = assemble(ASM_DIR / 'relocations_resolver32.asm',  keystone.KS_ARCH_X86, keystone.KS_MODE_32, patch_pe_offset=True)
+    r64  = assemble(ASM_DIR / 'relocations_resolver64.asm',  keystone.KS_ARCH_X86, keystone.KS_MODE_64, patch_pe_offset=True)
+    i32  = assemble(ASM_DIR / 'imports_resolver32.asm',      keystone.KS_ARCH_X86, keystone.KS_MODE_32)
+    i64  = assemble(ASM_DIR / 'imports_resolver64.asm',      keystone.KS_ARCH_X86, keystone.KS_MODE_64)
+    e32  = assemble(ASM_DIR / 'entrypoint_resolver32.asm',   keystone.KS_ARCH_X86, keystone.KS_MODE_32)
+    e64  = assemble(ASM_DIR / 'entrypoint_resolver64.asm',   keystone.KS_ARCH_X86, keystone.KS_MODE_64)
+    s64  = assemble(ASM_DIR / 'seh_registrar64.asm',         keystone.KS_ARCH_X86, keystone.KS_MODE_64)
+    s32  = assemble(ASM_DIR / 'seh_registrar32.asm',         keystone.KS_ARCH_X86, keystone.KS_MODE_32)
+    t32  = assemble(ASM_DIR / 'tls_callbacks32.asm',         keystone.KS_ARCH_X86, keystone.KS_MODE_32)
+    t64  = assemble(ASM_DIR / 'tls_callbacks64.asm',         keystone.KS_ARCH_X86, keystone.KS_MODE_64)
+
+    # cxx_eh_fixer: patch the FORWARD_MAGIC (0xFEFEFEFE) with the runtime byte-distance
+    # from _setup_ip to _data (so the setup code can find the data area via POP+ADD).
+    # The distance is computed from the assembled bytes by locating the CALL instruction
+    # that precedes the data area: call _data_ref has a fixed relative offset equal to
+    # the data area size (24 bytes for x64, 12 bytes for x86), so it encodes as a
+    # recognisable pattern.
+    def _patch_forward_magic(raw, data_call_pattern, magic_bytes):
+        """Patch the forward-distance magic with the actual distance from _setup_ip to _data."""
+        raw = bytearray(raw)
+        # _setup_ip is at byte 5 (right after the 5-byte 'call _setup_ip' at offset 0).
+        setup_ip_pos = 5
+        # Locate 'call _data_ref' whose push value is &_data (right after the call insn).
+        call_pos = bytes(raw).find(data_call_pattern)
+        if call_pos == -1:
+            raise RuntimeError(f"_data call pattern {data_call_pattern.hex()} not found")
+        data_pos = call_pos + 5
+        forward = data_pos - setup_ip_pos
+        # Patch the magic bytes in the assembled code.
+        idx = bytes(raw).find(magic_bytes)
+        if idx == -1 or bytes(raw).find(magic_bytes, idx + 1) != -1:
+            raise RuntimeError(f"Expected exactly one {magic_bytes.hex()} (FORWARD_MAGIC) in cxx_eh_fixer")
+        raw[idx:idx + 4] = struct.pack('<I', forward)
+        return bytes(raw)
+
+    f64_raw = assemble(ASM_DIR / 'cxx_eh_fixer64.asm', keystone.KS_ARCH_X86, keystone.KS_MODE_64)
+    # x64 magic: 0x5A5A5A5A (positive, fits signed int32, encoded in ADD RAX, imm32)
+    f64 = _patch_forward_magic(f64_raw, b'\xe8\x18\x00\x00\x00', b'\x5a\x5a\x5a\x5a')
 
     SHELLCODES_PY.write_text(
         "# Auto-generated by setup.py -- do not edit. Re-run: pip install -e .\n"
-        f"RELOCS_32     = bytes.fromhex('{r32.hex()}')\n"
-        f"RELOCS_64     = bytes.fromhex('{r64.hex()}')\n"
-        f"IMPORTS_32_UM = bytes.fromhex('{i32.hex()}')\n"
-        f"IMPORTS_64_UM = bytes.fromhex('{i64.hex()}')\n",
-        encoding='utf-8',
+        f"RELOCS_32           = bytes.fromhex('{r32.hex()}')\n"
+        f"RELOCS_64           = bytes.fromhex('{r64.hex()}')\n"
+        f"IMPORTS_32_UM       = bytes.fromhex('{i32.hex()}')\n"
+        f"IMPORTS_64_UM       = bytes.fromhex('{i64.hex()}')\n"
+        f"ENTRYPOINT_32       = bytes.fromhex('{e32.hex()}')\n"
+        f"ENTRYPOINT_64       = bytes.fromhex('{e64.hex()}')\n"
+        f"SEH_REGISTRAR_32    = bytes.fromhex('{s32.hex()}')\n"
+        f"SEH_REGISTRAR_64    = bytes.fromhex('{s64.hex()}')\n"
+        f"TLS_CALLBACKS_32    = bytes.fromhex('{t32.hex()}')\n"
+        f"TLS_CALLBACKS_64    = bytes.fromhex('{t64.hex()}')\n"
+        f"CXX_EH_FIXER_64     = bytes.fromhex('{f64.hex()}')\n"
     )
+
     print(f"[peor] assembled shellcodes -> {SHELLCODES_PY}")
 
 
@@ -75,10 +147,10 @@ class develop(_develop):
 
 setuptools.setup(
     name='peor',
-    version='1.0.0',
+    version=_get_version(),
     author='Ariel Tubul',
     packages=setuptools.find_packages(),
-    long_description=README_PATH.read_text(),
+    long_description=README_PATH.read_text(encoding='utf-8'),
     install_requires=['pefile', 'keystone-engine'],
     long_description_content_type='text/markdown',
     url='https://github.com/mon231/peor/',

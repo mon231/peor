@@ -6,7 +6,7 @@ from peor._shellcodes import (
     RELOCS_32, RELOCS_64,
     IMPORTS_32_UM, IMPORTS_64_UM,
     ENTRYPOINT_32, ENTRYPOINT_64,
-    SEH_REGISTRAR_64,
+    SEH_REGISTRAR_32, SEH_REGISTRAR_64,
     TLS_CALLBACKS_32, TLS_CALLBACKS_64,
     CXX_EH_FIXER_32, CXX_EH_FIXER_64,
 )
@@ -42,7 +42,8 @@ _SHELLCODES = {
         'relocs':           RELOCS_32,
         'imports':          IMPORTS_32_UM,
         'entrypoint':       ENTRYPOINT_32,
-        'seh':              None,               # x86 has no RUNTIME_FUNCTION table
+        'seh':              SEH_REGISTRAR_32,   # inject fake LDR_DATA_TABLE_ENTRY into PEB.Ldr
+        'seh_always':       True,               # needed regardless of .pdata (x86 uses FS:[0] SEH chains)
         'tls':              TLS_CALLBACKS_32,
         # x86 does NOT need the GetModuleHandleExW IAT hook.
         # On x86, _CxxThrowException stores (ThrowInfo - ImageBase) as a 32-bit value.
@@ -66,6 +67,7 @@ _SHELLCODES = {
         'imports':          IMPORTS_64_UM,
         'entrypoint':       ENTRYPOINT_64,
         'seh':              SEH_REGISTRAR_64,
+        'seh_always':       False,              # x64: only needed when .pdata (DataDir[3]) is present
         'tls':              TLS_CALLBACKS_64,
         'cxx_eh_fixer':     CXX_EH_FIXER_64,
         'cxx_eh_import':    b'RtlPcToFileHeader',
@@ -153,7 +155,7 @@ def _build_shellcode_chain(pe: PE, entry: dict, resolve_imports: bool) -> bytes:
     # handler reconstructs the pointer correctly without a hook.
     imports    = _strip_tail(entry['imports'], entry['tail']) if resolve_imports else b''
     relocs     = entry['relocs']
-    seh        = entry['seh'] if (entry['seh'] and _has_exception_table(pe)) else b''
+    seh        = entry['seh'] if (entry['seh'] and (entry.get('seh_always') or _has_exception_table(pe))) else b''
     tls        = entry['tls'] if (entry['tls'] and _has_tls_callbacks(pe)) else b''
     entrypoint = entry['entrypoint']
 

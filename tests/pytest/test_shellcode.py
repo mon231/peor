@@ -358,7 +358,7 @@ def test_10_tls_callbacks(arch, tmp_path):
     )
 
 
-@pytest.mark.parametrize("arch", ["x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64"])
 def test_11_cpp_exceptions(arch, tmp_path):
     """C++ EXE with typed throw/catch: typed catch must return 123; catch(...) returns 456; no-catch 789."""
     win_dir = ARCH_DIRS[arch]
@@ -384,7 +384,7 @@ def test_11_cpp_exceptions(arch, tmp_path):
     )
 
 
-@pytest.mark.parametrize("arch", ["x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64"])
 def test_12_seh_exceptions(arch, tmp_path):
     """C++ EXE compiled with /EHa (SEH-integrated): typed catch must fire and return 123."""
     win_dir = ARCH_DIRS[arch]

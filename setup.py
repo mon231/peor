@@ -57,6 +57,7 @@ def _assemble_shellcodes():
     e32  = assemble(ASM_DIR / 'entrypoint_resolver32.asm',   keystone.KS_ARCH_X86, keystone.KS_MODE_32)
     e64  = assemble(ASM_DIR / 'entrypoint_resolver64.asm',   keystone.KS_ARCH_X86, keystone.KS_MODE_64)
     s64  = assemble(ASM_DIR / 'seh_registrar64.asm',         keystone.KS_ARCH_X86, keystone.KS_MODE_64)
+    s32  = assemble(ASM_DIR / 'seh_registrar32.asm',         keystone.KS_ARCH_X86, keystone.KS_MODE_32)
     t32  = assemble(ASM_DIR / 'tls_callbacks32.asm',         keystone.KS_ARCH_X86, keystone.KS_MODE_32)
     t64  = assemble(ASM_DIR / 'tls_callbacks64.asm',         keystone.KS_ARCH_X86, keystone.KS_MODE_64)
 
@@ -100,6 +101,7 @@ def _assemble_shellcodes():
         f"IMPORTS_64_UM       = bytes.fromhex('{i64.hex()}')\n"
         f"ENTRYPOINT_32       = bytes.fromhex('{e32.hex()}')\n"
         f"ENTRYPOINT_64       = bytes.fromhex('{e64.hex()}')\n"
+        f"SEH_REGISTRAR_32    = bytes.fromhex('{s32.hex()}')\n"
         f"SEH_REGISTRAR_64    = bytes.fromhex('{s64.hex()}')\n"
         f"TLS_CALLBACKS_32    = bytes.fromhex('{t32.hex()}')\n"
         f"TLS_CALLBACKS_64    = bytes.fromhex('{t64.hex()}')\n"

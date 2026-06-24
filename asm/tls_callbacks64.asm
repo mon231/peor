@@ -18,6 +18,9 @@
 ;   add rsp, 0x28    -> 8 mod 16
 ; R15 is callee-saved (Windows x64 ABI), preserved across callbacks.
 
+; Named constants
+%define DLL_PROCESS_ATTACH 0x01
+
     mov esi, [rbx + 0x3C]
     add rsi, rbx                        ; RSI = NT headers
     mov eax, [rsi + 0xD0]               ; DataDir[9].VirtualAddress (TLS directory)
@@ -34,9 +37,9 @@ _loop:
     mov rax, [r15]                      ; RAX = next callback VA
     test rax, rax
     jz _cleanup                         ; null terminator
-    add r15, 8                          ; advance to next entry
+    add r15, 0x08                        ; advance to next entry (8-byte callback pointer)
     mov rcx, rbx                        ; arg1: hModule = PE base
-    mov edx, 1                          ; arg2: DLL_PROCESS_ATTACH
+    mov edx, DLL_PROCESS_ATTACH         ; arg2: DLL_PROCESS_ATTACH
     xor r8d, r8d                        ; arg3: lpvReserved = NULL
     call rax                            ; callback(base, 1, NULL)
     jmp _loop

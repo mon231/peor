@@ -4,13 +4,14 @@
 ; On entry: (none required).
 ; On exit:  EBX = PE base, execution falls through to the next shellcode.
 ;
-; 0x7E7E7E7E = PE_OFFSET_PLACEHOLDER, patched by setup.py with (shellcode_size - 5).
-; The name must match _PE_OFFSET_PLACEHOLDER in setup.py.
+; Named constants
+%define PE_OFFSET_PLACEHOLDER   0x7E7E7E7E  ; patched by setup.py: len(relocs) - 5
+%define IMAGE_REL_BASED_HIGHLOW 0x03        ; base-relocation type for 32-bit absolute pointers
 
     call _base
 _base:
     pop ebx                              ; EBX = runtime address of _base
-    lea edi, [ebx + 0x7E7E7E7E]         ; PATCHED (PE_OFFSET_PLACEHOLDER): EDI = PE image base
+    lea edi, [ebx + PE_OFFSET_PLACEHOLDER]  ; EDI = PE image base (offset patched at install)
     mov ebx, edi                         ; EBX = PE base
 
     cmp word [ebx], 0x5A4D               ; DOS "MZ" magic
@@ -38,10 +39,10 @@ _valid_pe:
 _block:
     mov edx, [esi]                       ; block.VirtualAddress
     mov ecx, [esi + 4]                   ; block.SizeOfBlock
-    add esi, 8
+    add esi, 0x08
     test ecx, ecx
     jz _done                             ; null block = end sentinel
-    sub ecx, 8
+    sub ecx, 0x08
     shr ecx, 1                           ; number of 16-bit entries
     jz _block
 
@@ -53,7 +54,7 @@ _entry:
     mov ebp, eax
     and eax, 0x0FFF                      ; lower 12 bits = page offset
     shr ebp, 0x0c                        ; upper 4 bits = reloc type
-    cmp ebp, 3                           ; IMAGE_REL_BASED_HIGHLOW
+    cmp ebp, IMAGE_REL_BASED_HIGHLOW
     jnz _next_entry
     lea ebp, [ebx + edx]                 ; page VA = PE_base + block.VirtualAddress
     add ebp, eax                         ; target address

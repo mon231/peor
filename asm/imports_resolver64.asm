@@ -158,7 +158,7 @@ _thunk_loop:
 
     ; Import by name: RAX = RVA of IMAGE_IMPORT_BY_NAME
     add rax, r14                        ; VA of IMAGE_IMPORT_BY_NAME
-    add rax, 2                          ; skip Hint WORD -> function name string
+    add rax, 0x02                       ; skip Hint WORD -> function name string
     mov rdx, rax                        ; arg2: name string
     mov rcx, rbx                        ; arg1: module handle
     call r12                            ; GetProcAddress(module, name) -> RAX
@@ -172,8 +172,8 @@ _by_ordinal:
 
 _save_func:
     mov [r15], rax                      ; write resolved address to IAT slot (64-bit)
-    add rsi, 8                          ; advance INT ptr (64-bit entry = 8 bytes)
-    add r15, 8                          ; advance IAT ptr
+    add rsi, 0x08                       ; advance INT ptr (8-byte thunk entry)
+    add r15, 0x08                       ; advance IAT ptr
     jmp _thunk_loop
 
 _next_desc:

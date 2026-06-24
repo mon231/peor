@@ -10,6 +10,9 @@
 ;
 ; DataDir[9].VirtualAddress is at NT+0xC0 (PE32: OptHdr at NT+24, DataDir at +96, entry 9 at +9*8=72 -> NT+24+96+72=NT+192=NT+0xC0).
 
+; Named constants
+%define DLL_PROCESS_ATTACH 0x01
+
     mov esi, [ebx + 0x3C]
     add esi, ebx                        ; ESI = NT headers
     mov eax, [esi + 0xC0]               ; DataDir[9].VirtualAddress (TLS directory)
@@ -25,12 +28,12 @@ _loop:
     test ecx, ecx
     jz _done                            ; null terminator
     push eax                            ; save callbacks-array pointer
-    push 0                              ; lpvReserved = NULL
-    push 1                              ; DLL_PROCESS_ATTACH
+    push 0x00                           ; lpvReserved = NULL
+    push DLL_PROCESS_ATTACH
     push ebx                            ; hModule = PE base
-    call ecx                            ; callback(base, 1, NULL)  [callee cleans 12 bytes]
+    call ecx                            ; callback(base, DLL_PROCESS_ATTACH, NULL)  [callee cleans 12 bytes]
     pop eax                             ; restore array pointer
-    add eax, 4                          ; advance to next entry
+    add eax, 0x04                       ; advance to next entry (4-byte callback pointer)
     jmp _loop
 
 _done:

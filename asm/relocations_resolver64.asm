@@ -4,13 +4,14 @@
 ; On entry: (none required).
 ; On exit:  RBX = PE base, execution falls through to the next shellcode.
 ;
-; 0x7E7E7E7E = PE_OFFSET_PLACEHOLDER, patched by setup.py with (shellcode_size - 5).
-; The name must match _PE_OFFSET_PLACEHOLDER in setup.py.
+; Named constants
+%define PE_OFFSET_PLACEHOLDER  0x7E7E7E7E  ; patched by setup.py: len(relocs) - 5
+%define IMAGE_REL_BASED_DIR64  0x0A        ; base-relocation type for 64-bit absolute pointers
 
     call _base
 _base:
     pop rbx                              ; RBX = runtime address of _base
-    lea rdi, [rbx + 0x7E7E7E7E]         ; PATCHED (PE_OFFSET_PLACEHOLDER): RDI = PE image base
+    lea rdi, [rbx + PE_OFFSET_PLACEHOLDER]  ; RDI = PE image base (offset patched at install)
     mov rbx, rdi                         ; RBX = PE base
 
     cmp word [rbx], 0x5A4D               ; "MZ"
@@ -38,10 +39,10 @@ _valid_pe:
 _block:
     mov edx, [rsi]                       ; block.VirtualAddress (32-bit)
     mov ecx, [rsi + 4]                   ; block.SizeOfBlock
-    add rsi, 8
+    add rsi, 0x08
     test ecx, ecx
     jz _done                             ; null block = end sentinel
-    sub ecx, 8
+    sub ecx, 0x08
     shr ecx, 1                           ; number of 16-bit entries
     jz _block
 
@@ -53,7 +54,7 @@ _entry:
     mov r9w, r8w
     and r8d, 0x0FFF                      ; page offset
     shr r9w, 0x0c                        ; reloc type
-    cmp r9b, 0x0A                        ; IMAGE_REL_BASED_DIR64
+    cmp r9b, IMAGE_REL_BASED_DIR64
     jnz _next_entry
     lea r10, [rbx + rdx]                 ; page VA
     add r10, r8                          ; target address

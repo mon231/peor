@@ -8,7 +8,7 @@ from peor._shellcodes import (
     ENTRYPOINT_32, ENTRYPOINT_64,
     SEH_REGISTRAR_32, SEH_REGISTRAR_64,
     TLS_CALLBACKS_32, TLS_CALLBACKS_64,
-    CXX_EH_FIXER_32, CXX_EH_FIXER_64,
+    CXX_EH_FIXER_64,
 )
 
 # Trailing bytes that terminate each import resolver so it falls through into the
@@ -18,13 +18,11 @@ from peor._shellcodes import (
 _IMPORTS_TAIL_32 = b'\xc3'
 _IMPORTS_TAIL_64 = b'\xff\xe0'
 
-# Magic placeholders in cxx_eh_fixer{32,64}.asm replaced at build time by peor.
+# Magic placeholders in cxx_eh_fixer64.asm replaced at build time by peor.
 # PE_SIZE_MAGIC: peor patches to pe.OPTIONAL_HEADER.SizeOfImage.
 # IAT_RVA_MAGIC: peor patches to the IAT-entry RVA for the hooked function.
 _CXX_EH_PE_SIZE_MAGIC_64 = b'\x78\x56\x34\x12'  # 0x12345678 LE (in ADD RCX, imm32)
 _CXX_EH_IAT_RVA_MAGIC_64 = b'\x21\x43\x65\x87'  # 0x87654321 LE (in LEA RDX, [RBX+disp32])
-_CXX_EH_PE_SIZE_MAGIC_32 = b'\xc4\xc3\xc2\xc1'  # 0xC1C2C3C4 LE (in ADD ECX, imm32)
-_CXX_EH_IAT_RVA_MAGIC_32 = b'\xd4\xd3\xd2\xd1'  # 0xD1D2D3D4 LE (in LEA EDX, [EBX+disp32])
 
 # Windows PE Subsystem values that peor does not yet support.
 _EFI_SUBSYSTEMS = frozenset({10, 11, 12, 13})  # EFI_APPLICATION / BOOT_SERVICE / RUNTIME / ROM
@@ -42,22 +40,9 @@ _SHELLCODES = {
         'relocs':           RELOCS_32,
         'imports':          IMPORTS_32_UM,
         'entrypoint':       ENTRYPOINT_32,
-        'seh':              SEH_REGISTRAR_32,   # inject fake LDR_DATA_TABLE_ENTRY into PEB.Ldr
-        'seh_always':       True,               # needed regardless of .pdata (x86 uses FS:[0] SEH chains)
+        'seh':              SEH_REGISTRAR_32,
+        'seh_always':       True,               # x86 uses FS:[0] SEH chains — always needed
         'tls':              TLS_CALLBACKS_32,
-        # x86 does NOT need the GetModuleHandleExW IAT hook.
-        # On x86, _CxxThrowException stores (ThrowInfo - ImageBase) as a 32-bit value.
-        # When ImageBase is NULL (shellcode not in module list), this is just ThrowInfo
-        # itself — a valid 32-bit pointer. __CxxFrameHandler reconstructs it as
-        # (NULL + ThrowInfo) = ThrowInfo, which is correct.  No truncation occurs
-        # because addresses never exceed 32 bits.  Installing the hook on x86 breaks
-        # _beginthreadex, which also calls GetModuleHandleExW(FLAG_FROM_ADDRESS) and
-        # passes the returned handle to FreeLibraryAndExitThread — crashing when given
-        # a non-module shellcode address.
-        'cxx_eh_fixer':     None,
-        'cxx_eh_import':    None,
-        'cxx_pe_size_magic': _CXX_EH_PE_SIZE_MAGIC_32,
-        'cxx_iat_rva_magic': _CXX_EH_IAT_RVA_MAGIC_32,
         'tail':             _IMPORTS_TAIL_32,
         'dir_array_offset': 96,
         'disp32_off':       8,
@@ -159,7 +144,7 @@ def _build_shellcode_chain(pe: PE, entry: dict, resolve_imports: bool) -> bytes:
     tls        = entry['tls'] if (entry['tls'] and _has_tls_callbacks(pe)) else b''
     entrypoint = entry['entrypoint']
 
-    if resolve_imports and entry['cxx_eh_fixer'] is not None and entry['cxx_eh_import'] is not None:
+    if resolve_imports and entry.get('cxx_eh_fixer') is not None and entry.get('cxx_eh_import') is not None:
         iat_rva = _find_iat_rva(pe, entry['cxx_eh_import'])
         if iat_rva is not None:
             fixer = bytearray(entry['cxx_eh_fixer'])

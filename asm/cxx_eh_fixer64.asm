@@ -12,12 +12,10 @@
 ; On entry: RBX = PE base (from relocs resolver).
 ; On exit:  RBX unchanged; falls through to next shellcode.
 ;
-; Two magic 32-bit constants replaced by peor/__main__.py at build time:
-;   0x12345678 (LE bytes 78 56 34 12) = SizeOfImage
-;   0x87654321 (LE bytes 21 43 65 87) = RVA of IAT entry for RtlPcToFileHeader
-;
-; One magic replaced by setup.py at package-install time:
-;   0xFEFEFEFE (LE bytes FE FE FE FE) = byte distance from _setup_ip64 to _data64
+; Named constants (patched by setup.py or peor/__main__.py)
+%define FORWARD_MAGIC  0x5A5A5A5A  ; patched by setup.py: (_data64 - _setup_ip64)
+%define PE_SIZE_MAGIC  0x12345678  ; patched by peor: SizeOfImage
+%define IAT_RVA_MAGIC  0x87654321  ; patched by peor: RtlPcToFileHeader IAT RVA
 
     ; == SETUP CODE (runs once, then jumps over the hook stub) ==
     call _setup_ip64            ; push &_setup_ip64, fall into setup
@@ -26,16 +24,16 @@ _setup_ip64:
 
     ; Compute runtime address of _data64 (data area inside the hook stub).
     ; The distance is a constant baked in by setup.py.
-    add rax, 0x5A5A5A5A         ; FORWARD_MAGIC: setup.py patches to (_data64 - _setup_ip64)
+    add rax, FORWARD_MAGIC      ; patched to (_data64 - _setup_ip64)
 
     ; Fill _data64[0] = pe_base, [8] = pe_end, [16] = orig_fn
     mov [rax], rbx              ; pe_base
     mov rcx, rbx
-    add rcx, 0x12345678         ; PE_SIZE_MAGIC: peor patches to SizeOfImage
-    mov [rax + 8], rcx          ; pe_end
-    lea rdx, [rbx + 0x87654321] ; IAT_RVA_MAGIC: peor patches; rdx -> IAT slot
+    add rcx, PE_SIZE_MAGIC      ; patched to SizeOfImage
+    mov [rax + 0x08], rcx       ; pe_end
+    lea rdx, [rbx + IAT_RVA_MAGIC]  ; patched; rdx -> RtlPcToFileHeader IAT slot
     mov r10, [rdx]              ; r10 = original RtlPcToFileHeader pointer
-    mov [rax + 0x10], r10       ; orig_fn
+    mov [rax + 0x10], r10       ; orig_fn (at _data64 + 0x10)
 
     ; Patch IAT slot -> hook stub.
     ; _hook_stub64 is 5 bytes before _data64 (the CALL instruction prefix).

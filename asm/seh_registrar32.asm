@@ -35,6 +35,10 @@
 ; On exit:  EBX unchanged, falls through to next chain component
 ; Clobbers: EAX, ECX, EDX, ESI, EDI
 
+; Named constants
+%define CPP_EXCEPTION_CODE  0xe06d7363  ; MSVC C++ exception magic (throw)
+%define EXCEPTION_CHAIN_END 0xffffffff  ; FS:[0] end-of-chain sentinel
+
     push ebx                          ; save PE_base
 
     ; ----------------------------------------------------------------
@@ -114,7 +118,7 @@ _veh_handler:
     mov edi, [esi]                    ; EXCEPTION_RECORD*
 
     ; Only intercept C++ exceptions
-    cmp dword [edi], 0xe06d7363
+    cmp dword [edi], CPP_EXCEPTION_CODE
     jne _veh_search
 
     ; Walk SEH chain (FS:[0] = top of EXCEPTION_REGISTRATION_RECORD chain)
@@ -122,7 +126,7 @@ _veh_handler:
     mov ebx, [0]                      ; FS:[0] = chain head
 
 _veh_walk:
-    cmp ebx, -1                       ; end-of-chain sentinel
+    cmp ebx, EXCEPTION_CHAIN_END
     je _veh_search
 
     mov ecx, [ebx + 4]               ; frame->Handler
@@ -158,7 +162,7 @@ _veh_search:
     pop esi
     pop ebp
     xor eax, eax                      ; EXCEPTION_CONTINUE_SEARCH (0)
-    ret 4                             ; __stdcall: callee pops the one PVOID arg
+    ret 0x04                          ; __stdcall: callee pops the one PVOID arg
 ; =====================================================================
 ; END VEH HANDLER
 ; =====================================================================

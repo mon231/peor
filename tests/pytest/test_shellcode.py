@@ -19,6 +19,7 @@ from peor.__main__ import (
     _build_shellcode_chain,
     _find_export_rva,
     _SHELLCODES,
+    _PLATFORM_LINUX,
     IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR,
     IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT,
 )
@@ -666,6 +667,15 @@ def test_custom_entry(arch, tmp_path):
     )
 
 
+def _shellcodify_platform(pe_path: Path, output_path: Path, platform: str) -> None:
+    """Shellcodify with an explicit --platform override (determinism-checked)."""
+    dump_memory_layout(PE(str(pe_path)), output_path, platform=platform)
+    det_path = output_path.parent / (output_path.stem + '_det' + output_path.suffix)
+    dump_memory_layout(PE(str(pe_path)), det_path, platform=platform)
+    assert output_path.read_bytes() == det_path.read_bytes(), \
+        f"Non-deterministic shellcode output for {pe_path.name}"
+
+
 def _win_path_to_wsl(p: Path) -> str:
     """Convert an absolute Windows path to its WSL /mnt/<drive>/... form."""
     s = str(p).replace("\\", "/")
@@ -683,10 +693,13 @@ def _find_mingw_gcc():
     if shutil.which(gcc):
         return [gcc], False
     if platform.system() == "Windows" and shutil.which("wsl"):
-        r = subprocess.run(["wsl", "--", "which", gcc],
-                           capture_output=True, timeout=10)
-        if r.returncode == 0:
-            return ["wsl", "--", gcc], True
+        try:
+            r = subprocess.run(["wsl", "--", "which", gcc],
+                               capture_output=True, timeout=10)
+            if r.returncode == 0:
+                return ["wsl", "--", gcc], True
+        except subprocess.TimeoutExpired:
+            pass
     return None, None
 
 
@@ -869,4 +882,245 @@ def test_clangcl_simple_calc(arch, tmp_path):
         f"[clang-cl {arch}] expected 4950, got {result.returncode}\n"
         f"stdout: {result.stdout.decode(errors='replace')}\n"
         f"stderr: {result.stderr.decode(errors='replace')}"
+    )
+
+
+# ── P4-18: Linux user-mode ────────────────────────────────────────────────────
+
+_LIBC_DEF_CONTENT = "LIBRARY libc.so.6\nEXPORTS\nwrite\n"
+
+_MINGW_CFLAGS_LINUX = [
+    "-nostdlib", "-nodefaultlibs", "-nostartfiles",
+    "-fno-unwind-tables", "-fno-asynchronous-unwind-tables",
+]
+
+
+def _build_linux_write_pe(tmp_path: Path, use_wsl: bool) -> "Path | None":
+    """Cross-compile tests/Linux_x64/01_linux_write/main.c as a Windows PE with libc.so.6 imports.
+
+    Returns the path to the compiled .exe or None on failure.
+    Creates a .def file, generates an import library via dlltool, then compiles.
+    """
+    src = TESTS_DIR / "Linux_x64" / "01_linux_write" / "main.c"
+    if not src.exists():
+        return None
+
+    exe     = tmp_path / "linux_write.exe"
+    def_file = tmp_path / "libc.so.6.def"
+    imp_lib  = tmp_path / "liblibc_import.a"
+    def_file.write_text(_LIBC_DEF_CONTENT, encoding="ascii")
+
+    if use_wsl:
+        def_wsl  = _win_path_to_wsl(def_file)
+        imp_wsl  = _win_path_to_wsl(imp_lib)
+        src_wsl  = _win_path_to_wsl(src)
+        exe_wsl  = _win_path_to_wsl(exe)
+
+        r = subprocess.run(
+            ["wsl", "--", "x86_64-w64-mingw32-dlltool", "-d", def_wsl, "-l", imp_wsl],
+            capture_output=True, timeout=30,
+        )
+        if r.returncode != 0:
+            return None
+
+        cc = subprocess.run(
+            ["wsl", "--", "bash", "-c",
+             "x86_64-w64-mingw32-gcc " + " ".join(_MINGW_CFLAGS_LINUX)
+             + f" -Wl,-e,main -Wl,--subsystem,posix {src_wsl} {imp_wsl} -o {exe_wsl}"],
+            capture_output=True, timeout=30,
+        )
+    else:
+        r = subprocess.run(
+            ["x86_64-w64-mingw32-dlltool", "-d", str(def_file), "-l", str(imp_lib)],
+            capture_output=True, timeout=30,
+        )
+        if r.returncode != 0:
+            return None
+
+        cc = subprocess.run(
+            ["x86_64-w64-mingw32-gcc"] + _MINGW_CFLAGS_LINUX
+            + ["-Wl,-e,main", "-Wl,--subsystem,posix",
+               str(src), str(imp_lib), "-o", str(exe)],
+            capture_output=True, timeout=30,
+        )
+
+    if cc.returncode != 0 or not exe.exists():
+        return None
+    return exe
+
+
+@pytest.mark.parametrize("arch", ["x64"])
+def test_01_linux_write(arch, tmp_path):
+    """Linux import resolver: PE imports write() from libc.so.6; shellcode writes PEOR to stdout.
+
+    Requires native x86_64-w64-mingw32-gcc + dlltool and the Linux test_loader.
+    Only runs on Linux (the test_loader is a Linux ELF; Windows runners skip this test).
+    The PE is compiled with --subsystem posix (subsystem 7) so peor auto-selects the Linux chain.
+    The Linux import resolver uses dlopen/dlsym passed by the loader via RDI/RSI.
+    """
+    if platform.system() != "Linux":
+        pytest.skip("test_01_linux_write requires a Linux runner (test_loader_linux is an ELF)")
+
+    loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux"
+    if not loader.exists():
+        pytest.skip(
+            "Linux test_loader not found — "
+            "build with: gcc -O2 -ffixed-rbx -ffixed-r12 -ffixed-r13 "
+            "-ffixed-r14 -ffixed-r15 -o tests/test_loader_linux/test_loader_linux "
+            "tests/test_loader_linux/main.c"
+        )
+
+    mingw_cmd, use_wsl = _find_mingw_gcc()
+    if mingw_cmd is None:
+        pytest.skip("x86_64-w64-mingw32-gcc not found (native PATH)")
+
+    exe = _build_linux_write_pe(tmp_path, use_wsl)
+    if exe is None:
+        pytest.skip("Failed to build linux_write PE (dlltool or mingw-gcc unavailable)")
+
+    sc = tmp_path / "linux_write.bin"
+    _shellcodify_platform(exe, sc, _PLATFORM_LINUX)
+
+    result = subprocess.run([str(loader), str(sc)], capture_output=True, timeout=15)
+    assert result.returncode == 0, (
+        f"[linux_write] loader crashed with code {result.returncode}\n"
+        f"stderr: {result.stderr.decode(errors='replace')}"
+    )
+    stdout = result.stdout.decode(errors="replace")
+    assert "PEOR\n" in stdout, (
+        f"[linux_write] expected 'PEOR\\n' in stdout, got {stdout!r}"
+    )
+
+
+# ── P4-20: EFI via QEMU ───────────────────────────────────────────────────────
+
+_EFI_LOADER_SRC = TESTS_DIR / "EFI_x64" / "efi_loader" / "main.c"
+_EFI_HELLO_SRC  = TESTS_DIR / "EFI_x64" / "01_efi_hello" / "main.c"
+
+_MINGW_CFLAGS_EFI = [
+    "-nostdlib", "-nodefaultlibs", "-nostartfiles",
+    "-fno-unwind-tables", "-fno-asynchronous-unwind-tables",
+]
+
+
+def _find_qemu_ovmf() -> "tuple[str, str, str] | tuple[None, None, None]":
+    """Return (qemu_bin, ovmf_code, ovmf_vars) or (None, None, None) if unavailable."""
+    qemu = shutil.which("qemu-system-x86_64")
+    if qemu is None:
+        return None, None, None
+
+    candidates_code = [
+        "/usr/share/OVMF/OVMF_CODE.fd",
+        "/usr/share/ovmf/OVMF.fd",
+        "/usr/share/edk2/ovmf/OVMF_CODE.fd",
+    ]
+    candidates_vars = [
+        "/usr/share/OVMF/OVMF_VARS.fd",
+        "/usr/share/ovmf/OVMF_VARS.fd",
+        "/usr/share/edk2/ovmf/OVMF_VARS.fd",
+    ]
+    ovmf_code = next((p for p in candidates_code if Path(p).exists()), None)
+    ovmf_vars = next((p for p in candidates_vars if Path(p).exists()), None)
+    if ovmf_code is None:
+        return None, None, None
+    return qemu, ovmf_code, ovmf_vars
+
+
+def _make_efi_boot_dir(efi_pe: Path, boot_dir: Path) -> None:
+    """Populate boot_dir/EFI/BOOT/BOOTX64.EFI for QEMU vvfat presentation."""
+    efi_boot = boot_dir / "EFI" / "BOOT"
+    efi_boot.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(efi_pe, efi_boot / "BOOTX64.EFI")
+
+
+def test_01_efi_hello(tmp_path):
+    """EFI shellcode: peor converts an EFI application PE; QEMU+OVMF boots it and shuts down.
+
+    Requires x86_64-w64-mingw32-gcc, qemu-system-x86_64, ovmf, and mtools on the PATH.
+    The EFI loader PE (compiled from efi_loader/main.c) embeds the shellcode bytes as a
+    C array, calls the shellcode (which returns EFI_SUCCESS=0), then calls ResetSystem.
+    QEMU exits 0 on clean UEFI shutdown — that is the success criterion.
+    """
+    mingw_cmd, use_wsl = _find_mingw_gcc()
+    if mingw_cmd is None or use_wsl:
+        pytest.skip("x86_64-w64-mingw32-gcc not found natively (WSL not usable for EFI build)")
+
+    qemu, ovmf_code, ovmf_vars = _find_qemu_ovmf()
+    if qemu is None:
+        pytest.skip("qemu-system-x86_64 not found")
+    if ovmf_code is None:
+        pytest.skip("OVMF firmware not found (install ovmf package)")
+
+    gcc = "x86_64-w64-mingw32-gcc"
+
+    # 1. Build the minimal EFI hello PE
+    hello_efi = tmp_path / "01_efi_hello.efi"
+    cc = subprocess.run(
+        [gcc] + _MINGW_CFLAGS_EFI
+        + ["-Wl,-e,efi_main", "-Wl,--subsystem,efi_application",
+           "-o", str(hello_efi), str(_EFI_HELLO_SRC)],
+        capture_output=True, timeout=30,
+    )
+    assert cc.returncode == 0, (
+        f"EFI hello compile failed:\n{cc.stderr.decode(errors='replace')}"
+    )
+
+    # 2. Convert to shellcode using the EFI chain (auto-detected from subsystem 10)
+    sc = tmp_path / "efi_hello.bin"
+    _shellcodify(hello_efi, sc)
+
+    # 3. Generate shellcode_data.h for the EFI loader
+    sc_bytes = sc.read_bytes()
+    hex_bytes = ", ".join(f"0x{b:02x}" for b in sc_bytes)
+    header = (
+        f"static const unsigned char SHELLCODE_BYTES[] = {{{hex_bytes}}};\n"
+        f"static const unsigned long long SHELLCODE_SIZE = {len(sc_bytes)}ULL;\n"
+    )
+    header_path = tmp_path / "shellcode_data.h"
+    header_path.write_text(header, encoding="ascii")
+
+    # 4. Build the EFI loader PE with shellcode bytes embedded
+    loader_efi = tmp_path / "efi_loader.efi"
+    cc = subprocess.run(
+        [gcc] + _MINGW_CFLAGS_EFI
+        + [f"-I{tmp_path}", "-Wl,-e,efi_loader_main", "-Wl,--subsystem,efi_application",
+           "-o", str(loader_efi), str(_EFI_LOADER_SRC)],
+        capture_output=True, timeout=30,
+    )
+    assert cc.returncode == 0, (
+        f"EFI loader compile failed:\n{cc.stderr.decode(errors='replace')}"
+    )
+
+    # 5. Prepare EFI/BOOT/BOOTX64.EFI directory for QEMU vvfat virtual disk
+    boot_dir = tmp_path / "efi_boot"
+    _make_efi_boot_dir(loader_efi, boot_dir)
+
+    # 6. Copy writable OVMF VARS (firmware needs writable variable store)
+    ovmf_vars_rw = tmp_path / "OVMF_VARS.fd"
+    if ovmf_vars:
+        shutil.copy2(ovmf_vars, ovmf_vars_rw)
+    else:
+        ovmf_vars_rw.write_bytes(b'\x00' * (540 * 1024))  # 540 KB blank vars store
+
+    # 7. Boot QEMU with OVMF; assert it exits 0 (ResetSystem called on EFI_SUCCESS).
+    # vvfat presents boot_dir as a FAT16 drive — no mtools needed.
+    qemu_cmd = [
+        qemu,
+        "-nographic",
+        "-machine", "q35",
+        "-drive", f"if=pflash,format=raw,readonly=on,file={ovmf_code}",
+        "-drive", f"if=pflash,format=raw,file={ovmf_vars_rw}",
+        "-drive", f"format=vvfat,file={boot_dir},if=ide,fat-type=16",
+        "-m", "256M",
+        "-no-reboot",
+    ]
+    try:
+        result = subprocess.run(qemu_cmd, capture_output=True, timeout=90)
+    except subprocess.TimeoutExpired:
+        pytest.fail("QEMU timed out — EFI shellcode did not return EFI_SUCCESS or ResetSystem was not called")
+
+    assert result.returncode == 0, (
+        f"QEMU exited with code {result.returncode} (expected 0 = clean UEFI shutdown)\n"
+        f"stdout: {result.stdout.decode(errors='replace')[:2000]}\n"
+        f"stderr: {result.stderr.decode(errors='replace')[:500]}"
     )

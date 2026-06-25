@@ -6,8 +6,10 @@ from pefile import PE, OPTIONAL_HEADER_MAGIC_PE, OPTIONAL_HEADER_MAGIC_PE_PLUS
 from peor._shellcodes import (
     RELOCS_32, RELOCS_64,
     IMPORTS_32_UM, IMPORTS_64_UM,
+    IMPORTS_64_LINUX,
     DELAY_IMPORTS_32_UM, DELAY_IMPORTS_64_UM,
     ENTRYPOINT_32, ENTRYPOINT_64,
+    ENTRYPOINT_EFI64,
     SEH_REGISTRAR_32, SEH_REGISTRAR_64,
     TLS_CALLBACKS_32, TLS_CALLBACKS_64,
     CXX_EH_FIXER_64,
@@ -47,9 +49,14 @@ _EP_RVA_MAGIC = b'\xce\xce\xce\xce'  # 0xCECECECE LE (in MOV EAX, imm32)
 # Maximum signed 32-bit displacement for the LEA disp32 field in the relocs resolver.
 _MAX_SHELLCODE_DISP32 = 0x7FFFFFFF
 
-# Windows PE Subsystem values that peor does not yet support.
-_EFI_SUBSYSTEMS   = frozenset({10, 11, 12, 13})  # EFI_APPLICATION / BOOT_SERVICE / RUNTIME / ROM
-_NATIVE_SUBSYSTEM = 1                             # Windows native (kernel-mode drivers)
+# Windows PE Subsystem constants (PECOFF/UEFI spec).
+_NATIVE_SUBSYSTEM       = 1   # Windows native (kernel-mode drivers)
+_POSIX_CUI_SUBSYSTEM    = 7   # POSIX CUI — auto-selects Linux shellcode chain
+_EFI_SUBSYSTEMS = frozenset({10, 11, 12, 13})   # EFI_APPLICATION / BOOT_SERVICE / RUNTIME / ROM
+
+# Platform keys used to select a shellcode chain in _SHELLCODES.
+_PLATFORM_LINUX = 'linux'
+_PLATFORM_EFI   = 'efi'
 
 # Per-architecture shellcode table.
 # dir_array_offset: bytes from the optional-header start to the DataDirectory array
@@ -84,6 +91,36 @@ _SHELLCODES = {
         'cxx_eh_import':     b'RtlPcToFileHeader',
         'cxx_pe_size_magic': _CXX_EH_PE_SIZE_MAGIC_64,
         'cxx_iat_rva_magic': _CXX_EH_IAT_RVA_MAGIC_64,
+        'tail':              _IMPORTS_TAIL_64,
+        'dir_array_offset':  112,
+        'disp32_off':        9,
+        'ep_rva_magic':      _EP_RVA_MAGIC,
+    },
+    # Linux x64 user-mode: dlopen/dlsym import resolver, no Windows-specific SEH/CXX.
+    # Selected when Subsystem == _POSIX_CUI_SUBSYSTEM (7) or --platform linux.
+    _PLATFORM_LINUX: {
+        'relocs':            RELOCS_64,
+        'imports':           IMPORTS_64_LINUX,
+        'delay_imports':     b'',
+        'entrypoint':        ENTRYPOINT_64,
+        'seh':               b'',
+        'seh_always':        False,
+        'tls':               b'',
+        'tail':              _IMPORTS_TAIL_64,
+        'dir_array_offset':  112,
+        'disp32_off':        9,
+        'ep_rva_magic':      _EP_RVA_MAGIC,
+    },
+    # EFI x64 application: no imports resolver, EFI-specific entrypoint (NULL args).
+    # Selected when Subsystem in _EFI_SUBSYSTEMS or --platform efi.
+    _PLATFORM_EFI: {
+        'relocs':            RELOCS_64,
+        'imports':           b'',
+        'delay_imports':     b'',
+        'entrypoint':        ENTRYPOINT_EFI64,
+        'seh':               b'',
+        'seh_always':        False,
+        'tls':               b'',
         'tail':              _IMPORTS_TAIL_64,
         'dir_array_offset':  112,
         'disp32_off':        9,
@@ -167,16 +204,44 @@ def _find_export_rva(pe: PE, name_or_ordinal: str) -> int:
     raise ValueError(f"Export '{name_or_ordinal}' not found in PE")
 
 
-def _validate_pe(pe: PE) -> dict:
+def _validate_pe(pe: PE, platform: str | None = None) -> dict:
+    """Return the shellcode-chain entry dict for pe, or raise ValueError.
+
+    platform overrides subsystem-based auto-detection when explicitly provided
+    (e.g. '--platform linux' or '--platform efi').
+    """
     subsystem = pe.OPTIONAL_HEADER.Subsystem
-    if subsystem in _EFI_SUBSYSTEMS:
-        raise ValueError(f"EFI PE (subsystem {subsystem}) is not yet supported")
-    if subsystem == _NATIVE_SUBSYSTEM:
-        raise ValueError(f"Kernel-mode PE (subsystem {subsystem}) is not yet supported")
+
     dirs = pe.OPTIONAL_HEADER.DATA_DIRECTORY
     if (len(dirs) > IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR
             and dirs[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR].VirtualAddress != 0):
         raise ValueError("CLR/managed PE is not supported")
+
+    if subsystem == _NATIVE_SUBSYSTEM and platform is None:
+        raise ValueError(f"Kernel-mode PE (subsystem {subsystem}) is not yet supported")
+
+    # Explicit --platform overrides subsystem-based detection.
+    if platform == _PLATFORM_LINUX:
+        if pe.PE_TYPE != OPTIONAL_HEADER_MAGIC_PE_PLUS:
+            raise ValueError("--platform linux requires a 64-bit (PE32+) input PE")
+        return _SHELLCODES[_PLATFORM_LINUX]
+
+    if platform == _PLATFORM_EFI:
+        if pe.PE_TYPE != OPTIONAL_HEADER_MAGIC_PE_PLUS:
+            raise ValueError("--platform efi requires a 64-bit (PE32+) input PE")
+        return _SHELLCODES[_PLATFORM_EFI]
+
+    # Auto-detect EFI or Linux from subsystem.
+    if subsystem in _EFI_SUBSYSTEMS:
+        if pe.PE_TYPE != OPTIONAL_HEADER_MAGIC_PE_PLUS:
+            raise ValueError(f"EFI PE (subsystem {subsystem}) must be 64-bit (PE32+)")
+        return _SHELLCODES[_PLATFORM_EFI]
+
+    if subsystem == _POSIX_CUI_SUBSYSTEM:
+        if pe.PE_TYPE != OPTIONAL_HEADER_MAGIC_PE_PLUS:
+            raise ValueError(f"POSIX PE (subsystem {subsystem}) must be 64-bit (PE32+)")
+        return _SHELLCODES[_PLATFORM_LINUX]
+
     entry = _SHELLCODES.get(pe.PE_TYPE)
     if entry is None:
         raise ValueError(f"Unsupported PE type: 0x{pe.PE_TYPE:04X}")
@@ -329,8 +394,9 @@ def _print_info(info: dict, pe_name: str) -> None:
 
 
 def _make_shellcode(pe: PE, ignore_imports: bool = False, no_imports: bool = False,
-                    override_ep_rva: int | None = None) -> bytes:
-    entry      = _validate_pe(pe)
+                    override_ep_rva: int | None = None,
+                    platform: str | None = None) -> bytes:
+    entry      = _validate_pe(pe, platform=platform)
     ram_layout = _build_ram_layout(pe)
     if ignore_imports:
         _zero_import_dir(ram_layout, pe, entry)
@@ -339,8 +405,13 @@ def _make_shellcode(pe: PE, ignore_imports: bool = False, no_imports: bool = Fal
 
 
 def dump_memory_layout(pe: PE, output_file: Path, ignore_imports: bool = False,
-                       no_imports: bool = False, override_ep_rva: int | None = None):
-    output_file.write_bytes(_make_shellcode(pe, ignore_imports, no_imports, override_ep_rva))
+                       no_imports: bool = False, override_ep_rva: int | None = None,
+                       platform: str | None = None):
+    output_file.write_bytes(_make_shellcode(pe, ignore_imports, no_imports, override_ep_rva,
+                                            platform=platform))
+
+
+_SUPPORTED_PLATFORMS = (_PLATFORM_LINUX, _PLATFORM_EFI)
 
 
 def parse_arguments():
@@ -351,6 +422,9 @@ def parse_arguments():
     parser.add_argument('-e', '--entry',           type=str, default=None,  help='Call named export (or ordinal) instead of OEP')
     parser.add_argument('-o', '--output-file',    required=False, type=str, help='Output path, or "-" for stdout')
     parser.add_argument(      '--info',            action='store_true',     help='Print resolver sizes without writing output')
+    parser.add_argument('--platform',              type=str, default=None,
+                        choices=_SUPPORTED_PLATFORMS,
+                        help='Override target platform (linux | efi); auto-detected from subsystem otherwise')
     return parser.parse_args()
 
 
@@ -376,12 +450,13 @@ def main():
         override_ep_rva = _find_export_rva(pe, args.entry)
 
     if args.info:
-        entry = _validate_pe(pe)
+        entry = _validate_pe(pe, platform=args.platform)
         info  = _shellcode_info(pe, entry, skip_imports=args.no_imports)
         _print_info(info, args.input_file.name)
         return
 
-    shellcode = _make_shellcode(pe, args.ignore_imports, args.no_imports, override_ep_rva)
+    shellcode = _make_shellcode(pe, args.ignore_imports, args.no_imports, override_ep_rva,
+                                platform=args.platform)
     if args.output_file == '-':
         sys.stdout.buffer.write(shellcode)
     else:

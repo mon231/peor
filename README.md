@@ -46,6 +46,8 @@ python -m peor -i input.exe -o -                     # write shellcode to stdout
 python -m peor -i input.exe --info                   # show resolver sizes (dry-run)
 python -m peor -i input.exe --entry MyExport -o out.bin  # call a named export instead of OEP
 python -m peor -i input.exe --no-imports -o out.bin  # skip all import resolvers
+python -m peor -i linux.exe --platform linux -o shell.bin  # force Linux import chain
+python -m peor -i app.efi -o shell.bin               # EFI application (auto-detected)
 ```
 
 | Flag | Meaning |
@@ -56,15 +58,19 @@ python -m peor -i input.exe --no-imports -o out.bin  # skip all import resolvers
 | `--no-imports` | Skip all import resolvers even if the PE has imports |
 | `-e / --entry NAME` | Call export `NAME` (by name or ordinal) instead of the PE's OEP |
 | `--info` | Print resolver component sizes without writing output |
+| `--platform PLATFORM` | Override platform detection: `windows` (default), `linux`, or `efi` |
 
-Import resolution is **automatic**: if the PE has an import directory (`DataDir[1]`)
-or a delay-load directory (`DataDir[13]`), the matching resolver is prepended
-automatically.  Use `--no-imports` to opt out.
+Platform and import chain selection is **automatic**:
+- Windows PEs (subsystems 2–3) use the PEB-walk import resolver.
+- POSIX\_CUI PEs (subsystem 7) use the Linux `dlopen`/`dlsym` resolver.
+- EFI application PEs (subsystems 10–13) use the EFI entry dispatcher (no import resolver).
 
-The shellcode is then executed by any loader that allocates executable memory,
-copies the binary in, and calls it (e.g. `VirtualAlloc` + `memcpy` + `call`).
-A minimal reference loader is included in `tests/test_loader/` (Windows) and
-`tests/test_loader_linux/` (Linux, for importless MinGW PEs).
+Use `--platform` to override detection; use `--no-imports` to skip import resolvers entirely.
+
+The shellcode is executed by any loader that allocates executable memory, copies the binary
+in, and calls it (e.g. `VirtualAlloc` + `memcpy` + `call`).
+Reference loaders are in `tests/test_loader/` (Windows) and `tests/test_loader_linux/`
+(Linux; passes `dlopen`/`dlsym` as the first two arguments for the Linux import chain).
 
 ---
 
@@ -153,6 +159,50 @@ scan `AddressOfNames` for the string, resolve via `AddressOfNameOrdinals` +
 **Step 3 — use `GetProcAddress` to get `LoadLibraryA`**, then walk
 `IMAGE_IMPORT_DESCRIPTOR`; for each DLL: call `LoadLibraryA`, then call
 `GetProcAddress` for each thunk.
+
+---
+
+### Linux User-Mode Import Resolution
+
+When the PE subsystem is POSIX\_CUI (7) or `--platform linux` is specified and
+the PE has an import directory, `imports_resolver64_linux.asm` is used instead
+of the PEB-walk resolver.
+
+The loader must call the shellcode with `dlopen` and `dlsym` as the first two
+arguments (System V AMD64 ABI: **RDI** = `dlopen`, **RSI** = `dlsym`).  The
+reference Linux loader does this:
+
+```c
+int result = ((int (*)(void *, void *))mem)(dlopen, dlsym);
+```
+
+The resolver then:
+1. Saves RDI/RSI into callee-saved registers (R12 = dlopen, R13 = dlsym).
+2. Walks `IMAGE_IMPORT_DESCRIPTOR` entries from `DataDir[1]`.
+3. For each descriptor: calls `dlopen(dll_name, RTLD_LAZY)` → library handle.
+4. For each INT thunk: calls `dlsym(handle, function_name)` and patches the
+   IAT slot.  Ordinal-only imports are patched to NULL (dlsym does not support
+   ordinal resolution).
+
+All calls use the System V AMD64 ABI (RDI/RSI/RDX for arguments).
+
+---
+
+### EFI Entry Dispatcher
+
+When the PE subsystem is an EFI application (10–13), `entrypoint_resolver_efi64.asm`
+is used in place of the standard Windows entry dispatcher.  No import resolver is
+inserted (EFI applications are expected to be importless; their runtime services are
+passed via the `EFI_SYSTEM_TABLE *` argument).
+
+The dispatcher:
+1. Reads `AddressOfEntryPoint` from the optional header.
+2. Calls `efi_main(NULL, NULL)` using the Microsoft ABI (RCX = ImageHandle = NULL,
+   RDX = SystemTable = NULL).
+3. Returns the `EFI_STATUS` result to the caller.
+
+To use real firmware services, pass the actual `ImageHandle` and `SystemTable`
+pointers from the EFI environment before calling the shellcode.
 
 ---
 
@@ -337,9 +387,15 @@ pytest tests/pytest -v
 | — | `custom_entry` | x64 | `--entry DllMain` calls a named export instead of OEP | 42 |
 | — | `mingw_simple_calc` | x64 | MinGW cross-compiled importless EXE; uses WSL on Windows, native compiler on Linux CI; Linux loader prints full int to stdout | stdout=4950 |
 | — | `clangcl_simple_calc` | x64 | clang-cl `/MT` compiled EXE with static CRT; Windows-only (skipped if `clang-cl` absent) | 4950 |
+| — | `01_linux_write` | x64 | Linux-platform PE (subsystem 7) importing `write` from `libc.so.6`; Linux loader passes `dlopen`/`dlsym` as RDI/RSI; asserts "PEOR\n" in stdout | stdout=PEOR |
+| — | `01_efi_hello` | x64 | EFI application PE (subsystem 10); peor converts it; EFI loader compiled with embedded shellcode boots under QEMU+OVMF and calls `ResetSystem(Shutdown)` | QEMU exit 0 |
 
 Test 03 requires an interactive desktop and is automatically skipped when the
 `CI` environment variable is set.
+
+Tests `01_linux_write` and `01_efi_hello` require a Linux runner with
+`gcc-mingw-w64-x86-64`, `binutils-mingw-w64-x86-64`, `gcc`, and (for EFI)
+`qemu-system-x86`/`ovmf`.  They are automatically skipped on Windows.
 
 ---
 
@@ -357,22 +413,36 @@ Binaries land in `tests/Win_x86/` and `tests/Win_x64/`.  Post-build steps
 automatically run `python -m peor` on each output to produce the corresponding
 `.shellcode` files alongside the PE.
 
-For the MinGW cross-platform test (Linux/Ubuntu):
+For the MinGW cross-platform and Linux import tests (Linux/Ubuntu):
 
 ```bash
-sudo apt-get install -y gcc-mingw-w64-x86-64 gcc
+sudo apt-get install -y gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 gcc
 
 # Build the Linux test loader.  The -ffixed-* flags tell GCC not to use
 # callee-saved registers that the shellcode chain clobbers (RBX = PE base, etc.).
+# -ldl: required for dlopen/dlsym used by the Linux import chain.
 gcc -O2 -ffixed-rbx -ffixed-r12 -ffixed-r13 -ffixed-r14 -ffixed-r15 \
     -o tests/test_loader_linux/test_loader_linux \
-    tests/test_loader_linux/main.c
+    tests/test_loader_linux/main.c -ldl
 
-pytest tests/pytest -v -k test_mingw_simple_calc
+pytest tests/pytest -v -k "test_mingw_simple_calc or test_01_linux_write"
 ```
 
-On Windows with WSL, the test automatically uses `wsl bash -c "..."` for compilation
-and the native Windows `test_loader.exe` for execution (no Linux loader needed).
+For the EFI QEMU test (Linux/Ubuntu):
+
+```bash
+sudo apt-get install -y gcc-mingw-w64-x86-64 qemu-system-x86 ovmf
+
+pytest tests/pytest -v -k test_01_efi_hello
+```
+
+The EFI test builds a minimal UEFI application PE, converts it with peor, embeds
+the shellcode in an EFI loader PE, and boots it under QEMU+OVMF.  The loader calls
+`ResetSystem(EfiResetShutdown)` on success — QEMU exits 0.  QEMU's `vvfat` driver
+presents the EFI/BOOT directory as a virtual FAT disk (no `mtools` needed).
+
+On Windows with WSL, the MinGW test automatically uses `wsl bash -c "..."` for
+compilation and the native Windows `test_loader.exe` for execution.
 
 ---
 
@@ -382,8 +452,9 @@ and the native Windows `test_loader.exe` for execution (no Linux loader needed).
 |---|---|---|
 | Windows GUI/console EXE | ✅ | ✅ |
 | Windows DLL | ✅ | ✅ |
-| EFI application | ❌ (planned) | ❌ (planned) |
-| Windows kernel driver | ❌ (planned) | ❌ (planned) |
+| Linux user-mode EXE (POSIX\_CUI, subsystem 7) | ❌ | ✅ |
+| EFI application (subsystems 10–13) | ❌ | ✅ |
+| Windows kernel driver | ❌ | ❌ |
 
-EFI and kernel-mode support are on the roadmap.  Attempting to convert them
-raises `ValueError` with a descriptive message.
+Linux and EFI shellcodes are x64-only.  Attempting to convert unsupported
+combinations raises `ValueError` with a descriptive message.

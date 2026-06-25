@@ -6,6 +6,7 @@
  * Used for testing PE-to-shellcode output on Linux (e.g. MinGW cross-compiled PEs
  * without Windows API imports).
  */
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -70,7 +71,10 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    int result = ((int (*)(void))mem)();
+    /* Pass dlopen and dlsym as the first two arguments (System V AMD64 ABI: RDI, RSI).
+       The Linux import resolver reads them from these registers on entry.
+       PEs without Linux imports (e.g. test_mingw_simple_calc) ignore these args. */
+    int result = ((int (*)(void *, void *))mem)(dlopen, dlsym);
 
     munmap(mem, total);
 

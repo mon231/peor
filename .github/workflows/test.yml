@@ -84,7 +84,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: test-bins-windows
-          path: tests
+          path: .
 
       - name: Add VS-bundled clang-cl to PATH
         shell: pwsh
@@ -123,16 +123,18 @@ jobs:
       - name: Install MinGW cross-compiler and GCC
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y gcc-mingw-w64-x86-64 gcc
+          sudo apt-get install -y gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 gcc
 
       - name: Build Linux test loader
         # -ffixed-rbx/r12-r15: shellcode chain clobbers these callee-saved regs;
         # telling GCC not to use them prevents a crash after the shellcode returns.
+        # -ldl: dlopen/dlsym (needed for the Linux import resolver)
         run: >
           gcc -O2
           -ffixed-rbx -ffixed-r12 -ffixed-r13 -ffixed-r14 -ffixed-r15
           -o tests/test_loader_linux/test_loader_linux
           tests/test_loader_linux/main.c
+          -ldl
 
       - name: Install Python dependencies
         run: |
@@ -140,5 +142,39 @@ jobs:
           pip install -e .
           pip install pytest
 
-      - name: Run MinGW shellcode test
-        run: pytest tests/pytest -v -k test_mingw_simple_calc
+      - name: Run MinGW and Linux import tests
+        run: pytest tests/pytest -v -k "test_mingw_simple_calc or test_01_linux_write"
+
+  test-efi-qemu:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Cache apt packages
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/apt/archives
+          key: apt-efi-${{ runner.os }}-${{ hashFiles('.github/workflows/test.yml') }}
+          restore-keys: apt-efi-${{ runner.os }}-
+
+      - name: Install MinGW, QEMU, and OVMF
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 \
+            qemu-system-x86 ovmf
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pytest
+
+      - name: Run EFI shellcode test
+        run: pytest tests/pytest -v -k test_01_efi_hello

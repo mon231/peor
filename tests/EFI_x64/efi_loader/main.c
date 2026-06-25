@@ -16,6 +16,7 @@
  *     -o efi_loader.efi main.c
  */
 
+#include <stddef.h>
 #include "shellcode_data.h"   /* defines: static const unsigned char SHELLCODE_BYTES[]; */
 
 typedef unsigned char  UINT8;
@@ -39,9 +40,9 @@ static const UINT16 FAIL_MSG[] = {'P','E','O','R','_','E','F','I','_','F','A','I
 EFI_STATUS efi_loader_main(void *image_handle, void *system_table) {
     (void)image_handle;
 
-    /* Call the shellcode with NULL ImageHandle and NULL SystemTable. */
-    EFI_STATUS result =
-        ((EFI_STATUS (*)(void *, void *))SHELLCODE_BYTES)(NULL, NULL);
+    /* The EFI shellcode is self-contained: it scans memory for EFI_SYSTEM_TABLE_SIGNATURE
+       by itself.  No parameters are passed from the loader. */
+    EFI_STATUS result = ((EFI_STATUS (*)(void))SHELLCODE_BYTES)();
 
     /* Print result via ConOut->OutputString. */
     void **conout_slot = (void **)((UINT8 *)system_table

@@ -6,10 +6,10 @@ from pefile import PE, OPTIONAL_HEADER_MAGIC_PE, OPTIONAL_HEADER_MAGIC_PE_PLUS
 from peor._shellcodes import (
     RELOCS_32, RELOCS_64,
     IMPORTS_32_UM, IMPORTS_64_UM,
-    IMPORTS_64_LINUX,
+    IMPORTS_64_LINUX, IMPORTS_32_LINUX,
     DELAY_IMPORTS_32_UM, DELAY_IMPORTS_64_UM,
     ENTRYPOINT_32, ENTRYPOINT_64,
-    ENTRYPOINT_EFI64,
+    ENTRYPOINT_EFI64, ENTRYPOINT_EFI32,
     SEH_REGISTRAR_32, SEH_REGISTRAR_64,
     TLS_CALLBACKS_32, TLS_CALLBACKS_64,
     CXX_EH_FIXER_64,
@@ -55,8 +55,12 @@ _POSIX_CUI_SUBSYSTEM    = 7   # POSIX CUI — auto-selects Linux shellcode chain
 _EFI_SUBSYSTEMS = frozenset({10, 11, 12, 13})   # EFI_APPLICATION / BOOT_SERVICE / RUNTIME / ROM
 
 # Platform keys used to select a shellcode chain in _SHELLCODES.
-_PLATFORM_LINUX = 'linux'
-_PLATFORM_EFI   = 'efi'
+# User-facing platform names (_PLATFORM_LINUX / _PLATFORM_EFI) select the
+# architecture-specific variant based on pe.PE_TYPE at validation time.
+_PLATFORM_LINUX    = 'linux'
+_PLATFORM_EFI      = 'efi'
+_PLATFORM_LINUX_32 = 'linux32'   # internal key for x86 Linux chain
+_PLATFORM_EFI_32   = 'efi32'     # internal key for x86 EFI chain
 
 # Per-architecture shellcode table.
 # dir_array_offset: bytes from the optional-header start to the DataDirectory array
@@ -96,8 +100,8 @@ _SHELLCODES = {
         'disp32_off':        9,
         'ep_rva_magic':      _EP_RVA_MAGIC,
     },
-    # Linux x64 user-mode: dlopen/dlsym import resolver, no Windows-specific SEH/CXX.
-    # Selected when Subsystem == _POSIX_CUI_SUBSYSTEM (7) or --platform linux.
+    # Linux x64 user-mode: self-contained dlsym/dlopen finder via /proc/self/maps.
+    # Selected when Subsystem == _POSIX_CUI_SUBSYSTEM (7) and PE_TYPE == PE32+, or --platform linux.
     _PLATFORM_LINUX: {
         'relocs':            RELOCS_64,
         'imports':           IMPORTS_64_LINUX,
@@ -111,8 +115,23 @@ _SHELLCODES = {
         'disp32_off':        9,
         'ep_rva_magic':      _EP_RVA_MAGIC,
     },
-    # EFI x64 application: no imports resolver, EFI-specific entrypoint (NULL args).
-    # Selected when Subsystem in _EFI_SUBSYSTEMS or --platform efi.
+    # Linux x86 user-mode: self-contained dlsym/dlopen finder via /proc/self/maps (int 0x80, ELF32).
+    # Selected when Subsystem == _POSIX_CUI_SUBSYSTEM (7) and PE_TYPE == PE32, or --platform linux.
+    _PLATFORM_LINUX_32: {
+        'relocs':            RELOCS_32,
+        'imports':           IMPORTS_32_LINUX,
+        'delay_imports':     b'',
+        'entrypoint':        ENTRYPOINT_32,
+        'seh':               b'',
+        'seh_always':        False,
+        'tls':               b'',
+        'tail':              _IMPORTS_TAIL_32,
+        'dir_array_offset':  96,
+        'disp32_off':        8,
+        'ep_rva_magic':      _EP_RVA_MAGIC,
+    },
+    # EFI x64: self-contained — entrypoint resolver scans memory for EFI_SYSTEM_TABLE_SIGNATURE.
+    # Selected when Subsystem in _EFI_SUBSYSTEMS and PE_TYPE == PE32+, or --platform efi.
     _PLATFORM_EFI: {
         'relocs':            RELOCS_64,
         'imports':           b'',
@@ -124,6 +143,21 @@ _SHELLCODES = {
         'tail':              _IMPORTS_TAIL_64,
         'dir_array_offset':  112,
         'disp32_off':        9,
+        'ep_rva_magic':      _EP_RVA_MAGIC,
+    },
+    # EFI x86: self-contained — entrypoint resolver scans memory for EFI_SYSTEM_TABLE_SIGNATURE.
+    # Selected when Subsystem in _EFI_SUBSYSTEMS and PE_TYPE == PE32, or --platform efi.
+    _PLATFORM_EFI_32: {
+        'relocs':            RELOCS_32,
+        'imports':           b'',
+        'delay_imports':     b'',
+        'entrypoint':        ENTRYPOINT_EFI32,
+        'seh':               b'',
+        'seh_always':        False,
+        'tls':               b'',
+        'tail':              _IMPORTS_TAIL_32,
+        'dir_array_offset':  96,
+        'disp32_off':        8,
         'ep_rva_magic':      _EP_RVA_MAGIC,
     },
 }
@@ -222,24 +256,24 @@ def _validate_pe(pe: PE, platform: str | None = None) -> dict:
 
     # Explicit --platform overrides subsystem-based detection.
     if platform == _PLATFORM_LINUX:
-        if pe.PE_TYPE != OPTIONAL_HEADER_MAGIC_PE_PLUS:
-            raise ValueError("--platform linux requires a 64-bit (PE32+) input PE")
+        if pe.PE_TYPE == OPTIONAL_HEADER_MAGIC_PE:
+            return _SHELLCODES[_PLATFORM_LINUX_32]
         return _SHELLCODES[_PLATFORM_LINUX]
 
     if platform == _PLATFORM_EFI:
-        if pe.PE_TYPE != OPTIONAL_HEADER_MAGIC_PE_PLUS:
-            raise ValueError("--platform efi requires a 64-bit (PE32+) input PE")
+        if pe.PE_TYPE == OPTIONAL_HEADER_MAGIC_PE:
+            return _SHELLCODES[_PLATFORM_EFI_32]
         return _SHELLCODES[_PLATFORM_EFI]
 
     # Auto-detect EFI or Linux from subsystem.
     if subsystem in _EFI_SUBSYSTEMS:
-        if pe.PE_TYPE != OPTIONAL_HEADER_MAGIC_PE_PLUS:
-            raise ValueError(f"EFI PE (subsystem {subsystem}) must be 64-bit (PE32+)")
+        if pe.PE_TYPE == OPTIONAL_HEADER_MAGIC_PE:
+            return _SHELLCODES[_PLATFORM_EFI_32]
         return _SHELLCODES[_PLATFORM_EFI]
 
     if subsystem == _POSIX_CUI_SUBSYSTEM:
-        if pe.PE_TYPE != OPTIONAL_HEADER_MAGIC_PE_PLUS:
-            raise ValueError(f"POSIX PE (subsystem {subsystem}) must be 64-bit (PE32+)")
+        if pe.PE_TYPE == OPTIONAL_HEADER_MAGIC_PE:
+            return _SHELLCODES[_PLATFORM_LINUX_32]
         return _SHELLCODES[_PLATFORM_LINUX]
 
     entry = _SHELLCODES.get(pe.PE_TYPE)

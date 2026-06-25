@@ -80,23 +80,27 @@ def _assemble_shellcodes():
     i32      = assemble(ASM_DIR / 'imports_resolver32.asm',           keystone.KS_ARCH_X86, keystone.KS_MODE_32)
     i64      = assemble(ASM_DIR / 'imports_resolver64.asm',           keystone.KS_ARCH_X86, keystone.KS_MODE_64)
     i64_linux = assemble(ASM_DIR / 'imports_resolver64_linux.asm',    keystone.KS_ARCH_X86, keystone.KS_MODE_64)
+    i32_linux = assemble(ASM_DIR / 'imports_resolver32_linux.asm',    keystone.KS_ARCH_X86, keystone.KS_MODE_32)
     dl32     = assemble(ASM_DIR / 'imports_resolver32_delayload.asm', keystone.KS_ARCH_X86, keystone.KS_MODE_32)
     dl64     = assemble(ASM_DIR / 'imports_resolver64_delayload.asm', keystone.KS_ARCH_X86, keystone.KS_MODE_64)
 
     e32_raw  = assemble(ASM_DIR / 'entrypoint_resolver32.asm',        keystone.KS_ARCH_X86, keystone.KS_MODE_32)
     e64_raw  = assemble(ASM_DIR / 'entrypoint_resolver64.asm',        keystone.KS_ARCH_X86, keystone.KS_MODE_64)
     e_efi64_raw = assemble(ASM_DIR / 'entrypoint_resolver_efi64.asm', keystone.KS_ARCH_X86, keystone.KS_MODE_64)
+    e_efi32_raw = assemble(ASM_DIR / 'entrypoint_resolver_efi32.asm', keystone.KS_ARCH_X86, keystone.KS_MODE_32)
     # Verify EP_RVA_MAGIC appears exactly once in each entrypoint resolver (peor patches it at conversion time)
     for ep_name, ep_raw in [
         ('entrypoint_resolver32.asm',     e32_raw),
         ('entrypoint_resolver64.asm',     e64_raw),
         ('entrypoint_resolver_efi64.asm', e_efi64_raw),
+        ('entrypoint_resolver_efi32.asm', e_efi32_raw),
     ]:
         if bytes(ep_raw).count(_EP_RVA_PLACEHOLDER) != 1:
             raise RuntimeError(f"Expected exactly one EP_RVA_MAGIC 0xCECECECE in {ep_name}")
-    e32    = e32_raw
-    e64    = e64_raw
+    e32     = e32_raw
+    e64     = e64_raw
     e_efi64 = e_efi64_raw
+    e_efi32 = e_efi32_raw
 
     s64  = assemble(ASM_DIR / 'seh_registrar64.asm',         keystone.KS_ARCH_X86, keystone.KS_MODE_64)
     s32  = assemble(ASM_DIR / 'seh_registrar32.asm',         keystone.KS_ARCH_X86, keystone.KS_MODE_32)
@@ -138,11 +142,13 @@ def _assemble_shellcodes():
         f"IMPORTS_32_UM          = bytes.fromhex('{i32.hex()}')\n"
         f"IMPORTS_64_UM          = bytes.fromhex('{i64.hex()}')\n"
         f"IMPORTS_64_LINUX       = bytes.fromhex('{i64_linux.hex()}')\n"
+        f"IMPORTS_32_LINUX       = bytes.fromhex('{i32_linux.hex()}')\n"
         f"DELAY_IMPORTS_32_UM    = bytes.fromhex('{dl32.hex()}')\n"
         f"DELAY_IMPORTS_64_UM    = bytes.fromhex('{dl64.hex()}')\n"
         f"ENTRYPOINT_32          = bytes.fromhex('{e32.hex()}')\n"
         f"ENTRYPOINT_64          = bytes.fromhex('{e64.hex()}')\n"
         f"ENTRYPOINT_EFI64       = bytes.fromhex('{e_efi64.hex()}')\n"
+        f"ENTRYPOINT_EFI32       = bytes.fromhex('{e_efi32.hex()}')\n"
         f"SEH_REGISTRAR_32       = bytes.fromhex('{s32.hex()}')\n"
         f"SEH_REGISTRAR_64       = bytes.fromhex('{s64.hex()}')\n"
         f"TLS_CALLBACKS_32       = bytes.fromhex('{t32.hex()}')\n"

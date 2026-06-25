@@ -165,44 +165,58 @@ scan `AddressOfNames` for the string, resolve via `AddressOfNameOrdinals` +
 ### Linux User-Mode Import Resolution
 
 When the PE subsystem is POSIX\_CUI (7) or `--platform linux` is specified and
-the PE has an import directory, `imports_resolver64_linux.asm` is used instead
-of the PEB-walk resolver.
+the PE has an import directory, the Linux import resolver
+(`imports_resolver32/64_linux.asm`) is used instead of the PEB-walk resolver.
 
-The loader must call the shellcode with `dlopen` and `dlsym` as the first two
-arguments (System V AMD64 ABI: **RDI** = `dlopen`, **RSI** = `dlsym`).  The
-reference Linux loader does this:
+The shellcode is **fully self-contained** — the caller passes no arguments.
+The reference Linux loader invokes it with zero arguments:
 
 ```c
-int result = ((int (*)(void *, void *))mem)(dlopen, dlsym);
+int result = ((int (*)(void))mem)();
 ```
 
-The resolver then:
-1. Saves RDI/RSI into callee-saved registers (R12 = dlopen, R13 = dlsym).
-2. Walks `IMAGE_IMPORT_DESCRIPTOR` entries from `DataDir[1]`.
-3. For each descriptor: calls `dlopen(dll_name, RTLD_LAZY)` → library handle.
-4. For each INT thunk: calls `dlsym(handle, function_name)` and patches the
-   IAT slot.  Ordinal-only imports are patched to NULL (dlsym does not support
-   ordinal resolution).
+At runtime the resolver:
+1. Opens `/proc/self/maps` via a raw syscall (no libc).
+2. Scans the output for the `libc.so` mapping to find libc's base address.
+3. Parses the ELF header (x64: ELF64; x86: ELF32): walks program headers for
+   `PT_DYNAMIC`, then scans `DT_HASH`/`DT_SYMTAB`/`DT_STRTAB` to find
+   `dlsym` and `dlopen` by symbol-table scan.
+4. Walks `IMAGE_IMPORT_DESCRIPTOR` entries from `DataDir[1]`; for each DLL
+   calls `dlopen(dll_name, RTLD_LAZY)`, then for each thunk calls
+   `dlsym(handle, name)` and patches the IAT slot.
 
-All calls use the System V AMD64 ABI (RDI/RSI/RDX for arguments).
+String literals (`/proc/self/maps`, `dlsym`, `dlopen`, `libc.so`) are embedded
+via the call-over-data trick (no absolute addresses).  All calls use the
+System V ABI (x64: RDI/RSI/RDX; x86: stack cdecl).
 
 ---
 
 ### EFI Entry Dispatcher
 
-When the PE subsystem is an EFI application (10–13), `entrypoint_resolver_efi64.asm`
-is used in place of the standard Windows entry dispatcher.  No import resolver is
-inserted (EFI applications are expected to be importless; their runtime services are
-passed via the `EFI_SYSTEM_TABLE *` argument).
+When the PE subsystem is an EFI application (10–13), the EFI entry dispatcher
+(`entrypoint_resolver_efi32/64.asm`) is used instead of the standard Windows
+entry dispatcher.  No import resolver is inserted (EFI applications are
+expected to be importless).
 
-The dispatcher:
-1. Reads `AddressOfEntryPoint` from the optional header.
-2. Calls `efi_main(NULL, NULL)` using the Microsoft ABI (RCX = ImageHandle = NULL,
-   RDX = SystemTable = NULL).
-3. Returns the `EFI_STATUS` result to the caller.
+The shellcode is **fully self-contained** — no runtime parameters are expected
+from the caller.  The reference EFI loader passes `(NULL, NULL)`:
 
-To use real firmware services, pass the actual `ImageHandle` and `SystemTable`
-pointers from the EFI environment before calling the shellcode.
+```c
+EFI_STATUS result = ((EFI_STATUS (*)(void *, void *))SHELLCODE_BYTES)(NULL, NULL);
+```
+
+At runtime the dispatcher:
+1. Scans page-aligned memory from `0x10000` upward looking for
+   `EFI_SYSTEM_TABLE_SIGNATURE` (`0x5453595320494249`), checking that
+   `Revision >= 2.0` and `HeaderSize >= 0x78`.
+2. Once found, calls `efi_main(NULL, SystemTable)`:
+   - x64: Microsoft ABI (RCX = NULL, RDX = SystemTable).
+   - x86: IA-32 cdecl (push SystemTable, push NULL, call).
+3. Returns the `EFI_STATUS` to the caller.
+
+The scan range is `0x10000–0x200000000` for x64 and `0x10000–0x10000000` for
+x86.  If the signature is not found, `SystemTable = NULL` is passed and
+`efi_main` is still called (it should handle a NULL table gracefully).
 
 ---
 
@@ -387,15 +401,21 @@ pytest tests/pytest -v
 | — | `custom_entry` | x64 | `--entry DllMain` calls a named export instead of OEP | 42 |
 | — | `mingw_simple_calc` | x64 | MinGW cross-compiled importless EXE; uses WSL on Windows, native compiler on Linux CI; Linux loader prints full int to stdout | stdout=4950 |
 | — | `clangcl_simple_calc` | x64 | clang-cl `/MT` compiled EXE with static CRT; Windows-only (skipped if `clang-cl` absent) | 4950 |
-| — | `01_linux_write` | x64 | Linux-platform PE (subsystem 7) importing `write` from `libc.so.6`; Linux loader passes `dlopen`/`dlsym` as RDI/RSI; asserts "PEOR\n" in stdout | stdout=PEOR |
-| — | `01_efi_hello` | x64 | EFI application PE (subsystem 10); peor converts it; EFI loader compiled with embedded shellcode boots under QEMU+OVMF and calls `ResetSystem(Shutdown)` | QEMU exit 0 |
+| — | `01_linux_write` | x64 | Linux-platform PE (subsystem 7) importing `write` from `libc.so.6`; shellcode finds `dlsym`/`dlopen` itself via `/proc/self/maps`; asserts "PEOR\n" in stdout | stdout=PEOR |
+| — | `01_linux_write_x86` | x86 | Same as above but compiled as PE32 with i686-w64-mingw32-gcc; uses x86 Linux chain and 32-bit loader | stdout=PEOR |
+| — | `01_efi_hello` | x64 | Minimal EFI application PE; peor converts it; EFI loader with embedded shellcode boots under QEMU+OVMF; shellcode scans memory for EFI_SYSTEM_TABLE and calls ResetSystem(Shutdown) | QEMU exit 0 |
+| — | `02_efi_print` | x64 | EFI shellcode uses ConOut->OutputString to print "PEOR\_EFI\_HELLO"; checks QEMU stdout | PEOR\_EFI\_HELLO in stdout |
+| — | `03_efi_simple_calc` | x64 | EFI shellcode computes sum(0..99)=4950, prints "PEOR\_4950" via ConOut; checks QEMU stdout | PEOR\_4950 in stdout |
+| — | `test_efi_x86_shellcode_conversion` | x86 | PE32 EFI application compiled with i686-w64-mingw32-gcc; verifies peor produces non-empty shellcode using x86 EFI chain | non-empty bin |
 
 Test 03 requires an interactive desktop and is automatically skipped when the
 `CI` environment variable is set.
 
-Tests `01_linux_write` and `01_efi_hello` require a Linux runner with
-`gcc-mingw-w64-x86-64`, `binutils-mingw-w64-x86-64`, `gcc`, and (for EFI)
-`qemu-system-x86`/`ovmf`.  They are automatically skipped on Windows.
+Tests `01_linux_write`, `01_linux_write_x86`, `01_efi_hello`, `02_efi_print`,
+`03_efi_simple_calc`, and `test_efi_x86_shellcode_conversion` require a Linux
+runner with `gcc-mingw-w64-x86-64`, `gcc-mingw-w64-i686`, `binutils-mingw-w64-*`,
+`gcc`, `gcc-multilib`, and (for EFI QEMU tests) `qemu-system-x86`/`ovmf`.
+They are automatically skipped on Windows.
 
 ---
 
@@ -416,33 +436,45 @@ automatically run `python -m peor` on each output to produce the corresponding
 For the MinGW cross-platform and Linux import tests (Linux/Ubuntu):
 
 ```bash
-sudo apt-get install -y gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 gcc
+sudo apt-get install -y \
+    gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 \
+    gcc-mingw-w64-i686   binutils-mingw-w64-i686 \
+    gcc gcc-multilib
 
-# Build the Linux test loader.  The -ffixed-* flags tell GCC not to use
-# callee-saved registers that the shellcode chain clobbers (RBX = PE base, etc.).
-# -ldl: required for dlopen/dlsym used by the Linux import chain.
+# x64 Linux test loader (-ffixed-* prevents GCC clobbering shellcode regs)
 gcc -O2 -ffixed-rbx -ffixed-r12 -ffixed-r13 -ffixed-r14 -ffixed-r15 \
     -o tests/test_loader_linux/test_loader_linux \
+    tests/test_loader_linux/main.c -ldl
+
+# x86 Linux test loader
+gcc -m32 -O2 -ffixed-ebx -ffixed-esi -ffixed-edi \
+    -o tests/test_loader_linux/test_loader_linux_32 \
     tests/test_loader_linux/main.c -ldl
 
 pytest tests/pytest -v -k "test_mingw_simple_calc or test_01_linux_write"
 ```
 
-For the EFI QEMU test (Linux/Ubuntu):
+For the EFI QEMU tests (Linux/Ubuntu):
 
 ```bash
-sudo apt-get install -y gcc-mingw-w64-x86-64 qemu-system-x86 ovmf
+sudo apt-get install -y \
+    gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 \
+    gcc-mingw-w64-i686   binutils-mingw-w64-i686 \
+    qemu-system-x86 ovmf
 
-pytest tests/pytest -v -k test_01_efi_hello
+pytest tests/pytest -v -k \
+    "test_01_efi_hello or test_02_efi_print or test_03_efi_simple_calc or test_efi_x86_shellcode_conversion"
 ```
 
-The EFI test builds a minimal UEFI application PE, converts it with peor, embeds
-the shellcode in an EFI loader PE, and boots it under QEMU+OVMF.  The loader calls
-`ResetSystem(EfiResetShutdown)` on success — QEMU exits 0.  QEMU's `vvfat` driver
-presents the EFI/BOOT directory as a virtual FAT disk (no `mtools` needed).
+EFI tests build a UEFI application PE, convert it with peor, embed the shellcode
+in an EFI loader PE, and boot it under QEMU+OVMF.  The shellcode scans memory for
+`EFI_SYSTEM_TABLE_SIGNATURE` at runtime — no runtime parameters are passed from
+the loader.  The loader calls `ResetSystem(EfiResetShutdown)` on success — QEMU
+exits 0.  QEMU's `vvfat` driver presents the `EFI/BOOT` directory as a virtual
+FAT disk (no `mtools` needed).
 
-On Windows with WSL, the MinGW test automatically uses `wsl bash -c "..."` for
-compilation and the native Windows `test_loader.exe` for execution.
+On Windows with WSL, MinGW tests automatically use `wsl -- gcc ...` for compilation
+and the native `test_loader.exe` for execution.
 
 ---
 
@@ -452,8 +484,8 @@ compilation and the native Windows `test_loader.exe` for execution.
 |---|---|---|
 | Windows GUI/console EXE | ✅ | ✅ |
 | Windows DLL | ✅ | ✅ |
-| Linux user-mode EXE (POSIX\_CUI, subsystem 7) | ❌ | ✅ |
-| EFI application (subsystems 10–13) | ❌ | ✅ |
+| Linux user-mode EXE (POSIX\_CUI, subsystem 7) | ✅ | ✅ |
+| EFI application (subsystems 10–13) | ✅ | ✅ |
 | Windows kernel driver | ❌ | ❌ |
 
 Linux and EFI shellcodes are x64-only.  Attempting to convert unsupported

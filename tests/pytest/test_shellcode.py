@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import time
 import struct
 import shutil
@@ -10,7 +11,11 @@ from pathlib import Path
 import pytest
 from pefile import PE
 
-from peor.__main__ import dump_memory_layout
+from peor.__main__ import (
+    dump_memory_layout,
+    IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR,
+    IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT,
+)
 
 TESTS_DIR = Path(__file__).parent.parent
 
@@ -37,6 +42,18 @@ def _skip_if_missing(loader_path: Path, pe_path: Path) -> None:
         pytest.skip(f"test_loader.exe not found — build tests/tests.sln first")
     if not pe_path.exists():
         pytest.skip(f"{pe_path.name} not found at {pe_path}")
+
+
+def _shellcodify(pe_path: Path, output_path: Path, *,
+                 resolve_imports: bool = False, ignore_imports: bool = False) -> None:
+    """Shellcodify pe_path to output_path and assert the output is deterministic."""
+    dump_memory_layout(PE(str(pe_path)), output_path,
+                       ignore_imports=ignore_imports, resolve_imports=resolve_imports)
+    det_path = output_path.parent / (output_path.stem + '_det' + output_path.suffix)
+    dump_memory_layout(PE(str(pe_path)), det_path,
+                       ignore_imports=ignore_imports, resolve_imports=resolve_imports)
+    assert output_path.read_bytes() == det_path.read_bytes(), \
+        f"Non-deterministic shellcode output for {pe_path.name}"
 
 
 def _poll_and_dismiss_msgbox(title: str, timeout: float = 10.0) -> dict:
@@ -87,7 +104,7 @@ def test_shellcode_exit_code(arch, test_name, expected, tmp_path):
     _skip_if_missing(loader_path, pe_path)
 
     shellcode_path = tmp_path / f"{test_name}_{arch}.bin"
-    dump_memory_layout(PE(str(pe_path)), shellcode_path)
+    _shellcodify(pe_path, shellcode_path)
 
     result = subprocess.run(
         [str(loader_path), str(shellcode_path)],
@@ -110,7 +127,7 @@ def test_03_winapi_messagebox(arch, tmp_path):
     _skip_if_missing(loader_path, pe_path)
 
     shellcode_path = tmp_path / f"03_winapi_messagebox_{arch}.bin"
-    dump_memory_layout(PE(str(pe_path)), shellcode_path, resolve_imports=True)
+    _shellcodify(pe_path, shellcode_path, resolve_imports=True)
 
     # The loader blocks on MessageBoxA — start it without waiting
     proc = subprocess.Popen([str(loader_path), str(shellcode_path)])
@@ -137,7 +154,7 @@ def test_04_crt_printf_rand(arch, tmp_path):
     _skip_if_missing(loader_path, pe_path)
 
     shellcode_path = tmp_path / f"04_crt_printf_rand_{arch}.bin"
-    dump_memory_layout(PE(str(pe_path)), shellcode_path, resolve_imports=True)
+    _shellcodify(pe_path, shellcode_path, resolve_imports=True)
 
     result = subprocess.run(
         [str(loader_path), str(shellcode_path)],
@@ -165,7 +182,7 @@ def test_05_dll_entry(arch, tmp_path):
     _skip_if_missing(loader_path, pe_path)
 
     shellcode_path = tmp_path / f"05_dll_entry_{arch}.bin"
-    dump_memory_layout(PE(str(pe_path)), shellcode_path, resolve_imports=True)
+    _shellcodify(pe_path, shellcode_path, resolve_imports=True)
 
     result = subprocess.run(
         [str(loader_path), str(shellcode_path)],
@@ -189,7 +206,7 @@ def test_06_stripped_relocs(arch, tmp_path):
     _skip_if_missing(loader_path, pe_path)
 
     shellcode_path = tmp_path / f"06_stripped_relocs_{arch}.bin"
-    dump_memory_layout(PE(str(pe_path)), shellcode_path)
+    _shellcodify(pe_path, shellcode_path)
 
     result = subprocess.run(
         [str(loader_path), str(shellcode_path)],
@@ -213,7 +230,7 @@ def test_07_cpp_exceptions(arch, tmp_path):
     _skip_if_missing(loader_path, pe_path)
 
     shellcode_path = tmp_path / f"07_cpp_exceptions_{arch}.bin"
-    dump_memory_layout(PE(str(pe_path)), shellcode_path, resolve_imports=True)
+    _shellcodify(pe_path, shellcode_path, resolve_imports=True)
 
     result = subprocess.run(
         [str(loader_path), str(shellcode_path)],
@@ -237,7 +254,7 @@ def test_08_cpp_thread(arch, tmp_path):
     _skip_if_missing(loader_path, pe_path)
 
     shellcode_path = tmp_path / f"08_cpp_thread_{arch}.bin"
-    dump_memory_layout(PE(str(pe_path)), shellcode_path, resolve_imports=True)
+    _shellcodify(pe_path, shellcode_path, resolve_imports=True)
 
     result = subprocess.run(
         [str(loader_path), str(shellcode_path)],
@@ -261,7 +278,7 @@ def test_09_resources(arch, tmp_path):
     _skip_if_missing(loader_path, pe_path)
 
     shellcode_path = tmp_path / f"09_resources_{arch}.bin"
-    dump_memory_layout(PE(str(pe_path)), shellcode_path, resolve_imports=True)
+    _shellcodify(pe_path, shellcode_path, resolve_imports=True)
 
     result = subprocess.run(
         [str(loader_path), str(shellcode_path)],
@@ -319,7 +336,7 @@ def test_certificate_signed_pe(arch, tmp_path):
     assert _sign_pe(pe_path, signed_path), 'failed singing the PE file'
 
     shellcode_path = tmp_path / f"02_relocs_signed_{arch}.bin"
-    dump_memory_layout(PE(str(signed_path)), shellcode_path)
+    _shellcodify(signed_path, shellcode_path)
 
     result = subprocess.run(
         [str(loader_path), str(shellcode_path)],
@@ -343,7 +360,7 @@ def test_10_tls_callbacks(arch, tmp_path):
     _skip_if_missing(loader_path, pe_path)
 
     shellcode_path = tmp_path / f"10_tls_callbacks_{arch}.bin"
-    dump_memory_layout(PE(str(pe_path)), shellcode_path, resolve_imports=True)
+    _shellcodify(pe_path, shellcode_path, resolve_imports=True)
 
     result = subprocess.run(
         [str(loader_path), str(shellcode_path)],
@@ -367,7 +384,7 @@ def test_11_cpp_exceptions(arch, tmp_path):
     _skip_if_missing(loader_path, pe_path)
 
     shellcode_path = tmp_path / f"11_cpp_exceptions_{arch}.bin"
-    dump_memory_layout(PE(str(pe_path)), shellcode_path, resolve_imports=True)
+    _shellcodify(pe_path, shellcode_path, resolve_imports=True)
 
     result = subprocess.run(
         [str(loader_path), str(shellcode_path)],
@@ -393,7 +410,7 @@ def test_12_seh_exceptions(arch, tmp_path):
     _skip_if_missing(loader_path, pe_path)
 
     shellcode_path = tmp_path / f"12_seh_exceptions_{arch}.bin"
-    dump_memory_layout(PE(str(pe_path)), shellcode_path, resolve_imports=True)
+    _shellcodify(pe_path, shellcode_path, resolve_imports=True)
 
     result = subprocess.run(
         [str(loader_path), str(shellcode_path)],
@@ -405,6 +422,161 @@ def test_12_seh_exceptions(arch, tmp_path):
         f"[{arch}] expected exit code 123 (typed catch fired), got {result.returncode}\n"
         f"  456 = catch(...) fired (type matching broken — cxx_eh_fixer not working with /EHa)\n"
         f"  789 = no exception caught at all\n"
+        f"stdout: {result.stdout.decode(errors='replace')}\n"
+        f"stderr: {result.stderr.decode(errors='replace')}"
+    )
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_clr_rejection(arch, tmp_path):
+    """peor must raise ValueError when DataDir[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR] is non-zero."""
+    pe_path = ARCH_DIRS[arch] / "01_simple_calc.exe"
+    if not pe_path.exists():
+        pytest.skip("test binaries not built")
+
+    pe   = PE(str(pe_path))
+    dirs = pe.OPTIONAL_HEADER.DATA_DIRECTORY
+    assert len(dirs) > IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR, \
+        "PE has too few DATA_DIRECTORY entries to set COM_DESCRIPTOR"
+    dirs[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR].VirtualAddress = 0x1000
+
+    with pytest.raises(ValueError, match="CLR"):
+        dump_memory_layout(pe, tmp_path / "clr_rejected.bin")
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_stdout_output(arch, tmp_path):
+    """`peor -o -` must write exactly the same bytes as dump_memory_layout to a file."""
+    pe_path = ARCH_DIRS[arch] / "01_simple_calc.exe"
+    if not pe_path.exists():
+        pytest.skip("test binaries not built")
+
+    file_path = tmp_path / f"01_simple_calc_{arch}.bin"
+    dump_memory_layout(PE(str(pe_path)), file_path)
+
+    result = subprocess.run(
+        [sys.executable, "-m", "peor", "-i", str(pe_path), "-o", "-"],
+        capture_output=True, timeout=30,
+    )
+    assert result.returncode == 0, f"peor -o - exited with {result.returncode}: {result.stderr}"
+    assert result.stdout == file_path.read_bytes(), \
+        f"[{arch}] stdout bytes differ from file bytes"
+
+
+@pytest.mark.parametrize("arch", ["x64"])
+def test_info_mode(arch, tmp_path):
+    """`peor --info` must print cxx_eh and seh rows (x64 + resolve-imports) without writing a file."""
+    pe_path = ARCH_DIRS[arch] / "11_cpp_exceptions.exe"
+    if not pe_path.exists():
+        pytest.skip("test binaries not built")
+
+    result = subprocess.run(
+        [sys.executable, "-m", "peor", "--info", "-r", "-i", str(pe_path)],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, f"peor --info exited with {result.returncode}: {result.stderr}"
+    assert "cxx_eh"   in result.stdout, f"'cxx_eh' not in --info output:\n{result.stdout}"
+    assert "seh"      in result.stdout, f"'seh' not in --info output:\n{result.stdout}"
+    assert "total"    in result.stdout, f"'total' not in --info output:\n{result.stdout}"
+    assert "PE image" in result.stdout, f"'PE image' not in --info output:\n{result.stdout}"
+    assert not list(tmp_path.iterdir()), "--info must not write any output files"
+
+
+# ── P2 tests ──────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_bound_imports(arch, tmp_path):
+    """Shellcode from a PE with a non-zero DataDir[BOUND_IMPORT] must still execute correctly."""
+    pe_path     = ARCH_DIRS[arch] / "04_crt_printf_rand.exe"
+    loader_path = ARCH_DIRS[arch] / "test_loader.exe"
+    _skip_if_missing(loader_path, pe_path)
+
+    # Patch DataDir[IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT] VirtualAddress to non-zero.
+    pe_bytes  = bytearray(pe_path.read_bytes())
+    e_lfanew  = struct.unpack_from('<I', pe_bytes, 0x3C)[0]
+    pe_magic  = struct.unpack_from('<H', pe_bytes, e_lfanew + 24)[0]
+    dir_off   = e_lfanew + 24 + (96 if pe_magic == 0x10B else 112)
+    bound_off = dir_off + IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT * 8
+    struct.pack_into('<II', pe_bytes, bound_off, 0x1000, 0)
+    patched_path = tmp_path / f"04_bound_{arch}.exe"
+    patched_path.write_bytes(bytes(pe_bytes))
+
+    shellcode_path = tmp_path / f"04_bound_{arch}.bin"
+    _shellcodify(patched_path, shellcode_path, resolve_imports=True)
+
+    result = subprocess.run(
+        [str(loader_path), str(shellcode_path)],
+        capture_output=True, timeout=10,
+    )
+    stdout = result.stdout.decode(errors="replace").strip()
+    assert result.returncode == 0, \
+        f"[{arch}] expected exit code 0, got {result.returncode}\nstdout: {stdout}"
+    assert re.fullmatch(r"Random: \d+", stdout), \
+        f"[{arch}] unexpected stdout: {stdout!r}"
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_13_tls_multi_callbacks(arch, tmp_path):
+    """Five ordered TLS callbacks accumulate g = g*10 + i (i=1..5); main returns g == 12345."""
+    win_dir     = ARCH_DIRS[arch]
+    pe_path     = win_dir / "13_tls_multi_callbacks.exe"
+    loader_path = win_dir / "test_loader.exe"
+    _skip_if_missing(loader_path, pe_path)
+
+    shellcode_path = tmp_path / f"13_tls_multi_callbacks_{arch}.bin"
+    _shellcodify(pe_path, shellcode_path, resolve_imports=True)
+
+    result = subprocess.run(
+        [str(loader_path), str(shellcode_path)],
+        capture_output=True, timeout=10,
+    )
+    assert result.returncode == 12345, (
+        f"[{arch}] expected exit code 12345 (callbacks ran in order 1-5), got {result.returncode}\n"
+        f"stdout: {result.stdout.decode(errors='replace')}\n"
+        f"stderr: {result.stderr.decode(errors='replace')}"
+    )
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_14_global_ctors(arch, tmp_path):
+    """File-scope C++ object constructor runs before main; sets g_value=42, main returns it."""
+    win_dir     = ARCH_DIRS[arch]
+    pe_path     = win_dir / "14_global_ctors.exe"
+    loader_path = win_dir / "test_loader.exe"
+    _skip_if_missing(loader_path, pe_path)
+
+    shellcode_path = tmp_path / f"14_global_ctors_{arch}.bin"
+    _shellcodify(pe_path, shellcode_path, resolve_imports=True)
+
+    result = subprocess.run(
+        [str(loader_path), str(shellcode_path)],
+        capture_output=True, timeout=10,
+    )
+    assert result.returncode == 42, (
+        f"[{arch}] expected exit code 42 (global ctor ran), got {result.returncode}\n"
+        f"stdout: {result.stdout.decode(errors='replace')}\n"
+        f"stderr: {result.stderr.decode(errors='replace')}"
+    )
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_15_nested_exceptions(arch, tmp_path):
+    """Nested try/rethrow: inner catch rethrows, outer catch must fire and return 55."""
+    win_dir     = ARCH_DIRS[arch]
+    pe_path     = win_dir / "15_nested_exceptions.exe"
+    loader_path = win_dir / "test_loader.exe"
+    _skip_if_missing(loader_path, pe_path)
+
+    shellcode_path = tmp_path / f"15_nested_exceptions_{arch}.bin"
+    _shellcodify(pe_path, shellcode_path, resolve_imports=True)
+
+    result = subprocess.run(
+        [str(loader_path), str(shellcode_path)],
+        capture_output=True, timeout=30,
+    )
+    assert result.returncode == 55, (
+        f"[{arch}] expected exit code 55 (outer catch fired after rethrow), got {result.returncode}\n"
         f"stdout: {result.stdout.decode(errors='replace')}\n"
         f"stderr: {result.stderr.decode(errors='replace')}"
     )

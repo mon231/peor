@@ -1,3 +1,4 @@
+import sys
 import struct
 import argparse
 from pathlib import Path
@@ -11,30 +12,44 @@ from peor._shellcodes import (
     CXX_EH_FIXER_64,
 )
 
+# PE Optional Header Data Directory indices (PECOFF spec §3.4)
+IMAGE_DIRECTORY_ENTRY_EXPORT         = 0
+IMAGE_DIRECTORY_ENTRY_IMPORT         = 1
+IMAGE_DIRECTORY_ENTRY_RESOURCE       = 2
+IMAGE_DIRECTORY_ENTRY_EXCEPTION      = 3
+IMAGE_DIRECTORY_ENTRY_SECURITY       = 4
+IMAGE_DIRECTORY_ENTRY_BASERELOC      = 5
+IMAGE_DIRECTORY_ENTRY_DEBUG          = 6
+IMAGE_DIRECTORY_ENTRY_TLS            = 9
+IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG    = 10
+IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT   = 11
+IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT   = 13
+IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR = 14
+
 # Trailing bytes that terminate each import resolver so it falls through into the
 # relocs resolver. We strip them at output time.
-#   x86: 0xC3 (RET)         → stripped → falls through to RELOCS_32
+#   x86: 0xC3 (RET)          → stripped → falls through to RELOCS_32
 #   x64: 0xFF 0xE0 (JMP RAX) → stripped → falls through to RELOCS_64
 _IMPORTS_TAIL_32 = b'\xc3'
 _IMPORTS_TAIL_64 = b'\xff\xe0'
 
 # Magic placeholders in cxx_eh_fixer64.asm replaced at build time by peor.
-# PE_SIZE_MAGIC: peor patches to pe.OPTIONAL_HEADER.SizeOfImage.
-# IAT_RVA_MAGIC: peor patches to the IAT-entry RVA for the hooked function.
+# PE_SIZE_MAGIC: patched to pe.OPTIONAL_HEADER.SizeOfImage.
+# IAT_RVA_MAGIC: patched to the IAT-entry RVA for the hooked function.
 _CXX_EH_PE_SIZE_MAGIC_64 = b'\x78\x56\x34\x12'  # 0x12345678 LE (in ADD RCX, imm32)
 _CXX_EH_IAT_RVA_MAGIC_64 = b'\x21\x43\x65\x87'  # 0x87654321 LE (in LEA RDX, [RBX+disp32])
 
 # Windows PE Subsystem values that peor does not yet support.
-_EFI_SUBSYSTEMS = frozenset({10, 11, 12, 13})  # EFI_APPLICATION / BOOT_SERVICE / RUNTIME / ROM
-_NATIVE_SUBSYSTEM = 1                           # Windows native (kernel-mode drivers)
+_EFI_SUBSYSTEMS   = frozenset({10, 11, 12, 13})  # EFI_APPLICATION / BOOT_SERVICE / RUNTIME / ROM
+_NATIVE_SUBSYSTEM = 1                             # Windows native (kernel-mode drivers)
 
 # Per-architecture shellcode table.
 # dir_array_offset: bytes from the optional-header start to the DataDirectory array
 #   PE32  (0x10B): 96  bytes  (PECOFF spec §3.4.1)
 #   PE32+ (0x20B): 112 bytes  (PECOFF spec §3.4.2)
 # disp32_off: byte index of the LEA disp32 field inside the assembled relocs resolver
-#   RELOCS_32: e8..(5) 5b(1) 8d bb <disp32>(4)       → disp32 at byte 8
-#   RELOCS_64: e8..(5) 5b(1) 48 8d bb <disp32>(4)    → disp32 at byte 9
+#   RELOCS_32: e8..(5) 5b(1) 8d bb <disp32>(4)    → disp32 at byte 8
+#   RELOCS_64: e8..(5) 5b(1) 48 8d bb <disp32>(4) → disp32 at byte 9
 _SHELLCODES = {
     OPTIONAL_HEADER_MAGIC_PE: {
         'relocs':           RELOCS_32,
@@ -84,14 +99,15 @@ def _find_iat_rva(pe: PE, func_name: bytes) -> int | None:
 
 def _has_exception_table(pe: PE) -> bool:
     dirs = pe.OPTIONAL_HEADER.DATA_DIRECTORY
-    return len(dirs) > 3 and dirs[3].VirtualAddress != 0
+    return (len(dirs) > IMAGE_DIRECTORY_ENTRY_EXCEPTION
+            and dirs[IMAGE_DIRECTORY_ENTRY_EXCEPTION].VirtualAddress != 0)
 
 
 def _has_tls_callbacks(pe: PE) -> bool:
     dirs = pe.OPTIONAL_HEADER.DATA_DIRECTORY
-    if len(dirs) <= 9 or dirs[9].VirtualAddress == 0:
+    if len(dirs) <= IMAGE_DIRECTORY_ENTRY_TLS or dirs[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress == 0:
         return False
-    tls_rva = dirs[9].VirtualAddress
+    tls_rva = dirs[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress
     # AddressOfCallBacks: offset 0x0C in IMAGE_TLS_DIRECTORY32, 0x18 in IMAGE_TLS_DIRECTORY64
     if pe.PE_TYPE == OPTIONAL_HEADER_MAGIC_PE:
         cb_off, ptr_size = 0x0C, 4
@@ -107,6 +123,10 @@ def _validate_pe(pe: PE) -> dict:
         raise ValueError(f"EFI PE (subsystem {subsystem}) is not yet supported")
     if subsystem == _NATIVE_SUBSYSTEM:
         raise ValueError(f"Kernel-mode PE (subsystem {subsystem}) is not yet supported")
+    dirs = pe.OPTIONAL_HEADER.DATA_DIRECTORY
+    if (len(dirs) > IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR
+            and dirs[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR].VirtualAddress != 0):
+        raise ValueError("CLR/managed PE is not supported")
     entry = _SHELLCODES.get(pe.PE_TYPE)
     if entry is None:
         raise ValueError(f"Unsupported PE type: 0x{pe.PE_TYPE:04X}")
@@ -127,8 +147,8 @@ def _build_ram_layout(pe: PE) -> bytearray:
 
 def _zero_import_dir(ram_layout: bytearray, pe: PE, entry: dict) -> None:
     # Optional header starts at e_lfanew + 4 (PE sig) + 20 (file header) = e_lfanew + 24.
-    opt_off = pe.DOS_HEADER.e_lfanew + 24
-    import_entry_off = opt_off + entry['dir_array_offset'] + 1 * 8  # DataDir[1], 8 bytes each
+    opt_off          = pe.DOS_HEADER.e_lfanew + 24
+    import_entry_off = opt_off + entry['dir_array_offset'] + IMAGE_DIRECTORY_ENTRY_IMPORT * 8
     ram_layout[import_entry_off:import_entry_off + 8] = b'\x00' * 8
 
 
@@ -148,7 +168,7 @@ def _build_shellcode_chain(pe: PE, entry: dict, resolve_imports: bool) -> bytes:
         iat_rva = _find_iat_rva(pe, entry['cxx_eh_import'])
         if iat_rva is not None:
             fixer = bytearray(entry['cxx_eh_fixer'])
-            soi   = pe.OPTIONAL_HEADER.SizeOfImage
+            soi           = pe.OPTIONAL_HEADER.SizeOfImage
             pe_size_magic = entry['cxx_pe_size_magic']
             iat_rva_magic = entry['cxx_iat_rva_magic']
             if fixer.count(pe_size_magic) != 1:
@@ -180,22 +200,73 @@ def _build_shellcode_chain(pe: PE, entry: dict, resolve_imports: bool) -> bytes:
     return imports + bytes(relocs) + cxx_fixer + seh + tls + entrypoint + (b'\x90' * align_pad)
 
 
-def dump_memory_layout(pe: PE, output_file: Path, ignore_imports: bool = False,
-                       resolve_imports: bool = False):
+def _shellcode_info(pe: PE, entry: dict, resolve_imports: bool) -> dict:
+    """Return per-component byte sizes for --info display; no shellcode is assembled."""
+    imports    = _strip_tail(entry['imports'], entry['tail']) if resolve_imports else b''
+    relocs     = entry['relocs']
+    seh        = entry['seh'] if (entry['seh'] and (entry.get('seh_always') or _has_exception_table(pe))) else b''
+    tls        = entry['tls'] if (entry['tls'] and _has_tls_callbacks(pe)) else b''
+    entrypoint = entry['entrypoint']
+
+    if resolve_imports and entry.get('cxx_eh_fixer') and entry.get('cxx_eh_import'):
+        iat_rva   = _find_iat_rva(pe, entry['cxx_eh_import'])
+        cxx_fixer = entry['cxx_eh_fixer'] if iat_rva is not None else b''
+    else:
+        cxx_fixer = b''
+
+    align_pad     = (-len(imports) - len(relocs) - len(cxx_fixer) - len(seh) - len(tls) - len(entrypoint)) % 16
+    pe_image_size = pe.OPTIONAL_HEADER.SizeOfImage
+    total         = (len(imports) + len(relocs) + len(cxx_fixer) + len(seh) + len(tls)
+                     + len(entrypoint) + align_pad + pe_image_size)
+
+    return {
+        'imports':    len(imports)   if imports   else None,
+        'relocs':     len(relocs),
+        'cxx_eh':     len(cxx_fixer) if cxx_fixer else None,
+        'seh':        len(seh)       if seh       else None,
+        'tls':        len(tls)       if tls       else None,
+        'entrypoint': len(entrypoint),
+        'align_pad':  align_pad      if align_pad else None,
+        'PE image':   pe_image_size,
+        'total':      total,
+    }
+
+
+def _print_info(info: dict, pe_name: str) -> None:
+    rows  = [(k, v) for k, v in info.items() if k != 'total']
+    key_w = max(len(k) for k, _ in rows)
+    num_w = max((len(str(v)) for _, v in rows if v is not None), default=1)
+    num_w = max(num_w, len(str(info['total'])))
+    for key, val in rows:
+        if val is not None:
+            print(f"  {key:<{key_w}}  {val:>{num_w}} B")
+        else:
+            print(f"  {key:<{key_w}}  {'—':>{num_w + 2}}")
+    print(f"  {'-' * (key_w + num_w + 4)}")
+    print(f"  {'total':<{key_w}}  {info['total']:>{num_w}} B  ({pe_name})")
+
+
+def _make_shellcode(pe: PE, ignore_imports: bool = False, resolve_imports: bool = False) -> bytes:
     entry      = _validate_pe(pe)
     ram_layout = _build_ram_layout(pe)
     if ignore_imports:
         _zero_import_dir(ram_layout, pe, entry)
     prefix = _build_shellcode_chain(pe, entry, resolve_imports)
-    output_file.write_bytes(prefix + bytes(ram_layout))
+    return prefix + bytes(ram_layout)
+
+
+def dump_memory_layout(pe: PE, output_file: Path, ignore_imports: bool = False,
+                       resolve_imports: bool = False):
+    output_file.write_bytes(_make_shellcode(pe, ignore_imports, resolve_imports))
 
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
-    parser.add_argument('-i', '--input-file',      required=True, type=Path, help='Path to a PE-file')
-    parser.add_argument('-m', '--ignore-imports',  action='store_true',      help='Zero the import directory in the output')
-    parser.add_argument('-r', '--resolve-imports', action='store_true',      help='Prepend import resolver shellcode')
-    parser.add_argument('-o', '--output-file',     required=True, type=Path, help='Path to output shellcode file')
+    parser.add_argument('-i', '--input-file',      required=True,  type=Path, help='Path to a PE-file')
+    parser.add_argument('-m', '--ignore-imports',  action='store_true',       help='Zero the import directory in the output')
+    parser.add_argument('-r', '--resolve-imports', action='store_true',       help='Prepend import resolver shellcode')
+    parser.add_argument('-o', '--output-file',     required=False, type=str,  help='Output path, or "-" for stdout')
+    parser.add_argument(      '--info',            action='store_true',       help='Print resolver sizes without writing output')
     return parser.parse_args()
 
 
@@ -206,8 +277,27 @@ def main():
         print("Error: --ignore-imports and --resolve-imports are mutually exclusive")
         return
 
+    if args.info and args.output_file:
+        print("Error: --info and --output-file are mutually exclusive")
+        return
+
+    if not args.info and not args.output_file:
+        print("Error: --output-file is required (use '-' for stdout, or --info for dry-run)")
+        return
+
     pe = PE(str(args.input_file))
-    dump_memory_layout(pe, args.output_file, args.ignore_imports, args.resolve_imports)
+
+    if args.info:
+        entry = _validate_pe(pe)
+        info  = _shellcode_info(pe, entry, args.resolve_imports)
+        _print_info(info, args.input_file.name)
+        return
+
+    shellcode = _make_shellcode(pe, args.ignore_imports, args.resolve_imports)
+    if args.output_file == '-':
+        sys.stdout.buffer.write(shellcode)
+    else:
+        Path(args.output_file).write_bytes(shellcode)
 
 
 if __name__ == '__main__':

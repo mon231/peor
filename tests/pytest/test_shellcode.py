@@ -5,6 +5,7 @@ import time
 import struct
 import shutil
 import ctypes
+import platform
 import subprocess
 from pathlib import Path
 
@@ -665,44 +666,207 @@ def test_custom_entry(arch, tmp_path):
     )
 
 
-# ── P2-16 ─────────────────────────────────────────────────────────────────────
+def _win_path_to_wsl(p: Path) -> str:
+    """Convert an absolute Windows path to its WSL /mnt/<drive>/... form."""
+    s = str(p).replace("\\", "/")
+    if len(s) >= 2 and s[1] == ":":
+        return f"/mnt/{s[0].lower()}{s[2:]}"
+    return s
+
+
+def _find_mingw_gcc():
+    """Return (cmd_prefix_list, use_wsl) or (None, None) if unavailable.
+
+    Tries the native PATH first; falls back to WSL on Windows.
+    """
+    gcc = "x86_64-w64-mingw32-gcc"
+    if shutil.which(gcc):
+        return [gcc], False
+    if platform.system() == "Windows" and shutil.which("wsl"):
+        r = subprocess.run(["wsl", "--", "which", gcc],
+                           capture_output=True, timeout=10)
+        if r.returncode == 0:
+            return ["wsl", "--", gcc], True
+    return None, None
+
+
+_LINUX_LOADER_CFLAGS = [
+    "-O2",
+    # The shellcode chain sets RBX = PE base and does not restore it, violating the
+    # System V callee-saved convention.  -ffixed-<reg> tells GCC not to use these
+    # registers in the loader itself, so the clobber is harmless.
+    "-ffixed-rbx", "-ffixed-r12", "-ffixed-r13", "-ffixed-r14", "-ffixed-r15",
+]
+
+
+def _ensure_linux_loader(use_wsl: bool) -> "Path | None":
+    """Return path to the pre-built test_loader_linux binary.
+
+    Builds it inside WSL if it does not yet exist and WSL is available.
+    The binary lands in tests/test_loader_linux/ so subsequent runs reuse it.
+    """
+    loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux"
+    if loader.exists():
+        return loader
+    src = TESTS_DIR / "test_loader_linux" / "main.c"
+    if not use_wsl or not shutil.which("wsl"):
+        return None
+    r = subprocess.run(
+        ["wsl", "--", "gcc"] + _LINUX_LOADER_CFLAGS
+        + ["-o", _win_path_to_wsl(loader), _win_path_to_wsl(src)],
+        capture_output=True, timeout=30,
+    )
+    return loader if r.returncode == 0 and loader.exists() else None
+
+
+def _find_clangcl() -> "str | None":
+    """Return path to clang-cl or None if not found.
+
+    Tries PATH first, then common LLVM install locations on Windows.
+    """
+    if shutil.which("clang-cl"):
+        return shutil.which("clang-cl")
+    candidates = [
+        r"C:\Program Files\LLVM\bin\clang-cl.exe",
+        r"C:\Program Files (x86)\LLVM\bin\clang-cl.exe",
+        # VS-bundled LLVM (present on GitHub windows-latest runners)
+        r"C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\Llvm\x64\bin\clang-cl.exe",
+        r"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\Llvm\x64\bin\clang-cl.exe",
+    ]
+    return next((p for p in candidates if Path(p).exists()), None)
+
+
+# ── P2-16 tests ───────────────────────────────────────────────────────────────
+
+_MINGW_CFLAGS = [
+    "-nostdlib", "-nodefaultlibs", "-nostartfiles",
+    "-fno-unwind-tables", "-fno-asynchronous-unwind-tables",
+]
 
 
 @pytest.mark.parametrize("arch", ["x64"])
 def test_mingw_simple_calc(arch, tmp_path):
-    """MinGW cross-compiled importless EXE must shellcodify and return 4950."""
-    import platform
+    """MinGW cross-compiled importless EXE: shellcodify and run via Linux loader.
 
-    compiler = "x86_64-w64-mingw32-gcc"
-    if not shutil.which(compiler):
-        pytest.skip(f"{compiler} not found in PATH")
+    Works on native Linux, on Windows+WSL, and on ubuntu-latest CI.
+    MinGW emits an empty .idata sentinel; peor must skip the imports resolver
+    for such PEs (fixed via _has_imports using pefile's parsed DIRECTORY_ENTRY_IMPORT).
+    The Linux loader prints the full int return value to stdout (bypassing the
+    8-bit Linux exit code limit).
+    """
+    mingw_cmd, use_wsl = _find_mingw_gcc()
+    if mingw_cmd is None:
+        pytest.skip("x86_64-w64-mingw32-gcc not found (native PATH or WSL)")
 
     src = TESTS_DIR / "01_simple_calc" / "main.c"
     if not src.exists():
         pytest.skip(f"source not found: {src}")
 
     exe = tmp_path / "simple_calc_mingw.exe"
-    cc = subprocess.run(
-        [compiler, "-nostdlib", "-nostartfiles", "-e", "main", str(src), "-o", str(exe)],
-        capture_output=True,
+
+    # MinGW's GCC injects a call to __main() (global ctor registration) inside
+    # main(); provide a no-op stub via stdin so we need no extra source file.
+    stub_c = "void __main(void) {}"
+    if use_wsl:
+        src_wsl = _win_path_to_wsl(src)
+        exe_wsl = _win_path_to_wsl(exe)
+        cc = subprocess.run(
+            ["wsl", "--", "bash", "-c",
+             f"echo '{stub_c}' | {mingw_cmd[-1]} "
+             + " ".join(_MINGW_CFLAGS)
+             + f" -x c - {src_wsl} -Wl,-e,main -o {exe_wsl}"],
+            capture_output=True, timeout=30,
+        )
+    else:
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".c", mode="w", delete=False) as f:
+            f.write(stub_c)
+            stub_file = f.name
+        try:
+            cc = subprocess.run(
+                mingw_cmd + _MINGW_CFLAGS
+                + ["-x", "c", stub_file, str(src), "-Wl,-e,main", "-o", str(exe)],
+                capture_output=True, timeout=30,
+            )
+        finally:
+            Path(stub_file).unlink(missing_ok=True)
+
+    assert cc.returncode == 0, (
+        f"MinGW compile failed:\n{cc.stderr.decode(errors='replace')}"
     )
-    assert cc.returncode == 0, f"MinGW compile failed:\n{cc.stderr.decode(errors='replace')}"
 
     sc = tmp_path / "simple_calc_mingw.bin"
     _shellcodify(exe, sc)
 
-    if platform.system() == "Windows":
+    if use_wsl:
+        # MinGW was compiled via WSL but the shellcode lives on the Windows
+        # filesystem; run the Windows test_loader.exe directly (no WSL layer
+        # needed for execution — test_loader.exe is a native Windows PE).
         loader = ARCH_DIRS[arch] / "test_loader.exe"
-        if not loader.exists():
-            pytest.skip(f"test_loader.exe not found — build tests/tests.sln first")
+        _skip_if_missing(loader, sc)
+        result = subprocess.run(
+            [str(loader), str(sc)], capture_output=True, timeout=10,
+        )
+        assert result.returncode == 4950, (
+            f"[MinGW {arch}] expected 4950, got {result.returncode}\n"
+            f"stdout: {result.stdout.decode(errors='replace')}\n"
+            f"stderr: {result.stderr.decode(errors='replace')}"
+        )
     else:
+        # Native Linux or Linux CI: use the Linux test_loader (built with
+        # -ffixed-rbx so GCC doesn't rely on callee-saved regs the shellcode clobbers).
         loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux"
         if not loader.exists():
-            pytest.skip(f"Linux test_loader not found — build tests/test_loader_linux/main.c first")
+            pytest.skip(
+                "Linux test_loader not found — "
+                "build with: gcc -O2 -ffixed-rbx -ffixed-r12 -ffixed-r13 "
+                "-ffixed-r14 -ffixed-r15 -o tests/test_loader_linux/test_loader_linux "
+                "tests/test_loader_linux/main.c"
+            )
+        result = subprocess.run([str(loader), str(sc)], capture_output=True, timeout=10)
+        assert result.returncode == 0, (
+            f"[MinGW {arch}] loader crashed with code {result.returncode}\n"
+            f"stderr: {result.stderr.decode(errors='replace')}"
+        )
+        stdout = result.stdout.decode(errors="replace").strip()
+        assert stdout == "4950", (
+            f"[MinGW {arch}] expected stdout '4950', got {stdout!r}\n"
+            f"stderr: {result.stderr.decode(errors='replace')}"
+        )
+
+
+@pytest.mark.parametrize("arch", ["x64"])
+def test_clangcl_simple_calc(arch, tmp_path):
+    """clang-cl compiled EXE with static CRT must shellcodify and return 4950."""
+    if platform.system() != "Windows":
+        pytest.skip("clang-cl test is Windows-only")
+
+    clangcl = _find_clangcl()
+    if clangcl is None:
+        pytest.skip("clang-cl not found (install LLVM or VS with Clang component)")
+
+    src = TESTS_DIR / "01_simple_calc" / "main.c"
+    if not src.exists():
+        pytest.skip(f"source not found: {src}")
+
+    exe = tmp_path / "simple_calc_clangcl.exe"
+    cc = subprocess.run(
+        [clangcl, "/MT", "/Ox", f"/Fe{exe}", str(src)],
+        capture_output=True, timeout=30,
+    )
+    assert cc.returncode == 0, (
+        f"clang-cl compile failed:\n{cc.stderr.decode(errors='replace')}"
+    )
+
+    loader = ARCH_DIRS[arch] / "test_loader.exe"
+    _skip_if_missing(loader, exe)
+
+    sc = tmp_path / "simple_calc_clangcl.bin"
+    _shellcodify(exe, sc)
 
     result = subprocess.run([str(loader), str(sc)], capture_output=True, timeout=10)
     assert result.returncode == 4950, (
-        f"[MinGW {arch}] expected 4950, got {result.returncode}\n"
+        f"[clang-cl {arch}] expected 4950, got {result.returncode}\n"
         f"stdout: {result.stdout.decode(errors='replace')}\n"
         f"stderr: {result.stderr.decode(errors='replace')}"
     )

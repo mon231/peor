@@ -74,17 +74,17 @@ A minimal reference loader is included in `tests/test_loader/` (Windows) and
 
 ```
 ┌──────────────────────────────────────────────────────┐
-│  shellcode prefix (assembled stubs, position-independent)  │
-│  ┌──────────────────────────────────────────────────┐ │
-│  │  [import resolver]    (auto, if DataDir[1] set)  │ │
-│  │  relocation resolver                             │ │
-│  │  [delay-load resolver](auto, if DataDir[13] set) │ │
-│  │  [C++ EH IAT fixer]   (x64, if needed)           │ │
-│  │  [SEH registrar]      (x86 always, x64 if .pdata)│ │
-│  │  [TLS callback invoker](if TLS directory present) │ │
-│  │  entry point dispatcher                          │ │
-│  └──────────────────────────────────────────────────┘ │
-│  memory-mapped PE image (headers + sections, zero-padded) │
+│  shellcode prefix (PIC asm stubs)                    │
+│ ┌──────────────────────────────────────────────────┐ │
+│ │ [import resolver]    (auto, if DataDir[1] set)   │ │
+│ │ relocation resolver                              │ │
+│ │ [delay-load resolver](auto, if DataDir[13] set)  │ │
+│ │ [C++ EH IAT fixer]   (x64, if needed)            │ │
+│ │ [SEH registrar]      (x86 always, x64 if .pdata) │ │
+│ │ [TLS callback invoker] (ThreadLocalStorage init) │ │
+│ │ entry point dispatcher                           │ │
+│ └──────────────────────────────────────────────────┘ │
+│  memory-mapped PE image (headers + sections, padded) │
 └──────────────────────────────────────────────────────┘
 ```
 
@@ -335,7 +335,8 @@ pytest tests/pytest -v
 | — | `clr_pe_rejection` | — | CLR/managed PE raises `ValueError` | ValueError |
 | — | `disp32_overflow` | — | Relocs resolver disp32 overflow check raises `ValueError` | ValueError |
 | — | `custom_entry` | x64 | `--entry DllMain` calls a named export instead of OEP | 42 |
-| — | `mingw_simple_calc` | x64 | MinGW cross-compiled importless EXE; CI-only (skipped if compiler absent) | 4950 |
+| — | `mingw_simple_calc` | x64 | MinGW cross-compiled importless EXE; uses WSL on Windows, native compiler on Linux CI; Linux loader prints full int to stdout | stdout=4950 |
+| — | `clangcl_simple_calc` | x64 | clang-cl `/MT` compiled EXE with static CRT; Windows-only (skipped if `clang-cl` absent) | 4950 |
 
 Test 03 requires an interactive desktop and is automatically skipped when the
 `CI` environment variable is set.
@@ -360,9 +361,18 @@ For the MinGW cross-platform test (Linux/Ubuntu):
 
 ```bash
 sudo apt-get install -y gcc-mingw-w64-x86-64 gcc
-gcc -O2 -o tests/test_loader_linux/test_loader_linux tests/test_loader_linux/main.c
+
+# Build the Linux test loader.  The -ffixed-* flags tell GCC not to use
+# callee-saved registers that the shellcode chain clobbers (RBX = PE base, etc.).
+gcc -O2 -ffixed-rbx -ffixed-r12 -ffixed-r13 -ffixed-r14 -ffixed-r15 \
+    -o tests/test_loader_linux/test_loader_linux \
+    tests/test_loader_linux/main.c
+
 pytest tests/pytest -v -k test_mingw_simple_calc
 ```
+
+On Windows with WSL, the test automatically uses `wsl bash -c "..."` for compilation
+and the native Windows `test_loader.exe` for execution (no Linux loader needed).
 
 ---
 

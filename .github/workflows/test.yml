@@ -3,11 +3,16 @@ name: Test
 on:
   push:
     branches: ["**"]
-  pull_request:
-    branches: [main]
+
+env:
+  PYTHON_VERSION: "3.11"
 
 jobs:
-  test:
+
+# ─────────────────────────────────────────────────────────────────────────────
+# build-windows: compile all test PEs with MSBuild, upload binaries as artifact
+# ─────────────────────────────────────────────────────────────────────────────
+  build-windows:
     runs-on: windows-latest
 
     steps:
@@ -16,20 +21,8 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-          cache: 'pip'
-
-      - name: Set up MSBuild
-        uses: microsoft/setup-msbuild@v2
-
-      - name: Cache test binaries
-        id: cache-test-binaries
-        uses: actions/cache@v4
-        with:
-          path: |
-            tests/Win_x86
-            tests/Win_x64
-          key: test-binaries-${{ hashFiles('tests/**/*.cpp', 'tests/**/*.c', 'tests/**/*.vcxproj', 'tests/tests.sln') }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
 
       - name: Install Python dependencies
         run: |
@@ -37,15 +30,115 @@ jobs:
           pip install -e .
           pip install pytest pytest-cov
 
-      - name: Build test suite (x86)
-        if: steps.cache-test-binaries.outputs.cache-hit != 'true'
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Cache test binaries
+        id: cache-bins
+        uses: actions/cache@v4
+        with:
+          path: |
+            tests/Win_x86
+            tests/Win_x64
+          key: test-bins-${{ runner.os }}-${{ hashFiles('tests/**/*.cpp', 'tests/**/*.c', 'tests/**/*.vcxproj', 'tests/tests.sln') }}
+
+      - name: Build test suite (Win32)
+        if: steps.cache-bins.outputs.cache-hit != 'true'
         working-directory: tests
-        run: msbuild tests.sln /p:Configuration=Release /p:Platform=Win32 /nologo /verbosity:minimal
+        run: msbuild tests.sln /p:Configuration=Release /p:Platform=Win32 /m /nologo /verbosity:minimal
 
       - name: Build test suite (x64)
-        if: steps.cache-test-binaries.outputs.cache-hit != 'true'
+        if: steps.cache-bins.outputs.cache-hit != 'true'
         working-directory: tests
-        run: msbuild tests.sln /p:Configuration=Release /p:Platform=x64 /nologo /verbosity:minimal
+        run: msbuild tests.sln /p:Configuration=Release /p:Platform=x64 /m /nologo /verbosity:minimal
 
-      - name: Run pytest with coverage
+      - name: Upload test binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-bins-windows
+          path: |
+            tests/Win_x86
+            tests/Win_x64
+          retention-days: 1
+
+  test-windows:
+    runs-on: windows-latest
+    needs: build-windows
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pytest pytest-cov
+
+      - name: Download test binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: test-bins-windows
+          path: tests
+
+      - name: Add VS-bundled clang-cl to PATH
+        shell: pwsh
+        run: |
+          $clangDir = Get-ChildItem "C:\Program Files\Microsoft Visual Studio" -Recurse -Filter "clang-cl.exe" -ErrorAction SilentlyContinue |
+            Select-Object -First 1 -ExpandProperty DirectoryName
+          if ($clangDir) {
+            echo "Found clang-cl at $clangDir"
+            echo $clangDir | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
+          } else {
+            echo "clang-cl not found in VS install; test_clangcl will skip"
+          }
+
+      - name: Run pytest (Windows)
         run: pytest tests/pytest/ -v --cov=peor --cov-report=xml --cov-report=term-missing
+
+  test-linux-mingw:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Cache apt packages
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/apt/archives
+          key: apt-mingw-${{ runner.os }}-${{ hashFiles('.github/workflows/test.yml') }}
+          restore-keys: apt-mingw-${{ runner.os }}-
+
+      - name: Install MinGW cross-compiler and GCC
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y gcc-mingw-w64-x86-64 gcc
+
+      - name: Build Linux test loader
+        # -ffixed-rbx/r12-r15: shellcode chain clobbers these callee-saved regs;
+        # telling GCC not to use them prevents a crash after the shellcode returns.
+        run: >
+          gcc -O2
+          -ffixed-rbx -ffixed-r12 -ffixed-r13 -ffixed-r14 -ffixed-r15
+          -o tests/test_loader_linux/test_loader_linux
+          tests/test_loader_linux/main.c
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pytest
+
+      - name: Run MinGW shellcode test
+        run: pytest tests/pytest -v -k test_mingw_simple_calc

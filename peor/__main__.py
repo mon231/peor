@@ -130,10 +130,17 @@ def _has_tls_callbacks(pe: PE) -> bool:
 
 
 def _has_imports(pe: PE) -> bool:
-    """Return True when DataDir[IMAGE_DIRECTORY_ENTRY_IMPORT] is non-zero."""
+    """Return True only when the PE contains actual import descriptors to resolve.
+
+    A DataDir[1].VirtualAddress != 0 is not sufficient: some toolchains (MinGW,
+    lld) emit a null-sentinel-only .idata section with no real entries.  Use
+    pefile's parsed DIRECTORY_ENTRY_IMPORT list as the authoritative source.
+    """
     dirs = pe.OPTIONAL_HEADER.DATA_DIRECTORY
-    return (len(dirs) > IMAGE_DIRECTORY_ENTRY_IMPORT
-            and dirs[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress != 0)
+    if not (len(dirs) > IMAGE_DIRECTORY_ENTRY_IMPORT
+            and dirs[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress != 0):
+        return False
+    return bool(getattr(pe, 'DIRECTORY_ENTRY_IMPORT', None))
 
 
 def _has_delay_imports(pe: PE) -> bool:

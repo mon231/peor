@@ -11,8 +11,13 @@ from pathlib import Path
 import pytest
 from pefile import PE
 
+from pefile import OPTIONAL_HEADER_MAGIC_PE_PLUS
+
 from peor.__main__ import (
     dump_memory_layout,
+    _build_shellcode_chain,
+    _find_export_rva,
+    _SHELLCODES,
     IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR,
     IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT,
 )
@@ -45,13 +50,16 @@ def _skip_if_missing(loader_path: Path, pe_path: Path) -> None:
 
 
 def _shellcodify(pe_path: Path, output_path: Path, *,
-                 resolve_imports: bool = False, ignore_imports: bool = False) -> None:
+                 ignore_imports: bool = False, no_imports: bool = False,
+                 override_ep_rva: int | None = None) -> None:
     """Shellcodify pe_path to output_path and assert the output is deterministic."""
     dump_memory_layout(PE(str(pe_path)), output_path,
-                       ignore_imports=ignore_imports, resolve_imports=resolve_imports)
+                       ignore_imports=ignore_imports, no_imports=no_imports,
+                       override_ep_rva=override_ep_rva)
     det_path = output_path.parent / (output_path.stem + '_det' + output_path.suffix)
     dump_memory_layout(PE(str(pe_path)), det_path,
-                       ignore_imports=ignore_imports, resolve_imports=resolve_imports)
+                       ignore_imports=ignore_imports, no_imports=no_imports,
+                       override_ep_rva=override_ep_rva)
     assert output_path.read_bytes() == det_path.read_bytes(), \
         f"Non-deterministic shellcode output for {pe_path.name}"
 
@@ -127,7 +135,7 @@ def test_03_winapi_messagebox(arch, tmp_path):
     _skip_if_missing(loader_path, pe_path)
 
     shellcode_path = tmp_path / f"03_winapi_messagebox_{arch}.bin"
-    _shellcodify(pe_path, shellcode_path, resolve_imports=True)
+    _shellcodify(pe_path, shellcode_path)
 
     # The loader blocks on MessageBoxA — start it without waiting
     proc = subprocess.Popen([str(loader_path), str(shellcode_path)])
@@ -154,7 +162,7 @@ def test_04_crt_printf_rand(arch, tmp_path):
     _skip_if_missing(loader_path, pe_path)
 
     shellcode_path = tmp_path / f"04_crt_printf_rand_{arch}.bin"
-    _shellcodify(pe_path, shellcode_path, resolve_imports=True)
+    _shellcodify(pe_path, shellcode_path)
 
     result = subprocess.run(
         [str(loader_path), str(shellcode_path)],
@@ -182,7 +190,7 @@ def test_05_dll_entry(arch, tmp_path):
     _skip_if_missing(loader_path, pe_path)
 
     shellcode_path = tmp_path / f"05_dll_entry_{arch}.bin"
-    _shellcodify(pe_path, shellcode_path, resolve_imports=True)
+    _shellcodify(pe_path, shellcode_path)
 
     result = subprocess.run(
         [str(loader_path), str(shellcode_path)],
@@ -230,7 +238,7 @@ def test_07_cpp_exceptions(arch, tmp_path):
     _skip_if_missing(loader_path, pe_path)
 
     shellcode_path = tmp_path / f"07_cpp_exceptions_{arch}.bin"
-    _shellcodify(pe_path, shellcode_path, resolve_imports=True)
+    _shellcodify(pe_path, shellcode_path)
 
     result = subprocess.run(
         [str(loader_path), str(shellcode_path)],
@@ -254,7 +262,7 @@ def test_08_cpp_thread(arch, tmp_path):
     _skip_if_missing(loader_path, pe_path)
 
     shellcode_path = tmp_path / f"08_cpp_thread_{arch}.bin"
-    _shellcodify(pe_path, shellcode_path, resolve_imports=True)
+    _shellcodify(pe_path, shellcode_path)
 
     result = subprocess.run(
         [str(loader_path), str(shellcode_path)],
@@ -278,7 +286,7 @@ def test_09_resources(arch, tmp_path):
     _skip_if_missing(loader_path, pe_path)
 
     shellcode_path = tmp_path / f"09_resources_{arch}.bin"
-    _shellcodify(pe_path, shellcode_path, resolve_imports=True)
+    _shellcodify(pe_path, shellcode_path)
 
     result = subprocess.run(
         [str(loader_path), str(shellcode_path)],
@@ -360,7 +368,7 @@ def test_10_tls_callbacks(arch, tmp_path):
     _skip_if_missing(loader_path, pe_path)
 
     shellcode_path = tmp_path / f"10_tls_callbacks_{arch}.bin"
-    _shellcodify(pe_path, shellcode_path, resolve_imports=True)
+    _shellcodify(pe_path, shellcode_path)
 
     result = subprocess.run(
         [str(loader_path), str(shellcode_path)],
@@ -384,7 +392,7 @@ def test_11_cpp_exceptions(arch, tmp_path):
     _skip_if_missing(loader_path, pe_path)
 
     shellcode_path = tmp_path / f"11_cpp_exceptions_{arch}.bin"
-    _shellcodify(pe_path, shellcode_path, resolve_imports=True)
+    _shellcodify(pe_path, shellcode_path)
 
     result = subprocess.run(
         [str(loader_path), str(shellcode_path)],
@@ -410,7 +418,7 @@ def test_12_seh_exceptions(arch, tmp_path):
     _skip_if_missing(loader_path, pe_path)
 
     shellcode_path = tmp_path / f"12_seh_exceptions_{arch}.bin"
-    _shellcodify(pe_path, shellcode_path, resolve_imports=True)
+    _shellcodify(pe_path, shellcode_path)
 
     result = subprocess.run(
         [str(loader_path), str(shellcode_path)],
@@ -471,7 +479,7 @@ def test_info_mode(arch, tmp_path):
         pytest.skip("test binaries not built")
 
     result = subprocess.run(
-        [sys.executable, "-m", "peor", "--info", "-r", "-i", str(pe_path)],
+        [sys.executable, "-m", "peor", "--info", "-i", str(pe_path)],
         capture_output=True, text=True, timeout=30,
     )
     assert result.returncode == 0, f"peor --info exited with {result.returncode}: {result.stderr}"
@@ -503,7 +511,7 @@ def test_bound_imports(arch, tmp_path):
     patched_path.write_bytes(bytes(pe_bytes))
 
     shellcode_path = tmp_path / f"04_bound_{arch}.bin"
-    _shellcodify(patched_path, shellcode_path, resolve_imports=True)
+    _shellcodify(patched_path, shellcode_path)
 
     result = subprocess.run(
         [str(loader_path), str(shellcode_path)],
@@ -525,7 +533,7 @@ def test_13_tls_multi_callbacks(arch, tmp_path):
     _skip_if_missing(loader_path, pe_path)
 
     shellcode_path = tmp_path / f"13_tls_multi_callbacks_{arch}.bin"
-    _shellcodify(pe_path, shellcode_path, resolve_imports=True)
+    _shellcodify(pe_path, shellcode_path)
 
     result = subprocess.run(
         [str(loader_path), str(shellcode_path)],
@@ -547,7 +555,7 @@ def test_14_global_ctors(arch, tmp_path):
     _skip_if_missing(loader_path, pe_path)
 
     shellcode_path = tmp_path / f"14_global_ctors_{arch}.bin"
-    _shellcodify(pe_path, shellcode_path, resolve_imports=True)
+    _shellcodify(pe_path, shellcode_path)
 
     result = subprocess.run(
         [str(loader_path), str(shellcode_path)],
@@ -569,7 +577,7 @@ def test_15_nested_exceptions(arch, tmp_path):
     _skip_if_missing(loader_path, pe_path)
 
     shellcode_path = tmp_path / f"15_nested_exceptions_{arch}.bin"
-    _shellcodify(pe_path, shellcode_path, resolve_imports=True)
+    _shellcodify(pe_path, shellcode_path)
 
     result = subprocess.run(
         [str(loader_path), str(shellcode_path)],
@@ -577,6 +585,124 @@ def test_15_nested_exceptions(arch, tmp_path):
     )
     assert result.returncode == 55, (
         f"[{arch}] expected exit code 55 (outer catch fired after rethrow), got {result.returncode}\n"
+        f"stdout: {result.stdout.decode(errors='replace')}\n"
+        f"stderr: {result.stderr.decode(errors='replace')}"
+    )
+
+
+# ── P2-15 ─────────────────────────────────────────────────────────────────────
+
+
+def test_large_pe_disp32_guard():
+    """_build_shellcode_chain raises ValueError when the computed disp32 would overflow signed 32-bit."""
+    pe_path = ARCH_DIRS["x64"] / "01_simple_calc.exe"
+    if not pe_path.exists():
+        pytest.skip("test binaries not built")
+
+    # Craft an entry dict whose relocs already has disp32 = 0x7FFFFFFF.
+    # Any non-zero extra (entrypoint resolver) will push it over the limit.
+    entry = dict(_SHELLCODES[OPTIONAL_HEADER_MAGIC_PE_PLUS])
+    relocs_bytes = bytearray(entry['relocs'])
+    off = entry['disp32_off']
+    relocs_bytes[off:off + 4] = (0x7FFFFFFF).to_bytes(4, 'little')
+    entry = dict(entry, relocs=bytes(relocs_bytes))
+
+    pe = PE(str(pe_path))
+    with pytest.raises(ValueError, match="disp32"):
+        _build_shellcode_chain(pe, entry, skip_imports=True)
+
+
+# ── P2-14 ─────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_16_delay_load(arch, tmp_path):
+    """Delay-loaded GetTickCount must be resolved before the entry point; returns 1..250."""
+    win_dir     = ARCH_DIRS[arch]
+    pe_path     = win_dir / "16_delay_load.exe"
+    loader_path = win_dir / "test_loader.exe"
+    _skip_if_missing(loader_path, pe_path)
+
+    shellcode_path = tmp_path / f"16_delay_load_{arch}.bin"
+    _shellcodify(pe_path, shellcode_path)
+
+    result = subprocess.run(
+        [str(loader_path), str(shellcode_path)],
+        capture_output=True, timeout=10,
+    )
+    assert 1 <= result.returncode <= 250, (
+        f"[{arch}] expected exit code 1..250 (GetTickCount resolved), got {result.returncode}\n"
+        f"stdout: {result.stdout.decode(errors='replace')}\n"
+        f"stderr: {result.stderr.decode(errors='replace')}"
+    )
+
+
+# ── P3-17 ─────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("arch", ["x64"])
+def test_custom_entry(arch, tmp_path):
+    """--entry selects a named export (DllMain) instead of OEP; must return 42."""
+    win_dir     = ARCH_DIRS[arch]
+    pe_path     = win_dir / "05_dll_entry.dll"
+    loader_path = win_dir / "test_loader.exe"
+    _skip_if_missing(loader_path, pe_path)
+
+    pe = PE(str(pe_path))
+    override_ep_rva = _find_export_rva(pe, "DllMain")
+
+    shellcode_path = tmp_path / f"custom_entry_{arch}.bin"
+    _shellcodify(pe_path, shellcode_path, override_ep_rva=override_ep_rva)
+
+    result = subprocess.run(
+        [str(loader_path), str(shellcode_path)],
+        capture_output=True, timeout=10,
+    )
+    assert result.returncode == 42, (
+        f"[{arch}] --entry DllMain: expected exit code 42, got {result.returncode}\n"
+        f"stdout: {result.stdout.decode(errors='replace')}\n"
+        f"stderr: {result.stderr.decode(errors='replace')}"
+    )
+
+
+# ── P2-16 ─────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("arch", ["x64"])
+def test_mingw_simple_calc(arch, tmp_path):
+    """MinGW cross-compiled importless EXE must shellcodify and return 4950."""
+    import platform
+
+    compiler = "x86_64-w64-mingw32-gcc"
+    if not shutil.which(compiler):
+        pytest.skip(f"{compiler} not found in PATH")
+
+    src = TESTS_DIR / "01_simple_calc" / "main.c"
+    if not src.exists():
+        pytest.skip(f"source not found: {src}")
+
+    exe = tmp_path / "simple_calc_mingw.exe"
+    cc = subprocess.run(
+        [compiler, "-nostdlib", "-nostartfiles", "-e", "main", str(src), "-o", str(exe)],
+        capture_output=True,
+    )
+    assert cc.returncode == 0, f"MinGW compile failed:\n{cc.stderr.decode(errors='replace')}"
+
+    sc = tmp_path / "simple_calc_mingw.bin"
+    _shellcodify(exe, sc)
+
+    if platform.system() == "Windows":
+        loader = ARCH_DIRS[arch] / "test_loader.exe"
+        if not loader.exists():
+            pytest.skip(f"test_loader.exe not found — build tests/tests.sln first")
+    else:
+        loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux"
+        if not loader.exists():
+            pytest.skip(f"Linux test_loader not found — build tests/test_loader_linux/main.c first")
+
+    result = subprocess.run([str(loader), str(sc)], capture_output=True, timeout=10)
+    assert result.returncode == 4950, (
+        f"[MinGW {arch}] expected 4950, got {result.returncode}\n"
         f"stdout: {result.stdout.decode(errors='replace')}\n"
         f"stderr: {result.stderr.decode(errors='replace')}"
     )

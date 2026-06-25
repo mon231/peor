@@ -6,6 +6,7 @@ from pefile import PE, OPTIONAL_HEADER_MAGIC_PE, OPTIONAL_HEADER_MAGIC_PE_PLUS
 from peor._shellcodes import (
     RELOCS_32, RELOCS_64,
     IMPORTS_32_UM, IMPORTS_64_UM,
+    DELAY_IMPORTS_32_UM, DELAY_IMPORTS_64_UM,
     ENTRYPOINT_32, ENTRYPOINT_64,
     SEH_REGISTRAR_32, SEH_REGISTRAR_64,
     TLS_CALLBACKS_32, TLS_CALLBACKS_64,
@@ -28,8 +29,8 @@ IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR = 14
 
 # Trailing bytes that terminate each import resolver so it falls through into the
 # relocs resolver. We strip them at output time.
-#   x86: 0xC3 (RET)          → stripped → falls through to RELOCS_32
-#   x64: 0xFF 0xE0 (JMP RAX) → stripped → falls through to RELOCS_64
+#   x86: 0xC3 (RET)          → stripped → falls through to next resolver
+#   x64: 0xFF 0xE0 (JMP RAX) → stripped → falls through to next resolver
 _IMPORTS_TAIL_32 = b'\xc3'
 _IMPORTS_TAIL_64 = b'\xff\xe0'
 
@@ -38,6 +39,13 @@ _IMPORTS_TAIL_64 = b'\xff\xe0'
 # IAT_RVA_MAGIC: patched to the IAT-entry RVA for the hooked function.
 _CXX_EH_PE_SIZE_MAGIC_64 = b'\x78\x56\x34\x12'  # 0x12345678 LE (in ADD RCX, imm32)
 _CXX_EH_IAT_RVA_MAGIC_64 = b'\x21\x43\x65\x87'  # 0x87654321 LE (in LEA RDX, [RBX+disp32])
+
+# Magic placeholder in entrypoint_resolver{32,64}.asm for AddressOfEntryPoint RVA.
+# peor patches this to the actual OEP RVA (or a named-export RVA for --entry).
+_EP_RVA_MAGIC = b'\xce\xce\xce\xce'  # 0xCECECECE LE (in MOV EAX, imm32)
+
+# Maximum signed 32-bit displacement for the LEA disp32 field in the relocs resolver.
+_MAX_SHELLCODE_DISP32 = 0x7FFFFFFF
 
 # Windows PE Subsystem values that peor does not yet support.
 _EFI_SUBSYSTEMS   = frozenset({10, 11, 12, 13})  # EFI_APPLICATION / BOOT_SERVICE / RUNTIME / ROM
@@ -52,30 +60,34 @@ _NATIVE_SUBSYSTEM = 1                             # Windows native (kernel-mode 
 #   RELOCS_64: e8..(5) 5b(1) 48 8d bb <disp32>(4) → disp32 at byte 9
 _SHELLCODES = {
     OPTIONAL_HEADER_MAGIC_PE: {
-        'relocs':           RELOCS_32,
-        'imports':          IMPORTS_32_UM,
-        'entrypoint':       ENTRYPOINT_32,
-        'seh':              SEH_REGISTRAR_32,
-        'seh_always':       True,               # x86 uses FS:[0] SEH chains — always needed
-        'tls':              TLS_CALLBACKS_32,
-        'tail':             _IMPORTS_TAIL_32,
-        'dir_array_offset': 96,
-        'disp32_off':       8,
+        'relocs':            RELOCS_32,
+        'imports':           IMPORTS_32_UM,
+        'delay_imports':     DELAY_IMPORTS_32_UM,
+        'entrypoint':        ENTRYPOINT_32,
+        'seh':               SEH_REGISTRAR_32,
+        'seh_always':        True,               # x86 uses FS:[0] SEH chains — always needed
+        'tls':               TLS_CALLBACKS_32,
+        'tail':              _IMPORTS_TAIL_32,
+        'dir_array_offset':  96,
+        'disp32_off':        8,
+        'ep_rva_magic':      _EP_RVA_MAGIC,
     },
     OPTIONAL_HEADER_MAGIC_PE_PLUS: {
-        'relocs':           RELOCS_64,
-        'imports':          IMPORTS_64_UM,
-        'entrypoint':       ENTRYPOINT_64,
-        'seh':              SEH_REGISTRAR_64,
-        'seh_always':       False,              # x64: only needed when .pdata (DataDir[3]) is present
-        'tls':              TLS_CALLBACKS_64,
-        'cxx_eh_fixer':     CXX_EH_FIXER_64,
-        'cxx_eh_import':    b'RtlPcToFileHeader',
+        'relocs':            RELOCS_64,
+        'imports':           IMPORTS_64_UM,
+        'delay_imports':     DELAY_IMPORTS_64_UM,
+        'entrypoint':        ENTRYPOINT_64,
+        'seh':               SEH_REGISTRAR_64,
+        'seh_always':        False,              # x64: only needed when .pdata (DataDir[3]) is present
+        'tls':               TLS_CALLBACKS_64,
+        'cxx_eh_fixer':      CXX_EH_FIXER_64,
+        'cxx_eh_import':     b'RtlPcToFileHeader',
         'cxx_pe_size_magic': _CXX_EH_PE_SIZE_MAGIC_64,
         'cxx_iat_rva_magic': _CXX_EH_IAT_RVA_MAGIC_64,
-        'tail':             _IMPORTS_TAIL_64,
-        'dir_array_offset': 112,
-        'disp32_off':       9,
+        'tail':              _IMPORTS_TAIL_64,
+        'dir_array_offset':  112,
+        'disp32_off':        9,
+        'ep_rva_magic':      _EP_RVA_MAGIC,
     },
 }
 
@@ -117,6 +129,37 @@ def _has_tls_callbacks(pe: PE) -> bool:
     return int.from_bytes(raw, 'little') != 0
 
 
+def _has_imports(pe: PE) -> bool:
+    """Return True when DataDir[IMAGE_DIRECTORY_ENTRY_IMPORT] is non-zero."""
+    dirs = pe.OPTIONAL_HEADER.DATA_DIRECTORY
+    return (len(dirs) > IMAGE_DIRECTORY_ENTRY_IMPORT
+            and dirs[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress != 0)
+
+
+def _has_delay_imports(pe: PE) -> bool:
+    """Return True when DataDir[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT] is non-zero."""
+    dirs = pe.OPTIONAL_HEADER.DATA_DIRECTORY
+    return (len(dirs) > IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT
+            and dirs[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].VirtualAddress != 0)
+
+
+def _find_export_rva(pe: PE, name_or_ordinal: str) -> int:
+    """Look up a PE export by name or ordinal, return its RVA."""
+    if not hasattr(pe, 'DIRECTORY_ENTRY_EXPORT'):
+        raise ValueError("PE has no export directory; cannot use --entry")
+    if name_or_ordinal.isdigit():
+        ordinal = int(name_or_ordinal)
+        for exp in pe.DIRECTORY_ENTRY_EXPORT.symbols:
+            if exp.ordinal == ordinal:
+                return exp.address
+        raise ValueError(f"Export ordinal {ordinal} not found")
+    name_bytes = name_or_ordinal.encode()
+    for exp in pe.DIRECTORY_ENTRY_EXPORT.symbols:
+        if exp.name == name_bytes:
+            return exp.address
+    raise ValueError(f"Export '{name_or_ordinal}' not found in PE")
+
+
 def _validate_pe(pe: PE) -> dict:
     subsystem = pe.OPTIONAL_HEADER.Subsystem
     if subsystem in _EFI_SUBSYSTEMS:
@@ -152,19 +195,23 @@ def _zero_import_dir(ram_layout: bytearray, pe: PE, entry: dict) -> None:
     ram_layout[import_entry_off:import_entry_off + 8] = b'\x00' * 8
 
 
-def _build_shellcode_chain(pe: PE, entry: dict, resolve_imports: bool) -> bytes:
-    # Chain order: [imports] → relocs → [cxx_eh_fixer] → [seh] → [tls] → entrypoint → [pad]
-    # cxx_eh_fixer (x64 only) hooks RtlPcToFileHeader in the IAT so that
-    # _CxxThrowException gets the correct ImageBase for typed C++ exceptions.
-    # x86 does not need it: 32-bit ThrowInfo − NULL = ThrowInfo, so the frame
-    # handler reconstructs the pointer correctly without a hook.
-    imports    = _strip_tail(entry['imports'], entry['tail']) if resolve_imports else b''
-    relocs     = entry['relocs']
-    seh        = entry['seh'] if (entry['seh'] and (entry.get('seh_always') or _has_exception_table(pe))) else b''
-    tls        = entry['tls'] if (entry['tls'] and _has_tls_callbacks(pe)) else b''
-    entrypoint = entry['entrypoint']
+def _build_shellcode_chain(pe: PE, entry: dict, skip_imports: bool = False,
+                            override_ep_rva: int | None = None) -> bytes:
+    # Chain order: [imports] → relocs → [delay_imports] → [cxx_eh_fixer] → [seh] → [tls] → entrypoint → [pad]
+    # delay_imports runs AFTER relocs so the relocs resolver doesn't overwrite the patched delay-load IAT
+    # (delay-load IAT slots have DIR64 relocations; running delay_imports before relocs would get clobbered).
+    # imports: skipped when skip_imports=True or when the PE has no import directory.
+    imports       = (_strip_tail(entry['imports'], entry['tail'])
+                     if not skip_imports and _has_imports(pe) else b'')
+    delay_imports = (_strip_tail(entry['delay_imports'], entry['tail'])
+                     if not skip_imports and _has_delay_imports(pe) else b'')
+    relocs        = entry['relocs']
+    seh           = entry['seh'] if (entry['seh'] and (entry.get('seh_always') or _has_exception_table(pe))) else b''
+    tls           = entry['tls'] if (entry['tls'] and _has_tls_callbacks(pe)) else b''
+    entrypoint    = bytearray(entry['entrypoint'])
 
-    if resolve_imports and entry.get('cxx_eh_fixer') is not None and entry.get('cxx_eh_import') is not None:
+    # cxx_eh_fixer: only when we resolved regular imports (needed for IAT lookup)
+    if imports and entry.get('cxx_eh_fixer') is not None and entry.get('cxx_eh_import') is not None:
         iat_rva = _find_iat_rva(pe, entry['cxx_eh_import'])
         if iat_rva is not None:
             fixer = bytearray(entry['cxx_eh_fixer'])
@@ -185,50 +232,78 @@ def _build_shellcode_chain(pe: PE, entry: dict, resolve_imports: bool) -> bytes:
     else:
         cxx_fixer = b''
 
+    # Patch the EP RVA magic in the entrypoint resolver.
+    ep_rva = override_ep_rva if override_ep_rva is not None else pe.OPTIONAL_HEADER.AddressOfEntryPoint
+    ep_magic = entry.get('ep_rva_magic', b'')
+    if ep_magic:
+        if entrypoint.count(ep_magic) != 1:
+            raise RuntimeError(f"EP_RVA_MAGIC {ep_magic.hex()} not unique in entrypoint resolver")
+        idx = bytes(entrypoint).find(ep_magic)
+        entrypoint[idx:idx + 4] = struct.pack('<I', ep_rva)
+    entrypoint = bytes(entrypoint)
+
     # PE image must be 16-byte aligned in the buffer for MOVDQA/MOVAPS safety.
-    align_pad = (-len(imports) - len(relocs) - len(cxx_fixer) - len(seh) - len(tls) - len(entrypoint)) % 16
+    align_pad = (
+        -len(imports) - len(relocs) - len(delay_imports)
+        - len(cxx_fixer) - len(seh) - len(tls) - len(entrypoint)
+    ) % 16
 
     # Patch the disp32 in the relocs resolver.
     # setup.py bakes in disp32 = len(relocs_assembled) - 5 (PE follows relocs standalone).
-    # At runtime we add the remaining shellcodes + alignment padding.
-    extra  = len(cxx_fixer) + len(seh) + len(tls) + len(entrypoint) + align_pad
-    off    = entry['disp32_off']
-    relocs = bytearray(relocs)
-    old    = int.from_bytes(relocs[off:off + 4], 'little')
-    relocs[off:off + 4] = (old + extra).to_bytes(4, 'little')
+    # We add the remaining shellcodes + alignment padding that come after relocs.
+    # delay_imports comes after relocs so it is included in extra.
+    extra    = len(delay_imports) + len(cxx_fixer) + len(seh) + len(tls) + len(entrypoint) + align_pad
+    off      = entry['disp32_off']
+    relocs   = bytearray(relocs)
+    old      = int.from_bytes(relocs[off:off + 4], 'little')
+    new_disp = old + extra
+    if new_disp > _MAX_SHELLCODE_DISP32:
+        raise ValueError(
+            f"shellcode chain too large: relocs resolver disp32 {new_disp:#010x} "
+            f"would overflow the signed 32-bit LEA field (max {_MAX_SHELLCODE_DISP32:#010x})"
+        )
+    relocs[off:off + 4] = new_disp.to_bytes(4, 'little')
 
-    return imports + bytes(relocs) + cxx_fixer + seh + tls + entrypoint + (b'\x90' * align_pad)
+    return (imports + bytes(relocs) + delay_imports + cxx_fixer + seh
+            + tls + entrypoint + (b'\x90' * align_pad))
 
 
-def _shellcode_info(pe: PE, entry: dict, resolve_imports: bool) -> dict:
+def _shellcode_info(pe: PE, entry: dict, skip_imports: bool = False) -> dict:
     """Return per-component byte sizes for --info display; no shellcode is assembled."""
-    imports    = _strip_tail(entry['imports'], entry['tail']) if resolve_imports else b''
-    relocs     = entry['relocs']
-    seh        = entry['seh'] if (entry['seh'] and (entry.get('seh_always') or _has_exception_table(pe))) else b''
-    tls        = entry['tls'] if (entry['tls'] and _has_tls_callbacks(pe)) else b''
-    entrypoint = entry['entrypoint']
+    imports       = (_strip_tail(entry['imports'], entry['tail'])
+                     if not skip_imports and _has_imports(pe) else b'')
+    delay_imports = (_strip_tail(entry['delay_imports'], entry['tail'])
+                     if not skip_imports and _has_delay_imports(pe) else b'')
+    relocs        = entry['relocs']
+    seh           = entry['seh'] if (entry['seh'] and (entry.get('seh_always') or _has_exception_table(pe))) else b''
+    tls           = entry['tls'] if (entry['tls'] and _has_tls_callbacks(pe)) else b''
+    entrypoint    = entry['entrypoint']
 
-    if resolve_imports and entry.get('cxx_eh_fixer') and entry.get('cxx_eh_import'):
+    if imports and entry.get('cxx_eh_fixer') and entry.get('cxx_eh_import'):
         iat_rva   = _find_iat_rva(pe, entry['cxx_eh_import'])
         cxx_fixer = entry['cxx_eh_fixer'] if iat_rva is not None else b''
     else:
         cxx_fixer = b''
 
-    align_pad     = (-len(imports) - len(relocs) - len(cxx_fixer) - len(seh) - len(tls) - len(entrypoint)) % 16
+    align_pad = (
+        -len(imports) - len(relocs) - len(delay_imports)
+        - len(cxx_fixer) - len(seh) - len(tls) - len(entrypoint)
+    ) % 16
     pe_image_size = pe.OPTIONAL_HEADER.SizeOfImage
-    total         = (len(imports) + len(relocs) + len(cxx_fixer) + len(seh) + len(tls)
-                     + len(entrypoint) + align_pad + pe_image_size)
+    total         = (len(imports) + len(relocs) + len(delay_imports) + len(cxx_fixer)
+                     + len(seh) + len(tls) + len(entrypoint) + align_pad + pe_image_size)
 
     return {
-        'imports':    len(imports)   if imports   else None,
-        'relocs':     len(relocs),
-        'cxx_eh':     len(cxx_fixer) if cxx_fixer else None,
-        'seh':        len(seh)       if seh       else None,
-        'tls':        len(tls)       if tls       else None,
-        'entrypoint': len(entrypoint),
-        'align_pad':  align_pad      if align_pad else None,
-        'PE image':   pe_image_size,
-        'total':      total,
+        'imports':       len(imports)       if imports       else None,
+        'delay_imports': len(delay_imports) if delay_imports else None,
+        'relocs':        len(relocs),
+        'cxx_eh':        len(cxx_fixer)     if cxx_fixer     else None,
+        'seh':           len(seh)           if seh           else None,
+        'tls':           len(tls)           if tls           else None,
+        'entrypoint':    len(entrypoint),
+        'align_pad':     align_pad          if align_pad     else None,
+        'PE image':      pe_image_size,
+        'total':         total,
     }
 
 
@@ -246,35 +321,37 @@ def _print_info(info: dict, pe_name: str) -> None:
     print(f"  {'total':<{key_w}}  {info['total']:>{num_w}} B  ({pe_name})")
 
 
-def _make_shellcode(pe: PE, ignore_imports: bool = False, resolve_imports: bool = False) -> bytes:
+def _make_shellcode(pe: PE, ignore_imports: bool = False, no_imports: bool = False,
+                    override_ep_rva: int | None = None) -> bytes:
     entry      = _validate_pe(pe)
     ram_layout = _build_ram_layout(pe)
     if ignore_imports:
         _zero_import_dir(ram_layout, pe, entry)
-    prefix = _build_shellcode_chain(pe, entry, resolve_imports)
+    prefix = _build_shellcode_chain(pe, entry, skip_imports=no_imports, override_ep_rva=override_ep_rva)
     return prefix + bytes(ram_layout)
 
 
 def dump_memory_layout(pe: PE, output_file: Path, ignore_imports: bool = False,
-                       resolve_imports: bool = False):
-    output_file.write_bytes(_make_shellcode(pe, ignore_imports, resolve_imports))
+                       no_imports: bool = False, override_ep_rva: int | None = None):
+    output_file.write_bytes(_make_shellcode(pe, ignore_imports, no_imports, override_ep_rva))
 
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
-    parser.add_argument('-i', '--input-file',      required=True,  type=Path, help='Path to a PE-file')
-    parser.add_argument('-m', '--ignore-imports',  action='store_true',       help='Zero the import directory in the output')
-    parser.add_argument('-r', '--resolve-imports', action='store_true',       help='Prepend import resolver shellcode')
-    parser.add_argument('-o', '--output-file',     required=False, type=str,  help='Output path, or "-" for stdout')
-    parser.add_argument(      '--info',            action='store_true',       help='Print resolver sizes without writing output')
+    parser.add_argument('-i', '--input-file',    required=True,  type=Path, help='Path to a PE-file')
+    parser.add_argument('-m', '--ignore-imports', action='store_true',      help='Zero the import directory in the output')
+    parser.add_argument('--no-imports',           action='store_true',      help='Skip import resolvers even if PE has imports')
+    parser.add_argument('-e', '--entry',           type=str, default=None,  help='Call named export (or ordinal) instead of OEP')
+    parser.add_argument('-o', '--output-file',    required=False, type=str, help='Output path, or "-" for stdout')
+    parser.add_argument(      '--info',            action='store_true',     help='Print resolver sizes without writing output')
     return parser.parse_args()
 
 
 def main():
     args = parse_arguments()
 
-    if args.ignore_imports and args.resolve_imports:
-        print("Error: --ignore-imports and --resolve-imports are mutually exclusive")
+    if args.ignore_imports and args.no_imports:
+        print("Error: --ignore-imports and --no-imports are mutually exclusive")
         return
 
     if args.info and args.output_file:
@@ -287,13 +364,17 @@ def main():
 
     pe = PE(str(args.input_file))
 
+    override_ep_rva = None
+    if args.entry:
+        override_ep_rva = _find_export_rva(pe, args.entry)
+
     if args.info:
         entry = _validate_pe(pe)
-        info  = _shellcode_info(pe, entry, args.resolve_imports)
+        info  = _shellcode_info(pe, entry, skip_imports=args.no_imports)
         _print_info(info, args.input_file.name)
         return
 
-    shellcode = _make_shellcode(pe, args.ignore_imports, args.resolve_imports)
+    shellcode = _make_shellcode(pe, args.ignore_imports, args.no_imports, override_ep_rva)
     if args.output_file == '-':
         sys.stdout.buffer.write(shellcode)
     else:

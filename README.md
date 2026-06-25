@@ -6,8 +6,8 @@ and executed without a loader, module list, or image base guarantee.
 
 The output is a self-contained binary: a small assembly stub prepended to a
 memory-mapped copy of the original PE.  No OS loader involvement is needed; the
-stub performs whatever setup the PE requires (relocations, imports, exception
-tables, TLS callbacks) before jumping to the entry point.
+stub performs whatever setup the PE requires (relocations, imports, delay-load
+imports, exception tables, TLS callbacks) before jumping to the entry point.
 
 > **Disclaimer** — PEOR is made for educational purposes and embedded-software
 > development (bare-metal, UEFI pre-OS, custom hypervisors, security research
@@ -41,20 +41,30 @@ does not need to be present at runtime.
 
 ```
 python -m peor -i input.exe -o output.bin
-python -m peor -i input.exe -o output.bin -r   # resolve imports
-python -m peor -i input.dll -o output.bin -r   # works for DLLs too
+python -m peor -i input.dll -o output.bin            # DLLs work too
+python -m peor -i input.exe -o -                     # write shellcode to stdout
+python -m peor -i input.exe --info                   # show resolver sizes (dry-run)
+python -m peor -i input.exe --entry MyExport -o out.bin  # call a named export instead of OEP
+python -m peor -i input.exe --no-imports -o out.bin  # skip all import resolvers
 ```
 
 | Flag | Meaning |
 |---|---|
 | `-i / --input-file` | Path to the source PE (EXE or DLL, x86 or x64) |
-| `-o / --output-file` | Path to write the shellcode binary |
-| `-r / --resolve-imports` | Prepend the import resolver; required when the PE uses Windows APIs |
+| `-o / --output-file` | Path to write the shellcode binary, or `-` for stdout |
 | `-m / --ignore-imports` | Zero the import directory in the output (for importless PEs loaded by a custom environment) |
+| `--no-imports` | Skip all import resolvers even if the PE has imports |
+| `-e / --entry NAME` | Call export `NAME` (by name or ordinal) instead of the PE's OEP |
+| `--info` | Print resolver component sizes without writing output |
+
+Import resolution is **automatic**: if the PE has an import directory (`DataDir[1]`)
+or a delay-load directory (`DataDir[13]`), the matching resolver is prepended
+automatically.  Use `--no-imports` to opt out.
 
 The shellcode is then executed by any loader that allocates executable memory,
 copies the binary in, and calls it (e.g. `VirtualAlloc` + `memcpy` + `call`).
-A minimal reference loader is included in `tests/test_loader/`.
+A minimal reference loader is included in `tests/test_loader/` (Windows) and
+`tests/test_loader_linux/` (Linux, for importless MinGW PEs).
 
 ---
 
@@ -66,20 +76,26 @@ A minimal reference loader is included in `tests/test_loader/`.
 ┌──────────────────────────────────────────────────────┐
 │  shellcode prefix (assembled stubs, position-independent)  │
 │  ┌──────────────────────────────────────────────────┐ │
-│  │  [import resolver]   (optional, -r)              │ │
+│  │  [import resolver]    (auto, if DataDir[1] set)  │ │
 │  │  relocation resolver                             │ │
-│  │  [C++ EH IAT fixer]  (x64, if needed)            │ │
-│  │  [SEH registrar]     (x86 always, x64 if .pdata) │ │
-│  │  [TLS callback invoker] (if TLS directory present)│ │
+│  │  [delay-load resolver](auto, if DataDir[13] set) │ │
+│  │  [C++ EH IAT fixer]   (x64, if needed)           │ │
+│  │  [SEH registrar]      (x86 always, x64 if .pdata)│ │
+│  │  [TLS callback invoker](if TLS directory present) │ │
 │  │  entry point dispatcher                          │ │
 │  └──────────────────────────────────────────────────┘ │
 │  memory-mapped PE image (headers + sections, zero-padded) │
 └──────────────────────────────────────────────────────┘
 ```
 
-Each stub runs and falls through to the next.  EBX/RBX carries the PE base
+Each stub runs and falls through to the next.  RBX carries the PE base
 address forward through the chain.  After the chain completes, execution jumps
-to the PE's own entry point.
+to the PE's own entry point (or to the export named by `--entry`).
+
+**Note on ordering**: the delay-load resolver runs *after* the relocs resolver
+so that base-relocation patches applied to the delay-load IAT are subsequently
+overwritten with the real function addresses resolved via `LoadLibraryA` +
+`GetProcAddress`.
 
 ---
 
@@ -116,8 +132,9 @@ falls through immediately.
 
 ### Usermode Import Resolution
 
-When `-r` is specified, the import stub (`imports_resolver32/64.asm`) resolves
-every entry in `IMAGE_IMPORT_DESCRIPTOR` before the reloc stub runs.
+When the PE has a non-zero import directory (`DataDir[1]`), the import stub
+(`imports_resolver32/64.asm`) resolves every entry in `IMAGE_IMPORT_DESCRIPTOR`
+before the reloc stub runs.
 
 **Step 1 — find kernel32** via the PEB loader list, without any imports of its
 own:
@@ -136,6 +153,25 @@ scan `AddressOfNames` for the string, resolve via `AddressOfNameOrdinals` +
 **Step 3 — use `GetProcAddress` to get `LoadLibraryA`**, then walk
 `IMAGE_IMPORT_DESCRIPTOR`; for each DLL: call `LoadLibraryA`, then call
 `GetProcAddress` for each thunk.
+
+---
+
+### Delay-Load Import Resolution
+
+When the PE has a non-zero delay-load directory (`DataDir[13]`), the delay-load
+stub (`imports_resolver32/64_delayload.asm`) resolves every entry in
+`IMAGE_DELAY_IMPORT_DESCRIPTOR` after the relocs stub runs.
+
+The delay-load resolver uses the same PEB walk as the regular import resolver
+to obtain `GetProcAddress` and `LoadLibraryA` independently.  For each
+`ImgDelayDescr` entry (modern `grAttrs=1` RVA format):
+1. Call `LoadLibraryA(rvaDLLName + PE_base)` → module handle.
+2. Walk the delay-load INT (`rvaINT`); for each thunk call
+   `GetProcAddress(module, name_or_ordinal)`.
+3. Patch the delay-load IAT slot (`rvaIAT`) with the resolved VA.
+
+This runs *after* the relocs resolver so that any `DIR64` relocation applied to
+the delay-load IAT is subsequently overwritten with the real function address.
 
 ---
 
@@ -256,10 +292,10 @@ This stub is only inserted when the TLS directory is present and
 ### Entry Point Dispatcher
 
 `entrypoint_resolver32/64.asm` reads `AddressOfEntryPoint` from the optional
-header.  If `IMAGE_FILE_DLL` is set in `Characteristics`, it calls
-`DllMain(base, DLL_PROCESS_ATTACH, NULL)` using the correct calling convention
-(x86 stdcall / x64 Microsoft ABI).  For EXEs it jumps directly to the entry
-point.
+header (or the RVA supplied by `--entry`).  If `IMAGE_FILE_DLL` is set in
+`Characteristics`, it calls `DllMain(base, DLL_PROCESS_ATTACH, NULL)` using the
+correct calling convention (x86 stdcall / x64 Microsoft ABI).  For EXEs it
+jumps directly to the entry point.
 
 ---
 
@@ -291,7 +327,15 @@ pytest tests/pytest -v
 | 10 | `10_tls_callbacks` | x86, x64 | TLS callback sets `g_result=88`; tests TLS callback invoker runs before `main` | 88 |
 | 11 | `11_cpp_exceptions` | x86, x64 | Typed C++ `throw`/`catch`; tests that the correct catch branch fires | 123 |
 | 12 | `12_seh_exceptions` | x86, x64 | Same as 11 but compiled `/EHa` (SEH-integrated C++ exceptions) | 123 |
-| — | `certificate_signed_pe` | x86, x64 | PE with a dummy `WIN_CERTIFICATE` appended (Authenticode structure); verifies peor handles the security directory correctly | 90 |
+| 13 | `13_tls_multi_callbacks` | x86, x64 | Five TLS callbacks in sequence with ordering check | computed sum |
+| 14 | `14_global_ctors` | x86, x64 | File-scope C++ constructor runs before `main` | 42 |
+| 15 | `15_nested_exceptions` | x64 | Nested/rethrown C++ exceptions test multi-frame unwind | 55 |
+| 16 | `16_delay_load` | x86, x64 | Delay-loaded `winmm.dll!timeGetTime`; tests delay-load IAT pre-patching | 1..250 |
+| — | `certificate_signed_pe` | x86, x64 | PE with a dummy `WIN_CERTIFICATE` appended; verifies security directory is handled | 90 |
+| — | `clr_pe_rejection` | — | CLR/managed PE raises `ValueError` | ValueError |
+| — | `disp32_overflow` | — | Relocs resolver disp32 overflow check raises `ValueError` | ValueError |
+| — | `custom_entry` | x64 | `--entry DllMain` calls a named export instead of OEP | 42 |
+| — | `mingw_simple_calc` | x64 | MinGW cross-compiled importless EXE; CI-only (skipped if compiler absent) | 4950 |
 
 Test 03 requires an interactive desktop and is automatically skipped when the
 `CI` environment variable is set.
@@ -300,8 +344,7 @@ Test 03 requires an interactive desktop and is automatically skipped when the
 
 ## Building
 
-Requirements: Visual Studio 2022 with the C++ workload, from a **Developer
-Command Prompt**.
+Requirements: Visual Studio 2022 with the C++ workload.
 
 ```bat
 rem Release builds (used by pytest)
@@ -311,7 +354,15 @@ msbuild tests\tests.sln /p:Configuration=Release /p:Platform=x64
 
 Binaries land in `tests/Win_x86/` and `tests/Win_x64/`.  Post-build steps
 automatically run `python -m peor` on each output to produce the corresponding
-`.bin` shellcode files alongside the PE.
+`.shellcode` files alongside the PE.
+
+For the MinGW cross-platform test (Linux/Ubuntu):
+
+```bash
+sudo apt-get install -y gcc-mingw-w64-x86-64 gcc
+gcc -O2 -o tests/test_loader_linux/test_loader_linux tests/test_loader_linux/main.c
+pytest tests/pytest -v -k test_mingw_simple_calc
+```
 
 ---
 

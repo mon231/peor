@@ -132,7 +132,7 @@
   </ItemGroup>
   <ItemDefinitionGroup>
     <PostBuildEvent>
-      <Command>peor -i "$(TargetPath)" -r -o "$(OutDir)$(TargetName).shellcode"</Command>
+      <Command>peor -i "$(TargetPath)" -o "$(OutDir)$(TargetName).shellcode"</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

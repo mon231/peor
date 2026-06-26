@@ -5,6 +5,7 @@ __pycache__/
 build/
 venv/
 dist/
+*.elf
 
 # VS test build output
 Win_x86/

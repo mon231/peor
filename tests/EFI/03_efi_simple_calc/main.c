@@ -24,9 +24,14 @@ typedef unsigned int EFI_STATUS;
 
 typedef unsigned short CHAR16;
 
-#define EFI_SUCCESS                              ((EFI_STATUS)0)
-#define EFI_LOAD_ERROR                           ((EFI_STATUS)1)
+#define EFI_SUCCESS    ((EFI_STATUS)0)
+#define EFI_LOAD_ERROR ((EFI_STATUS)1)
+/* OutputString is the 2nd member; pointer size differs per arch. */
+#ifdef _WIN64
 #define EFI_SIMPLE_TEXT_OUTPUT_OUTPUT_STRING_OFF 0x08
+#else
+#define EFI_SIMPLE_TEXT_OUTPUT_OUTPUT_STRING_OFF 0x04
+#endif
 
 #define CALC_EXPECTED_SUM 4950
 #define CALC_ITER_COUNT   100

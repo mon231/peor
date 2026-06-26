@@ -1,6 +1,7 @@
 /*
  * EFI loader - runs an embedded shellcode buffer, prints result, then shuts down.
  * The shellcode bytes are injected at compile time via shellcode_data.h.
+ * Supports both x64 (PE32+) and IA-32 (PE32) EFI builds via #ifdef _WIN64.
  *
  * UEFI pre-boot memory is executable by default (no NX enforcement in OVMF),
  * so calling a static array directly works without AllocatePool.
@@ -12,8 +13,9 @@
  * Compile (after generating shellcode_data.h):
  *   x86_64-w64-mingw32-gcc -nostdlib -nodefaultlibs -nostartfiles \
  *     -fno-unwind-tables -fno-asynchronous-unwind-tables \
- *     -I. -Wl,-e,efi_loader_main -Wl,--subsystem,efi_application \
+ *     -I. -Wl,-e,efi_loader_main -Wl,--subsystem,10 \
  *     -o efi_loader.efi main.c
+ *   i686-w64-mingw32-gcc ... same flags ... -o efi_loader_ia32.efi main.c
  */
 
 #include <stddef.h>
@@ -21,18 +23,35 @@
 
 typedef unsigned char  UINT8;
 typedef unsigned short UINT16;
-typedef unsigned long long UINT64;
-typedef UINT64 UINTN;
-typedef UINTN  EFI_STATUS;
 
-#define EFI_SUCCESS  ((EFI_STATUS)0)
+#ifdef _WIN64
+typedef unsigned long long UINTN;
+
+/* Byte offsets into EFI_SYSTEM_TABLE (UEFI spec, x64 / 64-bit pointers). */
+#define EFI_SYSTEM_TABLE_CONOUT_OFFSET           0x40
+#define EFI_SYSTEM_TABLE_RUNTIME_SERVICES_OFFSET 0x58
+/* EFI_RUNTIME_SERVICES.ResetSystem — 11th entry, each pointer is 8 bytes.
+   Header is 24 bytes; entries 0-9 (GetTime..GetNextHighMonotonicCount) take 80 bytes. */
+#define EFI_RUNTIME_SERVICES_RESET_SYSTEM_OFFSET 0x68
+/* EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL.OutputString — 2nd member, 8-byte pointer. */
+#define EFI_SIMPLE_TEXT_OUTPUT_OUTPUT_STRING_OFF 0x08
+#else
+typedef unsigned int UINTN;
+
+/* Byte offsets into EFI_SYSTEM_TABLE (UEFI spec, IA-32 / 32-bit pointers). */
+#define EFI_SYSTEM_TABLE_CONOUT_OFFSET           0x2C
+#define EFI_SYSTEM_TABLE_RUNTIME_SERVICES_OFFSET 0x38
+/* EFI_RUNTIME_SERVICES.ResetSystem — 11th entry, each pointer is 4 bytes.
+   Header is 24 bytes; entries 0-9 take 40 bytes. */
+#define EFI_RUNTIME_SERVICES_RESET_SYSTEM_OFFSET 0x40
+/* EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL.OutputString — 2nd member, 4-byte pointer. */
+#define EFI_SIMPLE_TEXT_OUTPUT_OUTPUT_STRING_OFF 0x04
+#endif
+
+typedef UINTN EFI_STATUS;
+
+#define EFI_SUCCESS      ((EFI_STATUS)0)
 #define EFI_RESET_SHUTDOWN 2
-
-/* Byte offsets into EFI structures (UEFI spec 2.9, 64-bit). */
-#define EFI_SYSTEM_TABLE_CONOUT_OFFSET           0x40  /* EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL* */
-#define EFI_SYSTEM_TABLE_RUNTIME_SERVICES_OFFSET 0x58  /* EFI_RUNTIME_SERVICES* */
-#define EFI_SIMPLE_TEXT_OUTPUT_OUTPUT_STRING_OFF 0x08  /* OutputString fn pointer */
-#define EFI_RUNTIME_SERVICES_RESET_SYSTEM_OFFSET 0x68  /* ResetSystem fn pointer */
 
 static const UINT16 OK_MSG[]   = {'P','E','O','R','_','E','F','I','_','O','K','\r','\n',0};
 static const UINT16 FAIL_MSG[] = {'P','E','O','R','_','E','F','I','_','F','A','I','L','\r','\n',0};

@@ -36,8 +36,9 @@
 
 ; EFI_SYSTEM_TABLE field offsets (x86 layout, 32-bit pointers)
 %define EFI_SYSTEM_TABLE_CONOUT_OFFSET_32       0x2C
-; EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL field offsets (same for both arches)
-%define EFI_SIMPLE_TEXT_OUTPUT_OUTPUT_STRING_OFF 0x08
+; EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL.OutputString is the 2nd member.
+; On IA-32 all function pointers are 4 bytes, so OutputString sits at offset 4.
+%define EFI_SIMPLE_TEXT_OUTPUT_OUTPUT_STRING_OFF 0x04
 ; Minimum address for valid EFI firmware code pointers (below 1 MB = low/BIOS memory)
 %define EFI_FIRMWARE_ADDR_MIN                   0x100000
 ; NULL ImageHandle to pass when invoking efi_main from self-contained shellcode

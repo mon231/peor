@@ -23,8 +23,13 @@ typedef unsigned int EFI_STATUS;
 
 typedef unsigned short CHAR16;
 
-#define EFI_SUCCESS                              ((EFI_STATUS)0)
+#define EFI_SUCCESS ((EFI_STATUS)0)
+/* OutputString is the 2nd member; pointer size differs per arch. */
+#ifdef _WIN64
 #define EFI_SIMPLE_TEXT_OUTPUT_OUTPUT_STRING_OFF 0x08
+#else
+#define EFI_SIMPLE_TEXT_OUTPUT_OUTPUT_STRING_OFF 0x04
+#endif
 
 static const CHAR16 MSG[] = {
     'P','E','O','R','_','E','F','I','_','H','E','L','L','O','\r','\n', 0

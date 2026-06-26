@@ -6,6 +6,7 @@ build/
 venv/
 dist/
 *.elf
+*.pe
 
 # VS test build output
 Win_x86/

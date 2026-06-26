@@ -96,8 +96,9 @@ def _poll_and_dismiss_msgbox(title: str, timeout: float = 10.0) -> dict:
             break
         hwnd_child = user32.FindWindowExA(hwnd, hwnd_child, b"Static", None)
 
-    # Click the OK button directly — more reliable than posting WM_COMMAND to the dialog.
-    # SendMessageA is synchronous so the button-click is fully processed before we return.
+    # BM_CLICK via SendMessageA is the most reliable cross-process, cross-bitness way to
+    # dismiss a MessageBox: it blocks until the dialog's message loop processes the click
+    # (which guarantees MessageBoxA has returned before we do), then ExitProcess runs.
     hwnd_ok = user32.FindWindowExA(hwnd, None, b"Button", None)
     if hwnd_ok:
         user32.SendMessageA(hwnd_ok, 0x00F5, 0, 0)  # BM_CLICK
@@ -143,13 +144,17 @@ def test_03_winapi_messagebox(arch, tmp_path):
     # The loader blocks on MessageBoxA — start it without waiting
     proc = subprocess.Popen([str(loader_path), str(shellcode_path)])
 
-    msgbox = _poll_and_dismiss_msgbox(_MSGBOX_TITLE)
+    try:
+        msgbox = _poll_and_dismiss_msgbox(_MSGBOX_TITLE)
 
-    if not msgbox["found"]:
-        proc.kill()
-        pytest.fail(f"[{arch}] MessageBox '{_MSGBOX_TITLE}' did not appear within timeout")
+        if not msgbox["found"]:
+            pytest.fail(f"[{arch}] MessageBox '{_MSGBOX_TITLE}' did not appear within timeout")
 
-    proc.wait(timeout=5)
+        # ExitProcess from inside the shellcode triggers full DLL teardown; 30s is sufficient.
+        proc.wait(timeout=30)
+    finally:
+        if proc.returncode is None:
+            proc.kill()
 
     assert msgbox["text"] == _MSGBOX_TEXT, (
         f"[{arch}] MessageBox text: expected {_MSGBOX_TEXT!r}, got {msgbox['text']!r}"
@@ -719,7 +724,7 @@ def _find_mingw_gcc():
         return [gcc], False
     if platform.system() == "Windows":
         try:
-            r = _wsl_bash_run(f"which {gcc}", capture_output=True, timeout=10)
+            r = _wsl_bash_run(f"which {gcc}", capture_output=True, timeout=60)
             if r.returncode == 0:
                 return ["__wsl__"], True
         except (subprocess.TimeoutExpired, FileNotFoundError):
@@ -907,7 +912,9 @@ def test_clangcl_simple_calc(arch, tmp_path):
 
 # ── P4-18: Linux user-mode ────────────────────────────────────────────────────
 
-_LIBC_DEF_CONTENT = "LIBRARY libc.so.6\nEXPORTS\nwrite\n"
+# LIBRARY line omitted: dlltool >=2.41 has a parsing bug with it; use -D flag instead.
+_LIBC_DEF_CONTENT = "EXPORTS\nwrite\n"
+_LIBC_DLL_NAME    = "libc.so.6"
 
 _MINGW_CFLAGS_LINUX = [
     "-nostdlib", "-nodefaultlibs", "-nostartfiles",
@@ -916,12 +923,12 @@ _MINGW_CFLAGS_LINUX = [
 
 
 def _build_linux_write_pe(tmp_path: Path, use_wsl: bool) -> "Path | None":
-    """Cross-compile tests/Linux_x64/01_linux_write/main.c as a Windows PE with libc.so.6 imports.
+    """Cross-compile tests/Linux/01_linux_write/main.c as a Windows PE with libc.so.6 imports.
 
     Returns the path to the compiled .exe or None on failure.
     Creates a .def file, generates an import library via dlltool, then compiles.
     """
-    src = TESTS_DIR / "Linux_x64" / "01_linux_write" / "main.c"
+    src = TESTS_DIR / "Linux" / "01_linux_write" / "main.c"
     if not src.exists():
         return None
 
@@ -930,6 +937,12 @@ def _build_linux_write_pe(tmp_path: Path, use_wsl: bool) -> "Path | None":
     imp_lib  = tmp_path / "liblibc_import.a"
     def_file.write_text(_LIBC_DEF_CONTENT, encoding="ascii")
 
+    _GCC64 = "x86_64-w64-mingw32-gcc"
+    _DLLTOOL64 = "x86_64-w64-mingw32-dlltool"
+    # MinGW GCC injects a call to __main() inside main() even with -nostartfiles;
+    # provide a no-op stub so the shellcode entry point is pure.
+    _MAIN_STUB = "void __main(void) {}"
+
     if use_wsl:
         def_wsl  = _win_path_to_wsl(def_file)
         imp_wsl  = _win_path_to_wsl(imp_lib)
@@ -937,31 +950,41 @@ def _build_linux_write_pe(tmp_path: Path, use_wsl: bool) -> "Path | None":
         exe_wsl  = _win_path_to_wsl(exe)
 
         r = _wsl_bash_run(
-            f"x86_64-w64-mingw32-dlltool -d {def_wsl} -l {imp_wsl}",
+            f"{_DLLTOOL64} -D {_LIBC_DLL_NAME} -d {def_wsl} -l {imp_wsl}",
             capture_output=True, timeout=30,
         )
         if r.returncode != 0:
             return None
 
+        # Write __main stub to a WSL-side temp file so -x c never sees the .a file.
         cc = _wsl_bash_run(
-            "x86_64-w64-mingw32-gcc " + " ".join(_MINGW_CFLAGS_LINUX)
-            + f" -Wl,-e,main -Wl,--subsystem,posix {src_wsl} {imp_wsl} -o {exe_wsl}",
+            f"printf '%s' '{_MAIN_STUB}' > /tmp/_peor_stub64.c"
+            f" && {_GCC64} " + " ".join(_MINGW_CFLAGS_LINUX)
+            + f" /tmp/_peor_stub64.c {src_wsl} {imp_wsl}"
+            f" -Wl,-e,main -Wl,--subsystem,posix -o {exe_wsl}",
             capture_output=True, timeout=30,
         )
     else:
         r = subprocess.run(
-            ["x86_64-w64-mingw32-dlltool", "-d", str(def_file), "-l", str(imp_lib)],
+            [_DLLTOOL64, "-D", _LIBC_DLL_NAME, "-d", str(def_file), "-l", str(imp_lib)],
             capture_output=True, timeout=30,
         )
         if r.returncode != 0:
             return None
 
-        cc = subprocess.run(
-            ["x86_64-w64-mingw32-gcc"] + _MINGW_CFLAGS_LINUX
-            + ["-Wl,-e,main", "-Wl,--subsystem,posix",
-               str(src), str(imp_lib), "-o", str(exe)],
-            capture_output=True, timeout=30,
-        )
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".c", mode="w", delete=False) as f:
+            f.write(_MAIN_STUB)
+            stub_file = f.name
+        try:
+            cc = subprocess.run(
+                [_GCC64] + _MINGW_CFLAGS_LINUX
+                + [stub_file, str(src), str(imp_lib),
+                   "-Wl,-e,main", "-Wl,--subsystem,posix", "-o", str(exe)],
+                capture_output=True, timeout=30,
+            )
+        finally:
+            Path(stub_file).unlink(missing_ok=True)
 
     if cc.returncode != 0 or not exe.exists():
         return None
@@ -972,26 +995,18 @@ def _build_linux_write_pe(tmp_path: Path, use_wsl: bool) -> "Path | None":
 def test_01_linux_write(arch, tmp_path):
     """Linux import resolver: PE imports write() from libc.so.6; shellcode writes PEOR to stdout.
 
-    Requires native x86_64-w64-mingw32-gcc + dlltool and the Linux test_loader.
-    Only runs on Linux (the test_loader is a Linux ELF; Windows runners skip this test).
+    Requires x86_64-w64-mingw32-gcc + dlltool and the Linux test_loader.
+    On Windows, both compilation and execution run inside WSL.
     The PE is compiled with --subsystem posix (subsystem 7) so peor auto-selects the Linux chain.
     The Linux import resolver finds dlsym/dlopen by itself via /proc/self/maps + ELF64 scan.
     """
-    if platform.system() != "Linux":
-        pytest.skip("test_01_linux_write requires a Linux runner (test_loader_linux is an ELF)")
-
-    loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux"
-    if not loader.exists():
-        pytest.skip(
-            "Linux test_loader not found — "
-            "build with: gcc -O2 -ffixed-rbx -ffixed-r12 -ffixed-r13 "
-            "-ffixed-r14 -ffixed-r15 -o tests/test_loader_linux/test_loader_linux "
-            "tests/test_loader_linux/main.c"
-        )
-
     mingw_cmd, use_wsl = _find_mingw_gcc()
     if mingw_cmd is None:
-        pytest.skip("x86_64-w64-mingw32-gcc not found (native PATH)")
+        pytest.skip("x86_64-w64-mingw32-gcc not found (native PATH or WSL)")
+
+    loader = _ensure_linux_loader(use_wsl)
+    if loader is None:
+        pytest.skip("Linux test_loader not found and could not be built via WSL")
 
     exe = _build_linux_write_pe(tmp_path, use_wsl)
     if exe is None:
@@ -1000,7 +1015,17 @@ def test_01_linux_write(arch, tmp_path):
     sc = tmp_path / "linux_write.bin"
     _shellcodify_platform(exe, sc, _PLATFORM_LINUX)
 
-    result = subprocess.run([str(loader), str(sc)], capture_output=True, timeout=15)
+    if use_wsl:
+        # Use wsl.exe directly (no Git Bash / MSYS2 layer) to avoid MSYS2 converting
+        # /mnt/c/ paths to C:/Program Files/Git/mnt/c/ before they reach WSL.
+        sc_wsl = _win_path_to_wsl(sc)
+        loader_wsl = _win_path_to_wsl(loader)
+        result = subprocess.run(
+            ["wsl", "--", loader_wsl, sc_wsl], capture_output=True, timeout=15
+        )
+    else:
+        result = subprocess.run([str(loader), str(sc)], capture_output=True, timeout=15)
+
     assert result.returncode == 0, (
         f"[linux_write] loader crashed with code {result.returncode}\n"
         f"stderr: {result.stderr.decode(errors='replace')}"
@@ -1013,8 +1038,8 @@ def test_01_linux_write(arch, tmp_path):
 
 # ── P4-20: EFI via QEMU ───────────────────────────────────────────────────────
 
-_EFI_LOADER_SRC = TESTS_DIR / "EFI_x64" / "efi_loader" / "main.c"
-_EFI_HELLO_SRC  = TESTS_DIR / "EFI_x64" / "01_efi_hello" / "main.c"
+_EFI_LOADER_SRC = TESTS_DIR / "EFI" / "efi_loader" / "main.c"
+_EFI_HELLO_SRC  = TESTS_DIR / "EFI" / "01_efi_hello" / "main.c"
 
 _MINGW_CFLAGS_EFI = [
     "-nostdlib", "-nodefaultlibs", "-nostartfiles",
@@ -1243,8 +1268,8 @@ def _build_and_run_efi(tmp_path: Path, efi_src: Path, expected_stdout_substr: st
     return stdout
 
 
-_EFI_PRINT_SRC       = TESTS_DIR / "EFI_x64" / "02_efi_print"       / "main.c"
-_EFI_SIMPLE_CALC_SRC = TESTS_DIR / "EFI_x64" / "03_efi_simple_calc" / "main.c"
+_EFI_PRINT_SRC       = TESTS_DIR / "EFI" / "02_efi_print"       / "main.c"
+_EFI_SIMPLE_CALC_SRC = TESTS_DIR / "EFI" / "03_efi_simple_calc" / "main.c"
 
 
 def test_02_efi_print(tmp_path):
@@ -1275,7 +1300,8 @@ _LINUX_LOADER_CFLAGS_32 = [
     "-ldl",
 ]
 
-_LIBC_DEF_CONTENT_32 = "LIBRARY libc.so.6\nEXPORTS\nwrite\n"
+# LIBRARY line omitted: dlltool >=2.41 has a parsing bug with it; use -D flag instead.
+_LIBC_DEF_CONTENT_32 = "EXPORTS\nwrite\n"
 
 
 def _find_mingw_gcc_32():
@@ -1285,7 +1311,7 @@ def _find_mingw_gcc_32():
         return [gcc], False
     if platform.system() == "Windows":
         try:
-            r = _wsl_bash_run(f"which {gcc}", capture_output=True, timeout=10)
+            r = _wsl_bash_run(f"which {gcc}", capture_output=True, timeout=60)
             if r.returncode == 0:
                 return ["__wsl__"], True
         except (subprocess.TimeoutExpired, FileNotFoundError):
@@ -1310,8 +1336,8 @@ def _ensure_linux_loader_32(use_wsl: bool) -> "Path | None":
 
 
 def _build_linux_write_pe_32(tmp_path: Path, use_wsl: bool) -> "Path | None":
-    """Cross-compile tests/Linux_x86/01_linux_write/main.c as a PE32 with libc.so.6 import."""
-    src = TESTS_DIR / "Linux_x86" / "01_linux_write" / "main.c"
+    """Cross-compile tests/Linux/01_linux_write/main.c as a PE32 with libc.so.6 import."""
+    src = TESTS_DIR / "Linux" / "01_linux_write" / "main.c"
     if not src.exists():
         return None
 
@@ -1320,35 +1346,49 @@ def _build_linux_write_pe_32(tmp_path: Path, use_wsl: bool) -> "Path | None":
     imp_lib  = tmp_path / "liblibc_import32.a"
     def_file.write_text(_LIBC_DEF_CONTENT_32, encoding="ascii")
 
+    _GCC32 = "i686-w64-mingw32-gcc"
+    _DLLTOOL32 = "i686-w64-mingw32-dlltool"
+    _MAIN_STUB = "void __main(void) {}"
+
     if use_wsl:
         def_wsl = _win_path_to_wsl(def_file)
         imp_wsl = _win_path_to_wsl(imp_lib)
         src_wsl = _win_path_to_wsl(src)
         exe_wsl = _win_path_to_wsl(exe)
         r = _wsl_bash_run(
-            f"i686-w64-mingw32-dlltool -d {def_wsl} -l {imp_wsl}",
+            f"{_DLLTOOL32} -D {_LIBC_DLL_NAME} -d {def_wsl} -l {imp_wsl}",
             capture_output=True, timeout=30,
         )
         if r.returncode != 0:
             return None
         cc = _wsl_bash_run(
-            "i686-w64-mingw32-gcc " + " ".join(_MINGW_CFLAGS_LINUX)
-            + f" -Wl,-e,main -Wl,--subsystem,posix {src_wsl} {imp_wsl} -o {exe_wsl}",
+            f"printf '%s' '{_MAIN_STUB}' > /tmp/_peor_stub32.c"
+            f" && {_GCC32} " + " ".join(_MINGW_CFLAGS_LINUX)
+            + f" /tmp/_peor_stub32.c {src_wsl} {imp_wsl}"
+            f" -Wl,-e,main -Wl,--subsystem,posix -o {exe_wsl}",
             capture_output=True, timeout=30,
         )
     else:
         r = subprocess.run(
-            ["i686-w64-mingw32-dlltool", "-d", str(def_file), "-l", str(imp_lib)],
+            [_DLLTOOL32, "-D", _LIBC_DLL_NAME, "-d", str(def_file), "-l", str(imp_lib)],
             capture_output=True, timeout=30,
         )
         if r.returncode != 0:
             return None
-        cc = subprocess.run(
-            ["i686-w64-mingw32-gcc"] + _MINGW_CFLAGS_LINUX
-            + ["-Wl,-e,main", "-Wl,--subsystem,posix",
-               str(src), str(imp_lib), "-o", str(exe)],
-            capture_output=True, timeout=30,
-        )
+
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".c", mode="w", delete=False) as f:
+            f.write(_MAIN_STUB)
+            stub_file = f.name
+        try:
+            cc = subprocess.run(
+                [_GCC32] + _MINGW_CFLAGS_LINUX
+                + [stub_file, str(src), str(imp_lib),
+                   "-Wl,-e,main", "-Wl,--subsystem,posix", "-o", str(exe)],
+                capture_output=True, timeout=30,
+            )
+        finally:
+            Path(stub_file).unlink(missing_ok=True)
 
     if cc.returncode != 0 or not exe.exists():
         return None
@@ -1359,25 +1399,17 @@ def test_01_linux_write_x86(tmp_path):
     """x86 Linux import resolver: PE32 imports write() from libc.so.6; shellcode writes PEOR.
 
     Requires i686-w64-mingw32-gcc, dlltool, and a 32-bit Linux loader (gcc -m32).
-    Only runs on Linux (the 32-bit loader is a Linux ELF32).
+    On Windows, both compilation and execution run inside WSL.
     The PE is compiled with --subsystem posix so peor auto-selects the x86 Linux chain.
     The shellcode finds dlsym/dlopen by itself via /proc/self/maps + ELF32 scan.
     """
-    if platform.system() != "Linux":
-        pytest.skip("test_01_linux_write_x86 requires a Linux runner (loader is ELF32)")
-
-    loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux_32"
-    if not loader.exists():
-        pytest.skip(
-            "32-bit Linux test loader not found — "
-            "build with: gcc -m32 -O2 -ffixed-ebx -ffixed-esi -ffixed-edi -ldl "
-            "-o tests/test_loader_linux/test_loader_linux_32 "
-            "tests/test_loader_linux/main.c"
-        )
-
     mingw_cmd, use_wsl = _find_mingw_gcc_32()
     if mingw_cmd is None:
-        pytest.skip("i686-w64-mingw32-gcc not found")
+        pytest.skip("i686-w64-mingw32-gcc not found (native PATH or WSL)")
+
+    loader = _ensure_linux_loader_32(use_wsl)
+    if loader is None:
+        pytest.skip("32-bit Linux test loader not found and could not be built via WSL")
 
     exe = _build_linux_write_pe_32(tmp_path, use_wsl)
     if exe is None:
@@ -1386,7 +1418,15 @@ def test_01_linux_write_x86(tmp_path):
     sc = tmp_path / "linux_write_x86.bin"
     _shellcodify_platform(exe, sc, _PLATFORM_LINUX)
 
-    result = subprocess.run([str(loader), str(sc)], capture_output=True, timeout=15)
+    if use_wsl:
+        sc_wsl = _win_path_to_wsl(sc)
+        loader_wsl = _win_path_to_wsl(loader)
+        result = subprocess.run(
+            ["wsl", "--", loader_wsl, sc_wsl], capture_output=True, timeout=15
+        )
+    else:
+        result = subprocess.run([str(loader), str(sc)], capture_output=True, timeout=15)
+
     assert result.returncode == 0, (
         f"[linux_write x86] loader crashed with code {result.returncode}\n"
         f"stderr: {result.stderr.decode(errors='replace')}"
@@ -1404,7 +1444,7 @@ def test_efi_x86_shellcode_conversion(tmp_path):
     shellcode.  No QEMU run (IA32 OVMF is not required for this conversion test).
     Requires i686-w64-mingw32-gcc natively or via WSL.
     """
-    efi_src = TESTS_DIR / "EFI_x32" / "01_efi_hello" / "main.c"
+    efi_src = TESTS_DIR / "EFI" / "01_efi_hello" / "main.c"
     if not efi_src.exists():
         pytest.skip(f"source not found: {efi_src}")
 

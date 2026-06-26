@@ -34,7 +34,7 @@
 %define SYS_READ                    0x00
 %define SYS_CLOSE                   0x03
 %define SYS_OPENAT                  0x101
-%define AT_FDCWD                    -100
+%define AT_FDCWD                    -0x64
 %define O_RDONLY                    0x00
 %define RTLD_DEFAULT                0x00
 %define RTLD_LAZY                   0x01
@@ -70,10 +70,10 @@
 %define IMPORT_DESC_FT_RVA_OFF      0x10
 
 ; String offsets from embedded table base (R15)
-%define STR_PROC_SELF_MAPS          0
-%define STR_DLOPEN                  16
-%define STR_DLSYM                   23
-%define STR_LIBC_SO                 29
+%define STR_PROC_SELF_MAPS          0x00
+%define STR_DLOPEN                  0x10
+%define STR_DLSYM                   0x17
+%define STR_LIBC_SO                 0x1D
 
     push rbp
     push rbx
@@ -423,7 +423,10 @@ _thunk_loop:
     add rax, IMPORT_BY_NAME_HINT_SIZE
     mov rsi, rax
     mov rdi, rbx
+    ; RSP is 8 mod 16 here (IAT ptr on stack); SysV requires 0 mod 16 before call.
+    sub rsp, 0x08
     call r13                    ; dlsym(handle, name)
+    add rsp, 0x08
     jmp _save_fn
 _ordinal:
     xor eax, eax                ; dlsym has no ordinal API; resolve to NULL

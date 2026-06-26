@@ -1,19 +1,29 @@
 /*
  * EFI print test - prints "PEOR_EFI_HELLO\r\n" via ConOut->OutputString.
- * Requires a real EFI_SYSTEM_TABLE pointer (passed by the updated efi_loader).
+ * Requires a real EFI_SYSTEM_TABLE pointer from the entrypoint resolver.
  *
- * Compile:
+ * Supports x64 (PE32+, amd64) and x86 (PE32, IA-32).
+ * EFI_SYSTEM_TABLE layout differs per arch: ConOut at 0x40 (x64) or 0x2C (x86).
+ *
+ * Compile (x64):
  *   x86_64-w64-mingw32-gcc -nostdlib -nodefaultlibs -nostartfiles \
  *     -fno-unwind-tables -fno-asynchronous-unwind-tables \
- *     -Wl,-e,efi_main -Wl,--subsystem,efi_application \
- *     -o 02_efi_print.efi main.c
+ *     -Wl,-e,efi_main -Wl,--subsystem,efi_application -o 02_efi_print.efi main.c
  */
 
+#ifdef _WIN64
 typedef unsigned long long EFI_STATUS;
-typedef unsigned short     CHAR16;
-
-#define EFI_SUCCESS ((EFI_STATUS)0)
+/* x64 EFI_SYSTEM_TABLE layout (64-bit pointers, UEFI spec 2.x) */
 #define EFI_SYSTEM_TABLE_CONOUT_OFFSET           0x40
+#else
+typedef unsigned int EFI_STATUS;
+/* x86 EFI_SYSTEM_TABLE layout (32-bit pointers) */
+#define EFI_SYSTEM_TABLE_CONOUT_OFFSET           0x2C
+#endif
+
+typedef unsigned short CHAR16;
+
+#define EFI_SUCCESS                              ((EFI_STATUS)0)
 #define EFI_SIMPLE_TEXT_OUTPUT_OUTPUT_STRING_OFF 0x08
 
 static const CHAR16 MSG[] = {

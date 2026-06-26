@@ -16,40 +16,83 @@
 
 %define EP_RVA_MAGIC                    0xcececece
 
-%define EFI_SYSTEM_TABLE_SIGNATURE_LO   0x20494249
-%define EFI_SYSTEM_TABLE_SIGNATURE_HI   0x54535953
-%define EFI_HDR_REVISION_OFFSET         0x08
-%define EFI_HDR_HEADER_SIZE_OFFSET      0x0C
-%define EFI_REVISION_MIN                0x00020000
-%define EFI_HEADER_SIZE_MIN             0x78
+%define EFI_SYSTEM_TABLE_SIGNATURE_LO           0x20494249
+%define EFI_SYSTEM_TABLE_SIGNATURE_HI           0x54535953
+%define EFI_HDR_REVISION_OFFSET                 0x08
+%define EFI_HDR_HEADER_SIZE_OFFSET              0x0C
+%define EFI_REVISION_MIN                        0x00020000
+; x86 EFI_SYSTEM_TABLE is 0x48 bytes (32-bit pointers)
+%define EFI_HEADER_SIZE_MIN                     0x48
 
-%define SCAN_START                      0x10000
-%define SCAN_END                        0x10000000
-%define PAGE_SIZE                       0x1000
+; EFI_SYSTEM_TABLE.BootServices is at offset 0x3C in IA-32 layout (32-bit pointers)
+%define EFI_SYSTEM_TABLE_BOOT_SERVICES_OFFSET   0x3C
 
-    ; Scan page-aligned memory for EFI_SYSTEM_TABLE_SIGNATURE
-    mov esi, SCAN_START         ; ESI = current scan page
+%define EFI_BOOT_SERVICES_SIGNATURE_LO          0x544f4f42
+%define EFI_BOOT_SERVICES_SIGNATURE_HI          0x56524553
+
+%define SCAN_START                              0x10000
+%define SCAN_END                                0x10000000
+%define EFI_POOL_ALIGN                          0x10
+
+; EFI_SYSTEM_TABLE field offsets (x86 layout, 32-bit pointers)
+%define EFI_SYSTEM_TABLE_CONOUT_OFFSET_32       0x2C
+; EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL field offsets (same for both arches)
+%define EFI_SIMPLE_TEXT_OUTPUT_OUTPUT_STRING_OFF 0x08
+; Minimum address for valid EFI firmware code pointers (below 1 MB = low/BIOS memory)
+%define EFI_FIRMWARE_ADDR_MIN                   0x100000
+; NULL ImageHandle to pass when invoking efi_main from self-contained shellcode
+%define EFI_NULL_IMAGE_HANDLE                   0
+
+    ; Scan top-down at 16-byte granularity; EDK2 places system table near top of RAM.
+    ; Validate BootServices pointer to reject false positives.
+    mov esi, SCAN_END
+    sub esi, EFI_POOL_ALIGN     ; start at last valid 16-byte address
 
 _scan_loop32:
-    cmp esi, SCAN_END
-    jae _scan_done32
+    cmp esi, SCAN_START
+    jb _scan_done32
+    ; Step 1: EFI_SYSTEM_TABLE signature check
     cmp dword [esi], EFI_SYSTEM_TABLE_SIGNATURE_LO
     jne _scan_next32
     cmp dword [esi + 4], EFI_SYSTEM_TABLE_SIGNATURE_HI
     jne _scan_next32
+    ; Step 2: Revision and HeaderSize
     cmp dword [esi + EFI_HDR_REVISION_OFFSET], EFI_REVISION_MIN
     jb _scan_next32
     cmp dword [esi + EFI_HDR_HEADER_SIZE_OFFSET], EFI_HEADER_SIZE_MIN
     jb _scan_next32
-    jmp _scan_done32            ; ESI = valid SystemTable pointer
+    ; Step 3: validate BootServices pointer within scan range
+    mov edi, dword [esi + EFI_SYSTEM_TABLE_BOOT_SERVICES_OFFSET]
+    test edi, edi
+    jz _scan_next32
+    cmp edi, SCAN_START
+    jb _scan_next32
+    cmp edi, SCAN_END
+    jae _scan_next32
+    ; Step 4: verify BootServices starts with EFI_BOOT_SERVICES signature
+    cmp dword [edi], EFI_BOOT_SERVICES_SIGNATURE_LO
+    jne _scan_next32
+    cmp dword [edi + 4], EFI_BOOT_SERVICES_SIGNATURE_HI
+    jne _scan_next32
+    ; Step 5: validate ConOut->OutputString is above EFI_FIRMWARE_ADDR_MIN
+    mov eax, dword [esi + EFI_SYSTEM_TABLE_CONOUT_OFFSET_32]
+    test eax, eax
+    jz _scan_next32
+    cmp eax, SCAN_START
+    jb _scan_next32
+    cmp eax, SCAN_END
+    jae _scan_next32
+    mov eax, dword [eax + EFI_SIMPLE_TEXT_OUTPUT_OUTPUT_STRING_OFF]
+    cmp eax, EFI_FIRMWARE_ADDR_MIN
+    jb _scan_next32
+    jmp _scan_done32            ; ESI = valid SystemTable
 _scan_next32:
-    add esi, PAGE_SIZE
+    sub esi, EFI_POOL_ALIGN
     jmp _scan_loop32
 _scan_done32:
-    ; ESI = SystemTable VA (or SCAN_END if not found -> pass as-is, efi_main should handle NULL)
-    cmp esi, SCAN_END
-    jb _have_st32
-    xor esi, esi                ; pass NULL if not found
+    cmp esi, SCAN_START
+    jae _have_st32
+    xor esi, esi                ; not found: pass NULL
 _have_st32:
 
     ; Compute entry point
@@ -58,7 +101,7 @@ _have_st32:
 
     ; Call efi_main(NULL, SystemTable) - IA-32 cdecl: right-to-left push
     push esi                    ; arg2: SystemTable
-    push 0                      ; arg1: ImageHandle = NULL
+    push EFI_NULL_IMAGE_HANDLE  ; arg1: ImageHandle = NULL
     call eax
     add esp, 8                  ; cdecl caller cleanup
     ret

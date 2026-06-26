@@ -70,7 +70,7 @@ Use `--platform` to override detection; use `--no-imports` to skip import resolv
 The shellcode is executed by any loader that allocates executable memory, copies the binary
 in, and calls it (e.g. `VirtualAlloc` + `memcpy` + `call`).
 Reference loaders are in `tests/test_loader/` (Windows) and `tests/test_loader_linux/`
-(Linux; passes `dlopen`/`dlsym` as the first two arguments for the Linux import chain).
+(Linux; calls the shellcode with zero arguments — it is fully self-contained).
 
 ---
 
@@ -488,5 +488,4 @@ and the native `test_loader.exe` for execution.
 | EFI application (subsystems 10–13) | ✅ | ✅ |
 | Windows kernel driver | ❌ | ❌ |
 
-Linux and EFI shellcodes are x64-only.  Attempting to convert unsupported
-combinations raises `ValueError` with a descriptive message.
+Attempting to convert unsupported combinations raises `ValueError` with a descriptive message.

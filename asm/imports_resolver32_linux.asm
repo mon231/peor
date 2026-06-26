@@ -44,10 +44,10 @@
 %define ORDINAL_FLAG32              0x80000000
 
 ; String offsets from embedded table base
-%define STR_PROC_SELF_MAPS          0
-%define STR_DLOPEN                  16
-%define STR_DLSYM                   23
-%define STR_LIBC_SO                 29
+%define STR_PROC_SELF_MAPS          0x00
+%define STR_DLOPEN                  0x10
+%define STR_DLSYM                   0x17
+%define STR_LIBC_SO                 0x1D
 
     push ebp
     push ebx

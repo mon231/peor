@@ -88,6 +88,7 @@ Reference loaders are in `tests/test_loader/` (Windows) and `tests/test_loader_l
 │ │ [C++ EH IAT fixer]   (x64, if needed)            │ │
 │ │ [SEH registrar]      (x86 always, x64 if .pdata) │ │
 │ │ [TLS callback invoker] (ThreadLocalStorage init) │ │
+│ │ [.init_array runner]   (EFI/Linux, if present)   │ │
 │ │ entry point dispatcher                           │ │
 │ └──────────────────────────────────────────────────┘ │
 │  memory-mapped PE image (headers + sections, padded) │
@@ -350,6 +351,30 @@ running as shellcode, the OS is not involved, so PEOR must invoke them manually.
 
 This stub is only inserted when the TLS directory is present and
 `AddressOfCallBacks` is non-zero.
+
+---
+
+### `.init_array` Constructor Runner (EFI and Linux)
+
+GCC-compiled C++ binaries register C++ global constructors — and the GCC
+exception-handling runtime's frame tables — via function pointers stored in the
+`.init_array` (or `.ctors`) section.  On EFI and Linux shellcode chains, the OS
+loader is bypassed entirely, so PEOR must call these constructors manually before
+the entry point.
+
+`ctors_runner32/64.asm`:
+1. Compute `start = PE_base + .init_array RVA` and `end = start + size`.
+2. Walk the array; for each non-null function pointer, call it.
+3. Preserve `RBX`/`EBX` (PE base) and RSP alignment across all calls.
+
+The RVA and size are baked in at conversion time by `peor/__main__.py`, replacing
+placeholder constants `CTORS_SECTION_RVA` / `CTORS_SECTION_SIZE` in the assembled
+bytes.  This stub is only inserted when the PE contains a `.init_array` or `.ctors`
+section with non-zero virtual size.
+
+**Native C++ exceptions** — EFI and Linux shellcodes support C++ `try/catch` via the
+GCC exception-handling runtime; `peor` runs `.init_array` constructors (including EH
+frame registration) before the entry point.
 
 ---
 

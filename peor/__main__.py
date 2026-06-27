@@ -13,6 +13,7 @@ from peor._shellcodes import (
     SEH_REGISTRAR_32, SEH_REGISTRAR_64,
     TLS_CALLBACKS_32, TLS_CALLBACKS_64,
     CXX_EH_FIXER_64,
+    CTORS_RUNNER_64, CTORS_RUNNER_32,
 )
 
 # PE Optional Header Data Directory indices (PECOFF spec §3.4)
@@ -45,6 +46,11 @@ _CXX_EH_IAT_RVA_MAGIC_64 = b'\x21\x43\x65\x87'  # 0x87654321 LE (in LEA RDX, [RB
 # Magic placeholder in entrypoint_resolver{32,64}.asm for AddressOfEntryPoint RVA.
 # peor patches this to the actual OEP RVA (or a named-export RVA for --entry).
 _EP_RVA_MAGIC = b'\xce\xce\xce\xce'  # 0xCECECECE LE (in MOV EAX, imm32)
+
+# Magic placeholders in ctors_runner{32,64}.asm for .init_array section RVA and size.
+# Patched at conversion time when a .init_array or .ctors section is found.
+_CTORS_RVA_MAGIC  = b'\xfd\xfc\xfb\xfa'   # 0xFAFBFCFD LE
+_CTORS_SIZE_MAGIC = b'\xe4\xe3\xe2\xe1'   # 0xE1E2E3E4 LE
 
 # Maximum signed 32-bit displacement for the LEA disp32 field in the relocs resolver.
 _MAX_SHELLCODE_DISP32 = 0x7FFFFFFF
@@ -110,6 +116,9 @@ _SHELLCODES = {
         'seh':               b'',
         'seh_always':        False,
         'tls':               b'',
+        'ctors':             CTORS_RUNNER_64,
+        'ctors_rva_magic':   _CTORS_RVA_MAGIC,
+        'ctors_size_magic':  _CTORS_SIZE_MAGIC,
         'tail':              _IMPORTS_TAIL_64,
         'dir_array_offset':  112,
         'disp32_off':        9,
@@ -125,6 +134,9 @@ _SHELLCODES = {
         'seh':               b'',
         'seh_always':        False,
         'tls':               b'',
+        'ctors':             CTORS_RUNNER_32,
+        'ctors_rva_magic':   _CTORS_RVA_MAGIC,
+        'ctors_size_magic':  _CTORS_SIZE_MAGIC,
         'tail':              _IMPORTS_TAIL_32,
         'dir_array_offset':  96,
         'disp32_off':        8,
@@ -140,6 +152,9 @@ _SHELLCODES = {
         'seh':               b'',
         'seh_always':        False,
         'tls':               b'',
+        'ctors':             CTORS_RUNNER_64,
+        'ctors_rva_magic':   _CTORS_RVA_MAGIC,
+        'ctors_size_magic':  _CTORS_SIZE_MAGIC,
         'tail':              _IMPORTS_TAIL_64,
         'dir_array_offset':  112,
         'disp32_off':        9,
@@ -155,6 +170,9 @@ _SHELLCODES = {
         'seh':               b'',
         'seh_always':        False,
         'tls':               b'',
+        'ctors':             CTORS_RUNNER_32,
+        'ctors_rva_magic':   _CTORS_RVA_MAGIC,
+        'ctors_size_magic':  _CTORS_SIZE_MAGIC,
         'tail':              _IMPORTS_TAIL_32,
         'dir_array_offset':  96,
         'disp32_off':        8,
@@ -238,6 +256,17 @@ def _find_export_rva(pe: PE, name_or_ordinal: str) -> int:
     raise ValueError(f"Export '{name_or_ordinal}' not found in PE")
 
 
+def _find_ctors_section(pe: PE) -> "tuple[int, int] | None":
+    """Return (rva, size) of .init_array or .ctors section, or None if absent."""
+    for section in pe.sections:
+        name = section.Name.rstrip(b'\x00')
+        if name in (b'.init_array', b'.ctors'):
+            size = section.Misc_VirtualSize
+            if size > 0:
+                return section.VirtualAddress, size
+    return None
+
+
 def _validate_pe(pe: PE, platform: str | None = None) -> dict:
     """Return the shellcode-chain entry dict for pe, or raise ValueError.
 
@@ -303,7 +332,7 @@ def _zero_import_dir(ram_layout: bytearray, pe: PE, entry: dict) -> None:
 
 def _build_shellcode_chain(pe: PE, entry: dict, skip_imports: bool = False,
                             override_ep_rva: int | None = None) -> bytes:
-    # Chain order: [imports] → relocs → [delay_imports] → [cxx_eh_fixer] → [seh] → [tls] → entrypoint → [pad]
+    # Chain order: [imports] → relocs → [delay_imports] → [cxx_eh_fixer] → [seh] → [tls] → [ctors] → entrypoint → [pad]
     # delay_imports runs AFTER relocs so the relocs resolver doesn't overwrite the patched delay-load IAT
     # (delay-load IAT slots have DIR64 relocations; running delay_imports before relocs would get clobbered).
     # imports: skipped when skip_imports=True or when the PE has no import directory.
@@ -338,6 +367,26 @@ def _build_shellcode_chain(pe: PE, entry: dict, skip_imports: bool = False,
     else:
         cxx_fixer = b''
 
+    # ctors runner: only for Linux and EFI chains (entry has 'ctors' key) and only when
+    # the PE has a .init_array or .ctors section.  Patch the RVA and size magic values.
+    ctors_info = _find_ctors_section(pe) if entry.get('ctors') is not None else None
+    if ctors_info is not None:
+        ctors_rva, ctors_sz = ctors_info
+        ctors_bytes = bytearray(entry['ctors'])
+        rva_magic  = entry['ctors_rva_magic']
+        size_magic = entry['ctors_size_magic']
+        if ctors_bytes.count(rva_magic) != 1:
+            raise RuntimeError(f"CTORS_RVA_MAGIC {rva_magic.hex()} not unique in ctors runner")
+        if ctors_bytes.count(size_magic) != 1:
+            raise RuntimeError(f"CTORS_SIZE_MAGIC {size_magic.hex()} not unique in ctors runner")
+        idx = ctors_bytes.find(rva_magic)
+        ctors_bytes[idx:idx + 4] = struct.pack('<I', ctors_rva)
+        idx = ctors_bytes.find(size_magic)
+        ctors_bytes[idx:idx + 4] = struct.pack('<I', ctors_sz)
+        ctors = bytes(ctors_bytes)
+    else:
+        ctors = b''
+
     # Patch the EP RVA magic in the entrypoint resolver.
     ep_rva = override_ep_rva if override_ep_rva is not None else pe.OPTIONAL_HEADER.AddressOfEntryPoint
     ep_magic = entry.get('ep_rva_magic', b'')
@@ -351,14 +400,14 @@ def _build_shellcode_chain(pe: PE, entry: dict, skip_imports: bool = False,
     # PE image must be 16-byte aligned in the buffer for MOVDQA/MOVAPS safety.
     align_pad = (
         -len(imports) - len(relocs) - len(delay_imports)
-        - len(cxx_fixer) - len(seh) - len(tls) - len(entrypoint)
+        - len(cxx_fixer) - len(seh) - len(tls) - len(ctors) - len(entrypoint)
     ) % 16
 
     # Patch the disp32 in the relocs resolver.
     # setup.py bakes in disp32 = len(relocs_assembled) - 5 (PE follows relocs standalone).
     # We add the remaining shellcodes + alignment padding that come after relocs.
     # delay_imports comes after relocs so it is included in extra.
-    extra    = len(delay_imports) + len(cxx_fixer) + len(seh) + len(tls) + len(entrypoint) + align_pad
+    extra    = len(delay_imports) + len(cxx_fixer) + len(seh) + len(tls) + len(ctors) + len(entrypoint) + align_pad
     off      = entry['disp32_off']
     relocs   = bytearray(relocs)
     old      = int.from_bytes(relocs[off:off + 4], 'little')
@@ -371,7 +420,7 @@ def _build_shellcode_chain(pe: PE, entry: dict, skip_imports: bool = False,
     relocs[off:off + 4] = new_disp.to_bytes(4, 'little')
 
     return (imports + bytes(relocs) + delay_imports + cxx_fixer + seh
-            + tls + entrypoint + (b'\x90' * align_pad))
+            + tls + ctors + entrypoint + (b'\x90' * align_pad))
 
 
 def _shellcode_info(pe: PE, entry: dict, skip_imports: bool = False) -> dict:
@@ -391,13 +440,16 @@ def _shellcode_info(pe: PE, entry: dict, skip_imports: bool = False) -> dict:
     else:
         cxx_fixer = b''
 
+    ctors_info = _find_ctors_section(pe) if entry.get('ctors') is not None else None
+    ctors = entry['ctors'] if ctors_info is not None else b''
+
     align_pad = (
         -len(imports) - len(relocs) - len(delay_imports)
-        - len(cxx_fixer) - len(seh) - len(tls) - len(entrypoint)
+        - len(cxx_fixer) - len(seh) - len(tls) - len(ctors) - len(entrypoint)
     ) % 16
     pe_image_size = pe.OPTIONAL_HEADER.SizeOfImage
     total         = (len(imports) + len(relocs) + len(delay_imports) + len(cxx_fixer)
-                     + len(seh) + len(tls) + len(entrypoint) + align_pad + pe_image_size)
+                     + len(seh) + len(tls) + len(ctors) + len(entrypoint) + align_pad + pe_image_size)
 
     return {
         'imports':       len(imports)       if imports       else None,
@@ -406,6 +458,7 @@ def _shellcode_info(pe: PE, entry: dict, skip_imports: bool = False) -> dict:
         'cxx_eh':        len(cxx_fixer)     if cxx_fixer     else None,
         'seh':           len(seh)           if seh           else None,
         'tls':           len(tls)           if tls           else None,
+        'ctors':         len(ctors)         if ctors         else None,
         'entrypoint':    len(entrypoint),
         'align_pad':     align_pad          if align_pad     else None,
         'PE image':      pe_image_size,

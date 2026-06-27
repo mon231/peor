@@ -747,7 +747,7 @@ def _ensure_linux_loader(use_wsl: bool) -> "Path | None":
     Builds it inside WSL if it does not yet exist and WSL is available.
     The binary lands in tests/test_loader_linux/ so subsequent runs reuse it.
     """
-    loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux.elf"
+    loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux.pe"
     if loader.exists():
         return loader
     src = TESTS_DIR / "test_loader_linux" / "main.c"
@@ -853,12 +853,12 @@ def test_mingw_simple_calc(arch, tmp_path):
     else:
         # Native Linux or Linux CI: use the Linux test_loader (built with
         # -ffixed-rbx so GCC doesn't rely on callee-saved regs the shellcode clobbers).
-        loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux.elf"
+        loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux.pe"
         if not loader.exists():
             pytest.skip(
                 "Linux test_loader not found — "
                 "build with: gcc -O2 -ffixed-rbx -ffixed-r12 -ffixed-r13 "
-                "-ffixed-r14 -ffixed-r15 -o tests/test_loader_linux/test_loader_linux.elf "
+                "-ffixed-r14 -ffixed-r15 -o tests/test_loader_linux/test_loader_linux.pe "
                 "tests/test_loader_linux/main.c"
             )
         result = subprocess.run([str(loader), str(sc)], capture_output=True, timeout=10)
@@ -1042,6 +1042,59 @@ def test_01_linux_write(arch, tmp_path):
     stdout = result.stdout.decode(errors="replace")
     assert "PEOR\n" in stdout, (
         f"[linux_write {arch}] expected 'PEOR\\n' in stdout, got {stdout!r}"
+    )
+
+
+_LINUX_CPP_EXCEPTIONS_SRC = TESTS_DIR / "Linux" / "02_linux_cpp_exceptions" / "main.cpp"
+
+
+@pytest.mark.parametrize("arch", ["x64", "x86"])
+def test_02_linux_cpp_exceptions(arch, tmp_path):
+    """Linux C++ shellcode: throws and catches a custom type; main returns 42.
+
+    The PE is compiled with posix-threading g++ (DWARF-2 or SJLJ) so exceptions
+    are self-contained.  peor's ctors runner initialises the GCC EH runtime before
+    main runs.  The Linux loader prints the return value; test checks stdout == '42'.
+    Tested for x64 and x86.
+    """
+    if arch == "x64":
+        gpp_cmd, use_wsl = _find_mingw_gpp_posix()
+        gpp_skip = "x86_64-w64-mingw32-g++-posix not found (install g++-mingw-w64-x86-64)"
+        loader = _ensure_linux_loader(use_wsl)
+    else:
+        gpp_cmd, use_wsl = _find_mingw_gpp_posix_32()
+        gpp_skip = "i686-w64-mingw32-g++-posix not found (install g++-mingw-w64-i686)"
+        loader = _ensure_linux_loader_32(use_wsl)
+
+    if gpp_cmd is None:
+        pytest.skip(gpp_skip)
+    if loader is None:
+        pytest.skip("Linux test_loader not found and could not be built")
+
+    exe = tmp_path / f"linux_cpp_except_{arch}.pe"
+    cc = _compile_cpp_pe(_LINUX_CPP_EXCEPTIONS_SRC, exe, use_wsl, "main", "posix", arch=arch)
+    assert cc.returncode == 0, (
+        f"[linux_cpp {arch}] compile failed:\n{cc.stderr.decode(errors='replace')}"
+    )
+
+    sc = tmp_path / f"linux_cpp_except_{arch}.bin"
+    _shellcodify_platform(exe, sc, _PLATFORM_LINUX)
+
+    if use_wsl:
+        sc_wsl     = _win_path_to_wsl(sc)
+        loader_wsl = _win_path_to_wsl(loader)
+        result = subprocess.run(["wsl", "--", loader_wsl, sc_wsl], capture_output=True, timeout=15)
+    else:
+        result = subprocess.run([str(loader), str(sc)], capture_output=True, timeout=15)
+
+    assert result.returncode == 0, (
+        f"[linux_cpp {arch}] loader crashed with code {result.returncode}\n"
+        f"stderr: {result.stderr.decode(errors='replace')}"
+    )
+    stdout = result.stdout.decode(errors="replace").strip()
+    assert stdout == "42", (
+        f"[linux_cpp {arch}] expected stdout '42', got {stdout!r}\n"
+        f"stderr: {result.stderr.decode(errors='replace')}"
     )
 
 
@@ -1266,6 +1319,88 @@ def test_03_efi_simple_calc(arch, tmp_path):
                         arch=arch)
 
 
+_EFI_CPP_EXCEPTIONS_SRC = TESTS_DIR / "EFI" / "04_cpp_exceptions" / "main.cpp"
+
+
+@pytest.mark.parametrize("arch", ["x64", "x86"])
+def test_04_efi_cpp_exceptions(arch, tmp_path):
+    """EFI C++ shellcode: throws and catches a custom type; prints PEOR_CPP_EH_OK on success.
+
+    Requires g++-posix (DWARF-2 or SJLJ exceptions) and peor's ctors runner to initialise
+    the GCC EH runtime before efi_main runs.  Tested for x64 and x86.
+    """
+    if arch == "x64":
+        gpp_cmd, use_wsl = _find_mingw_gpp_posix()
+        gpp_skip = "x86_64-w64-mingw32-g++-posix not found (install g++-mingw-w64-x86-64)"
+    else:
+        gpp_cmd, use_wsl = _find_mingw_gpp_posix_32()
+        gpp_skip = "i686-w64-mingw32-g++-posix not found (install g++-mingw-w64-i686)"
+
+    if gpp_cmd is None:
+        pytest.skip(gpp_skip)
+
+    qemu, ovmf_code, ovmf_vars = _find_qemu_ovmf(arch)
+    if qemu is None:
+        pytest.skip(f"qemu not found for arch={arch}")
+    if ovmf_code is None:
+        pytest.skip(f"OVMF firmware not found for arch={arch}")
+
+    efi_pe = tmp_path / "04_efi_cpp.efi"
+    cc = _compile_cpp_pe(_EFI_CPP_EXCEPTIONS_SRC, efi_pe, use_wsl, "efi_main", "10", arch=arch)
+    assert cc.returncode == 0, (
+        f"EFI C++ PE compile failed:\n{cc.stderr.decode(errors='replace')}"
+    )
+
+    sc = tmp_path / "04_efi_cpp.bin"
+    _shellcodify(efi_pe, sc)
+
+    sc_bytes = sc.read_bytes()
+    hex_bytes = ", ".join(f"0x{b:02x}" for b in sc_bytes)
+    header = (
+        f"static const unsigned char SHELLCODE_BYTES[] = {{{hex_bytes}}};\n"
+        f"static const unsigned long long SHELLCODE_SIZE = {len(sc_bytes)}ULL;\n"
+    )
+    header_path = tmp_path / "shellcode_data.h"
+    header_path.write_text(header, encoding="ascii")
+
+    loader_efi = tmp_path / "efi_loader.efi"
+    cc = _compile_efi_pe(_EFI_LOADER_SRC, loader_efi, tmp_path, "efi_loader_main", use_wsl, arch=arch)
+    assert cc.returncode == 0, (
+        f"EFI loader compile failed:\n{cc.stderr.decode(errors='replace')}"
+    )
+
+    boot_dir = tmp_path / "efi_boot"
+    _make_efi_boot_dir(loader_efi, boot_dir, arch)
+
+    ovmf_vars_rw = tmp_path / "OVMF_VARS.fd"
+    if ovmf_vars:
+        shutil.copy2(ovmf_vars, ovmf_vars_rw)
+    else:
+        ovmf_vars_rw.write_bytes(b'\x00' * (540 * 1024))
+
+    qemu_cmd = [
+        qemu, "-nographic", "-machine", "q35",
+        "-drive", f"if=pflash,format=raw,readonly=on,file={ovmf_code}",
+        "-drive", f"if=pflash,format=raw,file={ovmf_vars_rw}",
+        "-drive", f"format=vvfat,file=fat:rw:{boot_dir},if=ide,fat-type=16",
+        "-m", "256M", "-no-reboot",
+    ]
+    try:
+        result = subprocess.run(qemu_cmd, capture_output=True, timeout=90)
+    except subprocess.TimeoutExpired:
+        pytest.fail("QEMU timed out for EFI C++ exceptions test")
+
+    stdout = result.stdout.decode(errors="replace")
+    assert result.returncode == 0, (
+        f"[efi_cpp {arch}] QEMU exited {result.returncode} (expected 0 = clean shutdown)\n"
+        f"stdout: {stdout[:2000]}\nstderr: {result.stderr.decode(errors='replace')[:500]}"
+    )
+    assert "PEOR_CPP_EH_OK" in stdout, (
+        f"[efi_cpp {arch}] PEOR_CPP_EH_OK not in QEMU stdout — exception not caught\n"
+        f"stdout: {stdout[:2000]}"
+    )
+
+
 # ── P4: x86 Linux user-mode ───────────────────────────────────────────────────
 
 
@@ -1295,9 +1430,96 @@ def _find_mingw_gcc_32():
     return None, None
 
 
+def _find_mingw_gpp_posix() -> "tuple[list | None, bool | None]":
+    """Return ([cmd], use_wsl) for x86_64-w64-mingw32-g++-posix, or (None, None)."""
+    gpp = "x86_64-w64-mingw32-g++-posix"
+    if shutil.which(gpp):
+        return [gpp], False
+    if platform.system() == "Windows":
+        try:
+            r = _wsl_bash_run(f"which {gpp}", capture_output=True, timeout=60)
+            if r.returncode == 0:
+                return ["__wsl__"], True
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+    return None, None
+
+
+def _find_mingw_gpp_posix_32() -> "tuple[list | None, bool | None]":
+    """Return ([cmd], use_wsl) for i686-w64-mingw32-g++-posix, or (None, None)."""
+    gpp = "i686-w64-mingw32-g++-posix"
+    if shutil.which(gpp):
+        return [gpp], False
+    if platform.system() == "Windows":
+        try:
+            r = _wsl_bash_run(f"which {gpp}", capture_output=True, timeout=60)
+            if r.returncode == 0:
+                return ["__wsl__"], True
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+    return None, None
+
+
+def _gpp_crt_files(gpp: str, use_wsl: bool) -> "tuple[str, str]":
+    """Return (crtbegin_path, crtend_path) for the given g++ compiler.
+
+    Returns empty strings if not found (e.g. SJLJ builds that don't need them).
+    """
+    def _query(name):
+        if use_wsl:
+            r = _wsl_bash_run(f"{gpp} -print-file-name={name}", capture_output=True, timeout=10)
+        else:
+            r = subprocess.run([gpp, f"-print-file-name={name}"], capture_output=True, timeout=10)
+        if r.returncode != 0:
+            return ""
+        path = r.stdout.decode(errors="replace").strip()
+        return path if path != name else ""  # compiler returns bare name when not found
+
+    return _query("crtbegin.o"), _query("crtend.o")
+
+
+_MINGW_CPP_EH_FLAGS = ["-fexceptions", "-nostartfiles", "-nodefaultlibs"]
+_MINGW_CPP_STATIC_LIBS = ["-lgcc_eh", "-lsupc++", "-lgcc"]
+
+
+def _compile_cpp_pe(gcc_src: Path, out: Path, use_wsl: bool,
+                    entry: str, subsystem: str, *, arch: str = "x64") -> subprocess.CompletedProcess:
+    """Compile a C++ source file to a Windows PE with GCC exception support.
+
+    Uses the -posix threading variant (DWARF-2 or SJLJ) and explicitly includes
+    crtbegin.o / crtend.o for DWARF EH frame registration.
+    """
+    gpp = ("x86_64-w64-mingw32-g++-posix" if arch == "x64"
+           else "i686-w64-mingw32-g++-posix")
+
+    crtbegin, crtend = _gpp_crt_files(gpp, use_wsl)
+
+    if use_wsl:
+        src_wsl = _win_path_to_wsl(gcc_src)
+        out_wsl = _win_path_to_wsl(out)
+        flags = " ".join(_MINGW_CPP_EH_FLAGS)
+        static_libs = " ".join(_MINGW_CPP_STATIC_LIBS)
+        cmd = (f"{gpp} {flags} {crtbegin} {src_wsl} {crtend}"
+               f" {static_libs} -Wl,-e,{entry} -Wl,--subsystem,{subsystem}"
+               f" -o {out_wsl}")
+        return _wsl_bash_run(cmd, capture_output=True, timeout=60)
+    else:
+        cmd = [gpp] + _MINGW_CPP_EH_FLAGS
+        if crtbegin:
+            cmd.append(crtbegin)
+        cmd.append(str(gcc_src))
+        if crtend:
+            cmd.append(crtend)
+        cmd += _MINGW_CPP_STATIC_LIBS + [
+            f"-Wl,-e,{entry}", f"-Wl,--subsystem,{subsystem}",
+            "-o", str(out),
+        ]
+        return subprocess.run(cmd, capture_output=True, timeout=60)
+
+
 def _ensure_linux_loader_32(use_wsl: bool) -> "Path | None":
     """Build a 32-bit Linux test loader (reuses main.c with -m32)."""
-    loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux_32.elf"
+    loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux_32.pe"
     if loader.exists():
         return loader
     src = TESTS_DIR / "test_loader_linux" / "main.c"

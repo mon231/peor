@@ -126,6 +126,7 @@ jobs:
           sudo apt-get install -y \
             gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 \
             gcc-mingw-w64-i686  binutils-mingw-w64-i686 \
+            g++-mingw-w64-x86-64 g++-mingw-w64-i686 \
             gcc gcc-multilib
 
       - name: Build Linux test loaders (x64 and x86)
@@ -135,11 +136,11 @@ jobs:
         run: |
           gcc -O2 \
             -ffixed-rbx -ffixed-r12 -ffixed-r13 -ffixed-r14 -ffixed-r15 \
-            -o tests/test_loader_linux/test_loader_linux.elf \
+            -o tests/test_loader_linux/test_loader_linux.pe \
             tests/test_loader_linux/main.c -ldl
           gcc -m32 -O2 \
             -ffixed-ebx -ffixed-esi -ffixed-edi \
-            -o tests/test_loader_linux/test_loader_linux_32.elf \
+            -o tests/test_loader_linux/test_loader_linux_32.pe \
             tests/test_loader_linux/main.c -ldl
 
       - name: Install Python dependencies
@@ -176,6 +177,7 @@ jobs:
           sudo apt-get install -y \
             gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 \
             gcc-mingw-w64-i686   binutils-mingw-w64-i686 \
+            g++-mingw-w64-x86-64 g++-mingw-w64-i686 \
             qemu-system-x86 ovmf
 
       - name: Install Python dependencies

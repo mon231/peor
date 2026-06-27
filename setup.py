@@ -106,6 +106,17 @@ def _assemble_shellcodes():
     s32  = assemble(ASM_DIR / 'seh_registrar32.asm',         keystone.KS_ARCH_X86, keystone.KS_MODE_32)
     t32  = assemble(ASM_DIR / 'tls_callbacks32.asm',         keystone.KS_ARCH_X86, keystone.KS_MODE_32)
     t64  = assemble(ASM_DIR / 'tls_callbacks64.asm',         keystone.KS_ARCH_X86, keystone.KS_MODE_64)
+    ctors64 = assemble(ASM_DIR / 'ctors_runner64.asm',       keystone.KS_ARCH_X86, keystone.KS_MODE_64)
+    ctors32 = assemble(ASM_DIR / 'ctors_runner32.asm',       keystone.KS_ARCH_X86, keystone.KS_MODE_32)
+
+    # Verify ctors magic bytes appear exactly once in each assembled ctors runner.
+    _CTORS_RVA_MAGIC_BYTES  = b'\xfd\xfc\xfb\xfa'
+    _CTORS_SIZE_MAGIC_BYTES = b'\xe4\xe3\xe2\xe1'
+    for _name, _raw in [('ctors_runner64.asm', ctors64), ('ctors_runner32.asm', ctors32)]:
+        if _raw.count(_CTORS_RVA_MAGIC_BYTES) != 1:
+            raise RuntimeError(f"CTORS_RVA_MAGIC not unique in {_name}")
+        if _raw.count(_CTORS_SIZE_MAGIC_BYTES) != 1:
+            raise RuntimeError(f"CTORS_SIZE_MAGIC not unique in {_name}")
 
     # cxx_eh_fixer: patch the FORWARD_MAGIC (0xFEFEFEFE) with the runtime byte-distance
     # from _setup_ip to _data (so the setup code can find the data area via POP+ADD).
@@ -154,6 +165,8 @@ def _assemble_shellcodes():
         f"TLS_CALLBACKS_32       = bytes.fromhex('{t32.hex()}')\n"
         f"TLS_CALLBACKS_64       = bytes.fromhex('{t64.hex()}')\n"
         f"CXX_EH_FIXER_64        = bytes.fromhex('{f64.hex()}')\n"
+        f"CTORS_RUNNER_64        = bytes.fromhex('{ctors64.hex()}')\n"
+        f"CTORS_RUNNER_32        = bytes.fromhex('{ctors32.hex()}')\n"
     )
 
     print(f"[peor] assembled shellcodes -> {SHELLCODES_PY}")

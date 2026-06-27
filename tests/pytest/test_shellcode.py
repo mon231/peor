@@ -32,6 +32,9 @@ ARCH_DIRS = {
     "x64": TESTS_DIR / "Win_x64",
 }
 
+MINGW_CPP_EH_RETURN_CODE = 42
+LINUX_CRT_RETURN_CODE = 73
+
 # v1 and v2: importless, verified by exit code
 _EXIT_CODE_CASES = [
     ("01_simple_calc", 4950),     # sum(0..99)
@@ -1016,7 +1019,7 @@ def test_01_linux_write(arch, tmp_path):
             pytest.skip("i686-w64-mingw32-gcc not found (native PATH or WSL)")
         loader = _ensure_linux_loader_32(use_wsl)
         if loader is None:
-            pytest.skip("32-bit Linux test loader not found and could not be built via WSL")
+            pytest.fail("32-bit Linux test_loader not found and could not be built via WSL — run: wsl sudo apt-get install gcc-multilib")
         exe = _build_linux_write_pe_32(tmp_path, use_wsl)
         if exe is None:
             pytest.skip("Failed to build x86 linux_write PE")
@@ -1069,7 +1072,7 @@ def test_02_linux_cpp_exceptions(arch, tmp_path):
     if gpp_cmd is None:
         pytest.skip(gpp_skip)
     if loader is None:
-        pytest.skip("Linux test_loader not found and could not be built")
+        pytest.fail("Linux test_loader not found and could not be built — install gcc-multilib")
 
     exe = tmp_path / f"linux_cpp_except_{arch}.pe"
     cc = _compile_cpp_pe(_LINUX_CPP_EXCEPTIONS_SRC, exe, use_wsl, "main", "posix", arch=arch)
@@ -1460,23 +1463,10 @@ def _find_mingw_gpp_posix_32() -> "tuple[list | None, bool | None]":
     return None, None
 
 
-def _gpp_crt_files(gpp: str, use_wsl: bool) -> "tuple[str, str]":
-    """Return (crtbegin_path, crtend_path) for the given g++ compiler.
-
-    Returns empty strings if not found (e.g. SJLJ builds that don't need them).
-    """
-    def _query(name):
-        if use_wsl:
-            r = _wsl_bash_run(f"{gpp} -print-file-name={name}", capture_output=True, timeout=10)
-        else:
-            r = subprocess.run([gpp, f"-print-file-name={name}"], capture_output=True, timeout=10)
-        if r.returncode != 0:
-            return ""
-        path = r.stdout.decode(errors="replace").strip()
-        return path if path != name else ""  # compiler returns bare name when not found
-
-    return _query("crtbegin.o"), _query("crtend.o")
-
+_CPP_EH_SUPPORT_DIR = TESTS_DIR / "cpp_eh_support"
+_LIBC_CPP_DEF_CONTENT = "EXPORTS\nstrlen\nstrncmp\nmemcpy\nfree\nmalloc\natexit\n"
+_LIBPTHREAD_CPP_DEF_CONTENT = "EXPORTS\npthread_mutex_init\npthread_mutex_destroy\npthread_mutex_lock\npthread_mutex_unlock\n"
+_LIBPTHREAD_DLL_NAME = "libpthread.so.0"
 
 _MINGW_CPP_EH_FLAGS = ["-fexceptions", "-nostartfiles", "-nodefaultlibs"]
 _MINGW_CPP_STATIC_LIBS = ["-lgcc_eh", "-lsupc++", "-lgcc"]
@@ -1484,52 +1474,170 @@ _MINGW_CPP_STATIC_LIBS = ["-lgcc_eh", "-lsupc++", "-lgcc"]
 
 def _compile_cpp_pe(gcc_src: Path, out: Path, use_wsl: bool,
                     entry: str, subsystem: str, *, arch: str = "x64") -> subprocess.CompletedProcess:
-    """Compile a C++ source file to a Windows PE with GCC exception support.
+    """Compile a C++ source file to a Windows PE with GCC DWARF exception support.
 
-    Uses the -posix threading variant (DWARF-2 or SJLJ) and explicitly includes
-    crtbegin.o / crtend.o for DWARF EH frame registration.
+    Uses peor_crtbegin.c / peor_crtend.c (from tests/cpp_eh_support/) instead of the system
+    crtbegin.o / crtend.o.  For EFI targets (subsystem '10' or entry 'efi_main'),
+    freestanding.c is also compiled and linked to supply libsupc++/libgcc_eh symbol deps.
+    For Linux targets (subsystem 'posix'), libc.so.6 and libpthread.so.0 import libs are
+    generated with dlltool and linked so those symbols are resolved at runtime via dlopen.
     """
     gpp = ("x86_64-w64-mingw32-g++-posix" if arch == "x64"
            else "i686-w64-mingw32-g++-posix")
+    dlltool = ("x86_64-w64-mingw32-dlltool" if arch == "x64"
+               else "i686-w64-mingw32-dlltool")
 
-    crtbegin, crtend = _gpp_crt_files(gpp, use_wsl)
+    is_efi   = (subsystem == "10" or entry == "efi_main")
+    is_linux = (subsystem == "posix")
+
+    crtbegin_src = _CPP_EH_SUPPORT_DIR / "peor_crtbegin.c"
+    crtend_src   = _CPP_EH_SUPPORT_DIR / "peor_crtend.c"
+    freestanding_src = _CPP_EH_SUPPORT_DIR / "freestanding.c"
+
+    arch_tag = arch  # "x64" or "x86" — used in temp file names to avoid conflicts
 
     if use_wsl:
+        crtbegin_wsl     = _win_path_to_wsl(crtbegin_src)
+        crtend_wsl       = _win_path_to_wsl(crtend_src)
+        freestanding_wsl = _win_path_to_wsl(freestanding_src)
         src_wsl = _win_path_to_wsl(gcc_src)
         out_wsl = _win_path_to_wsl(out)
-        flags = " ".join(_MINGW_CPP_EH_FLAGS)
-        static_libs = " ".join(_MINGW_CPP_STATIC_LIBS)
-        cmd = (f"{gpp} {flags} {crtbegin} {src_wsl} {crtend}"
-               f" {static_libs} -Wl,-e,{entry} -Wl,--subsystem,{subsystem}"
-               f" -o {out_wsl}")
-        return _wsl_bash_run(cmd, capture_output=True, timeout=60)
-    else:
-        cmd = [gpp] + _MINGW_CPP_EH_FLAGS
-        if crtbegin:
-            cmd.append(crtbegin)
-        cmd.append(str(gcc_src))
-        if crtend:
-            cmd.append(crtend)
-        cmd += _MINGW_CPP_STATIC_LIBS + [
-            f"-Wl,-e,{entry}", f"-Wl,--subsystem,{subsystem}",
-            "-o", str(out),
+
+        crtbegin_o     = f"/tmp/peor_crtbegin_{arch_tag}.o"
+        crtend_o       = f"/tmp/peor_crtend_{arch_tag}.o"
+        freestanding_o = f"/tmp/peor_freestanding_{arch_tag}.o"
+
+        compile_flags = " ".join(_MINGW_CPP_EH_FLAGS)
+        static_libs   = " ".join(_MINGW_CPP_STATIC_LIBS)
+
+        # Step 1: compile crtbegin and crtend
+        cmds = [
+            f"{gpp} -fexceptions -c {crtbegin_wsl} -o {crtbegin_o}",
+            f"{gpp} -fexceptions -c {crtend_wsl} -o {crtend_o}",
         ]
-        return subprocess.run(cmd, capture_output=True, timeout=60)
+
+        if is_efi:
+            cmds.append(f"{gpp} -fexceptions -c {freestanding_wsl} -o {freestanding_o}")
+            middle = f"{freestanding_o} {src_wsl}"
+            extra_libs = ""
+        elif is_linux:
+            libc_def      = f"/tmp/libc_cpp_{arch_tag}.def"
+            libpthread_def = f"/tmp/libpthread_cpp_{arch_tag}.def"
+            liblibc_a     = f"/tmp/liblibc_cpp_{arch_tag}.a"
+            libpthread_a  = f"/tmp/libpthread_cpp_{arch_tag}.a"
+            cmds += [
+                f"printf '%s' '{_LIBC_CPP_DEF_CONTENT}' > {libc_def}",
+                f"printf '%s' '{_LIBPTHREAD_CPP_DEF_CONTENT}' > {libpthread_def}",
+                f"{dlltool} -D {_LIBC_DLL_NAME} -d {libc_def} -l {liblibc_a}",
+                f"{dlltool} -D {_LIBPTHREAD_DLL_NAME} -d {libpthread_def} -l {libpthread_a}",
+            ]
+            middle = src_wsl
+            extra_libs = f"{liblibc_a} {libpthread_a}"
+        else:
+            # Windows or other: use freestanding stubs (no OS CRT)
+            cmds.append(f"{gpp} -fexceptions -c {freestanding_wsl} -o {freestanding_o}")
+            middle = f"{freestanding_o} {src_wsl}"
+            extra_libs = ""
+
+        # Final link command
+        if is_linux:
+            link_cmd = (
+                f"{gpp} {compile_flags} {crtbegin_o} {middle} {crtend_o}"
+                f" {extra_libs} {static_libs}"
+                f" -Wl,-e,{entry} -Wl,--subsystem,{subsystem}"
+                f" -o {out_wsl}"
+            )
+        else:
+            link_cmd = (
+                f"{gpp} {compile_flags} {crtbegin_o} {middle} {crtend_o}"
+                f" {static_libs}"
+                f" -Wl,-e,{entry} -Wl,--subsystem,{subsystem}"
+                f" -o {out_wsl}"
+            )
+        cmds.append(link_cmd)
+        full_cmd = " && ".join(cmds)
+        return _wsl_bash_run(full_cmd, capture_output=True, timeout=120)
+    else:
+        # Native (Linux CI): use temp dir for intermediate objects
+        import tempfile, os
+        tmp_dir = Path(tempfile.gettempdir())
+        crtbegin_o   = tmp_dir / f"peor_crtbegin_{arch_tag}.o"
+        crtend_o     = tmp_dir / f"peor_crtend_{arch_tag}.o"
+        freestanding_o = tmp_dir / f"peor_freestanding_{arch_tag}.o"
+
+        def _run(args, **kw):
+            return subprocess.run(args, capture_output=True, timeout=60)
+
+        r = _run([gpp, "-fexceptions", "-c", str(crtbegin_src), "-o", str(crtbegin_o)])
+        if r.returncode != 0:
+            return r
+        r = _run([gpp, "-fexceptions", "-c", str(crtend_src), "-o", str(crtend_o)])
+        if r.returncode != 0:
+            return r
+
+        if is_efi:
+            r = _run([gpp, "-fexceptions", "-c", str(freestanding_src), "-o", str(freestanding_o)])
+            if r.returncode != 0:
+                return r
+            middle_files = [str(freestanding_o), str(gcc_src)]
+            extra_libs = []
+        elif is_linux:
+            libc_def      = tmp_dir / f"libc_cpp_{arch_tag}.def"
+            libpthread_def = tmp_dir / f"libpthread_cpp_{arch_tag}.def"
+            liblibc_a     = tmp_dir / f"liblibc_cpp_{arch_tag}.a"
+            libpthread_a  = tmp_dir / f"libpthread_cpp_{arch_tag}.a"
+            libc_def.write_text(_LIBC_CPP_DEF_CONTENT, encoding="ascii")
+            libpthread_def.write_text(_LIBPTHREAD_CPP_DEF_CONTENT, encoding="ascii")
+            r = _run([dlltool, "-D", _LIBC_DLL_NAME, "-d", str(libc_def), "-l", str(liblibc_a)])
+            if r.returncode != 0:
+                return r
+            r = _run([dlltool, "-D", _LIBPTHREAD_DLL_NAME, "-d", str(libpthread_def), "-l", str(libpthread_a)])
+            if r.returncode != 0:
+                return r
+            middle_files = [str(gcc_src)]
+            extra_libs = [str(liblibc_a), str(libpthread_a)]
+        else:
+            r = _run([gpp, "-fexceptions", "-c", str(freestanding_src), "-o", str(freestanding_o)])
+            if r.returncode != 0:
+                return r
+            middle_files = [str(freestanding_o), str(gcc_src)]
+            extra_libs = []
+
+        cmd = (
+            [gpp] + _MINGW_CPP_EH_FLAGS
+            + [str(crtbegin_o)]
+            + middle_files
+            + [str(crtend_o)]
+            + extra_libs
+            + _MINGW_CPP_STATIC_LIBS
+            + [f"-Wl,-e,{entry}", f"-Wl,--subsystem,{subsystem}", "-o", str(out)]
+        )
+        return subprocess.run(cmd, capture_output=True, timeout=120)
 
 
 def _ensure_linux_loader_32(use_wsl: bool) -> "Path | None":
-    """Build a 32-bit Linux test loader (reuses main.c with -m32)."""
+    """Build a 32-bit Linux test loader (reuses main.c with -m32).
+
+    Auto-installs gcc-multilib via apt if the compiler is not available.
+    """
     loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux_32.pe"
     if loader.exists():
         return loader
     src = TESTS_DIR / "test_loader_linux" / "main.c"
     if not use_wsl:
         return None
-    r = _wsl_bash_run(
-        "gcc " + " ".join(_LINUX_LOADER_CFLAGS_32)
-        + f" -o {_win_path_to_wsl(loader)} {_win_path_to_wsl(src)}",
-        capture_output=True, timeout=30,
+    # Ensure gcc-multilib is available; install it if missing.
+    probe = _wsl_bash_run(
+        "echo 'int main(){}' | gcc -m32 -x c -o /dev/null - 2>/dev/null",
+        capture_output=True, timeout=20,
     )
+    if probe.returncode != 0:
+        _wsl_bash_run("sudo apt-get install -y gcc-multilib", capture_output=True, timeout=180)
+    cmd = (
+        "gcc -m32 -O2 -ffixed-ebx -ffixed-esi -ffixed-edi"
+        f" -o {_win_path_to_wsl(loader)} {_win_path_to_wsl(src)}"
+    )
+    r = _wsl_bash_run(cmd, capture_output=True, timeout=60)
     return loader if r.returncode == 0 and loader.exists() else None
 
 
@@ -1593,3 +1701,194 @@ def _build_linux_write_pe_32(tmp_path: Path, use_wsl: bool) -> "Path | None":
     return exe
 
 
+_LIBC_DEF_CONTENT_CRT = "EXPORTS\nstrlen\nstrncmp\nmemcpy\nfree\nmalloc\n"
+
+
+def _build_linux_crt_pe(tmp_path: Path, use_wsl: bool, *, arch: str = "x64") -> "Path | None":
+    """Cross-compile tests/Linux/03_linux_with_crt/main.c as a PE with libc.so.6 imports.
+
+    Returns the path to the compiled PE, or None on failure.
+    """
+    src = TESTS_DIR / "Linux" / "03_linux_with_crt" / "main.c"
+    if not src.exists():
+        return None
+
+    exe      = tmp_path / f"linux_crt_{arch}.exe"
+    def_file = tmp_path / f"libc_crt_{arch}.def"
+    imp_lib  = tmp_path / f"liblibc_crt_{arch}.a"
+    def_file.write_text(_LIBC_DEF_CONTENT_CRT, encoding="ascii")
+
+    if arch == "x64":
+        _GCC    = "x86_64-w64-mingw32-gcc"
+        _DLLTOOL = "x86_64-w64-mingw32-dlltool"
+    else:
+        _GCC    = "i686-w64-mingw32-gcc"
+        _DLLTOOL = "i686-w64-mingw32-dlltool"
+    _MAIN_STUB = "void __main(void) {}"
+
+    if use_wsl:
+        def_wsl = _win_path_to_wsl(def_file)
+        imp_wsl = _win_path_to_wsl(imp_lib)
+        src_wsl = _win_path_to_wsl(src)
+        exe_wsl = _win_path_to_wsl(exe)
+
+        r = _wsl_bash_run(
+            f"{_DLLTOOL} -D {_LIBC_DLL_NAME} -d {def_wsl} -l {imp_wsl}",
+            capture_output=True, timeout=30,
+        )
+        if r.returncode != 0:
+            return None
+
+        cc = _wsl_bash_run(
+            f"printf '%s' '{_MAIN_STUB}' > /tmp/_peor_crt_stub_{arch}.c"
+            f" && {_GCC} " + " ".join(_MINGW_CFLAGS_LINUX)
+            + f" /tmp/_peor_crt_stub_{arch}.c {src_wsl} {imp_wsl}"
+            f" -Wl,-e,main -Wl,--subsystem,posix -o {exe_wsl}",
+            capture_output=True, timeout=30,
+        )
+    else:
+        r = subprocess.run(
+            [_DLLTOOL, "-D", _LIBC_DLL_NAME, "-d", str(def_file), "-l", str(imp_lib)],
+            capture_output=True, timeout=30,
+        )
+        if r.returncode != 0:
+            return None
+
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".c", mode="w", delete=False) as f:
+            f.write(_MAIN_STUB)
+            stub_file = f.name
+        try:
+            cc = subprocess.run(
+                [_GCC] + _MINGW_CFLAGS_LINUX
+                + [stub_file, str(src), str(imp_lib),
+                   "-Wl,-e,main", "-Wl,--subsystem,posix", "-o", str(exe)],
+                capture_output=True, timeout=30,
+            )
+        finally:
+            Path(stub_file).unlink(missing_ok=True)
+
+    if cc.returncode != 0 or not exe.exists():
+        return None
+    return exe
+
+
+@pytest.mark.parametrize("arch", ["x64", "x86"])
+def test_03_linux_with_crt(arch, tmp_path):
+    """Linux C++ shellcode with CRT imports: uses strlen/malloc/free from libc.so.6.
+
+    Compiles main.c linking against a libc.so.6 import lib; the Linux import
+    resolver dlopen()s libc.so.6 at runtime.  Returns 73 on success.
+    Tested for both x64 and x86.
+    """
+    if arch == "x64":
+        mingw_cmd, use_wsl = _find_mingw_gcc()
+        if mingw_cmd is None:
+            pytest.skip("x86_64-w64-mingw32-gcc not found (native PATH or WSL)")
+        loader = _ensure_linux_loader(use_wsl)
+        if loader is None:
+            pytest.skip("Linux test_loader not found and could not be built via WSL")
+        exe = _build_linux_crt_pe(tmp_path, use_wsl, arch=arch)
+    else:
+        mingw_cmd, use_wsl = _find_mingw_gcc_32()
+        if mingw_cmd is None:
+            pytest.skip("i686-w64-mingw32-gcc not found (native PATH or WSL)")
+        loader = _ensure_linux_loader_32(use_wsl)
+        if loader is None:
+            pytest.fail("32-bit Linux test_loader not found and could not be built via WSL — run: wsl sudo apt-get install gcc-multilib")
+        exe = _build_linux_crt_pe(tmp_path, use_wsl, arch=arch)
+
+    if exe is None:
+        pytest.skip("Failed to build linux_crt PE (dlltool or mingw-gcc unavailable)")
+
+    sc = tmp_path / f"linux_crt_{arch}.bin"
+    _shellcodify_platform(exe, sc, _PLATFORM_LINUX)
+
+    if use_wsl:
+        sc_wsl = _win_path_to_wsl(sc)
+        loader_wsl = _win_path_to_wsl(loader)
+        result = subprocess.run(
+            ["wsl", "--", loader_wsl, sc_wsl], capture_output=True, timeout=15
+        )
+    else:
+        result = subprocess.run([str(loader), str(sc)], capture_output=True, timeout=15)
+
+    assert result.returncode == 0, (
+        f"[linux_crt {arch}] loader crashed with code {result.returncode}\n"
+        f"stderr: {result.stderr.decode(errors='replace')}"
+    )
+    stdout = result.stdout.decode(errors="replace").strip()
+    assert stdout == str(LINUX_CRT_RETURN_CODE), (
+        f"[linux_crt {arch}] expected stdout '{LINUX_CRT_RETURN_CODE}', got {stdout!r}\n"
+        f"stderr: {result.stderr.decode(errors='replace')}"
+    )
+
+
+@pytest.mark.parametrize("arch", ["x64", "x86"])
+def test_17_mingw_cpp_exceptions(arch, tmp_path):
+    """Windows MinGW DWARF C++ exception shellcode: throws PeorMinGWException{42}, returns 42.
+
+    Uses peor's ctors runner to initialise DWARF EH frames before entry.
+    Tests that peor's Windows chain now supports .init_array-based EH registration.
+    """
+    if arch == "x64":
+        gpp_cmd, use_wsl = _find_mingw_gpp_posix()
+        skip_msg = "x86_64-w64-mingw32-g++-posix not found"
+        loader = TESTS_DIR / "Win_x64" / "test_loader.exe"
+    else:
+        gpp_cmd, use_wsl = _find_mingw_gpp_posix_32()
+        skip_msg = "i686-w64-mingw32-g++-posix not found"
+        loader = TESTS_DIR / "Win_x86" / "test_loader.exe"
+
+    if gpp_cmd is None:
+        pytest.skip(skip_msg)
+    if not loader.exists():
+        pytest.skip(f"test_loader not found: {loader}")
+
+    src = TESTS_DIR / "Windows" / "17_mingw_cpp_exceptions" / "main.cpp"
+    exe = tmp_path / f"mingw_cpp_{arch}.exe"
+    cc = _compile_cpp_pe(src, exe, use_wsl, "WinMain", "windows", arch=arch)
+    assert cc.returncode == 0, f"MinGW C++ compile failed:\n{cc.stderr.decode(errors='replace')}"
+
+    sc = tmp_path / f"mingw_cpp_{arch}.bin"
+    _shellcodify(exe, sc)
+
+    result = subprocess.run([str(loader), str(sc)], capture_output=True, timeout=15)
+    assert result.returncode == MINGW_CPP_EH_RETURN_CODE, (
+        f"[mingw_cpp {arch}] expected exit {MINGW_CPP_EH_RETURN_CODE}, got {result.returncode}\n"
+        f"stderr: {result.stderr.decode(errors='replace')}"
+    )
+
+
+@pytest.mark.parametrize("arch,cmd_path,loader_subdir", [
+    ("x64", r"C:\Windows\System32\cmd.exe", "Win_x64"),
+    ("x86", r"C:\Windows\SysWOW64\cmd.exe", "Win_x86"),
+], ids=["x64", "x86"])
+def test_cmdexe(arch, cmd_path, loader_subdir, tmp_path):
+    """Windows cmd.exe shellcodified and run; verifies echo command output.
+
+    Shellcodifies the system cmd.exe (System32 for x64, SysWOW64 for x86),
+    runs via test_loader with stdin piped to 'echo PEOR_CMD_TEST', checks output.
+    """
+    if platform.system() != "Windows":
+        pytest.skip("cmd.exe test is Windows-only")
+    cmd_pe = Path(cmd_path)
+    if not cmd_pe.exists():
+        pytest.skip(f"cmd.exe not found at {cmd_path}")
+    loader = TESTS_DIR / loader_subdir / "test_loader.exe"
+    if not loader.exists():
+        pytest.skip(f"test_loader not found: {loader}")
+
+    sc = tmp_path / f"cmd_{arch}.bin"
+    _shellcodify(cmd_pe, sc)
+
+    cmd_input = b"echo PEOR_CMD_TEST\r\nexit\r\n"
+    result = subprocess.run(
+        [str(loader), str(sc)],
+        input=cmd_input, capture_output=True, timeout=15,
+    )
+    stdout = result.stdout.decode(errors="replace")
+    assert "PEOR_CMD_TEST" in stdout, (
+        f"[cmdexe {arch}] 'PEOR_CMD_TEST' not found in output\n"
+        f"stdout: {stdout[:500]!r}\nstderr: {result.stderr.decode(errors='replace')[:200]}"
+    )

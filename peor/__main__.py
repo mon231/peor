@@ -84,6 +84,9 @@ _SHELLCODES = {
         'seh':               SEH_REGISTRAR_32,
         'seh_always':        True,               # x86 uses FS:[0] SEH chains — always needed
         'tls':               TLS_CALLBACKS_32,
+        'ctors':             CTORS_RUNNER_32,
+        'ctors_rva_magic':   _CTORS_RVA_MAGIC,
+        'ctors_size_magic':  _CTORS_SIZE_MAGIC,
         'tail':              _IMPORTS_TAIL_32,
         'dir_array_offset':  96,
         'disp32_off':        8,
@@ -97,6 +100,9 @@ _SHELLCODES = {
         'seh':               SEH_REGISTRAR_64,
         'seh_always':        False,              # x64: only needed when .pdata (DataDir[3]) is present
         'tls':               TLS_CALLBACKS_64,
+        'ctors':             CTORS_RUNNER_64,
+        'ctors_rva_magic':   _CTORS_RVA_MAGIC,
+        'ctors_size_magic':  _CTORS_SIZE_MAGIC,
         'cxx_eh_fixer':      CXX_EH_FIXER_64,
         'cxx_eh_import':     b'RtlPcToFileHeader',
         'cxx_pe_size_magic': _CXX_EH_PE_SIZE_MAGIC_64,

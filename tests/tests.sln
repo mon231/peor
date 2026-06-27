@@ -37,6 +37,12 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "15_nested_exceptions", "15_
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "16_delay_load", "16_delay_load\16_delay_load.vcxproj", "{3A3A3A3A-3A3A-3A3A-3A3A-3A3A3A3A3A3A}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "01_efi_hello", "EFI\01_efi_hello\01_efi_hello.vcxproj", "{AAAA0001-0001-0001-0001-000000000001}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "02_efi_print", "EFI\02_efi_print\02_efi_print.vcxproj", "{AAAA0002-0002-0002-0002-000000000002}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "03_efi_simple_calc", "EFI\03_efi_simple_calc\03_efi_simple_calc.vcxproj", "{AAAA0003-0003-0003-0003-000000000003}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Win32 = Debug|Win32
@@ -181,6 +187,30 @@ Global
 		{3A3A3A3A-3A3A-3A3A-3A3A-3A3A3A3A3A3A}.Release|Win32.Build.0 = Release|Win32
 		{3A3A3A3A-3A3A-3A3A-3A3A-3A3A3A3A3A3A}.Release|x64.ActiveCfg = Release|x64
 		{3A3A3A3A-3A3A-3A3A-3A3A-3A3A3A3A3A3A}.Release|x64.Build.0 = Release|x64
+		{AAAA0001-0001-0001-0001-000000000001}.Debug|Win32.ActiveCfg = Debug|Win32
+		{AAAA0001-0001-0001-0001-000000000001}.Debug|Win32.Build.0 = Debug|Win32
+		{AAAA0001-0001-0001-0001-000000000001}.Debug|x64.ActiveCfg = Debug|x64
+		{AAAA0001-0001-0001-0001-000000000001}.Debug|x64.Build.0 = Debug|x64
+		{AAAA0001-0001-0001-0001-000000000001}.Release|Win32.ActiveCfg = Release|Win32
+		{AAAA0001-0001-0001-0001-000000000001}.Release|Win32.Build.0 = Release|Win32
+		{AAAA0001-0001-0001-0001-000000000001}.Release|x64.ActiveCfg = Release|x64
+		{AAAA0001-0001-0001-0001-000000000001}.Release|x64.Build.0 = Release|x64
+		{AAAA0002-0002-0002-0002-000000000002}.Debug|Win32.ActiveCfg = Debug|Win32
+		{AAAA0002-0002-0002-0002-000000000002}.Debug|Win32.Build.0 = Debug|Win32
+		{AAAA0002-0002-0002-0002-000000000002}.Debug|x64.ActiveCfg = Debug|x64
+		{AAAA0002-0002-0002-0002-000000000002}.Debug|x64.Build.0 = Debug|x64
+		{AAAA0002-0002-0002-0002-000000000002}.Release|Win32.ActiveCfg = Release|Win32
+		{AAAA0002-0002-0002-0002-000000000002}.Release|Win32.Build.0 = Release|Win32
+		{AAAA0002-0002-0002-0002-000000000002}.Release|x64.ActiveCfg = Release|x64
+		{AAAA0002-0002-0002-0002-000000000002}.Release|x64.Build.0 = Release|x64
+		{AAAA0003-0003-0003-0003-000000000003}.Debug|Win32.ActiveCfg = Debug|Win32
+		{AAAA0003-0003-0003-0003-000000000003}.Debug|Win32.Build.0 = Debug|Win32
+		{AAAA0003-0003-0003-0003-000000000003}.Debug|x64.ActiveCfg = Debug|x64
+		{AAAA0003-0003-0003-0003-000000000003}.Debug|x64.Build.0 = Debug|x64
+		{AAAA0003-0003-0003-0003-000000000003}.Release|Win32.ActiveCfg = Release|Win32
+		{AAAA0003-0003-0003-0003-000000000003}.Release|Win32.Build.0 = Release|Win32
+		{AAAA0003-0003-0003-0003-000000000003}.Release|x64.ActiveCfg = Release|x64
+		{AAAA0003-0003-0003-0003-000000000003}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

@@ -23,3 +23,9 @@ NOTE to add a test to any feature added, and ensure your code matches the conven
 1. tests must use a distinctive non-trivial return code (e.g. 42, 77, 88) — never 0, 1, or -1 — to avoid false positives
 1. ALL tests must pass locally (using wsl/qemu when needed); no test may be skipped on a local machine or in CI/CD
 1. compile linux binaries with a `.pe` extension so they are gitignored
+1. the ci/cd must have different stages for build, test, deploy
+    * ALL of the building process must be completed in the build stage
+    * test/build stages may be executed on different types of runners, but Windows-runner with qemu/wsl is prefered
+    * in each ci/cd stage/script that has installations over it, install all at first then create a cache that contains all installation, only then do other stuff like checkout/build/...
+1. whenever possible (even if takes extra-effort), prefer to use visual-studio projects for tests and add them to the tests solution
+1. whenever possible, avoid creating c code stubs / functions placeholders. use compilation/likage techniques to avoid the need of signature-only symbols with falsy implementation

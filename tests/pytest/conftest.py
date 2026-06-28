@@ -52,7 +52,7 @@ def pytest_sessionstart(session):
         )
 
     _wsl_run(
-        "gcc -m32 -O2 -ffixed-ebx -ffixed-esi -ffixed-edi"
+        "gcc -m32 -O2 -D_FILE_OFFSET_BITS=64"
         f" -o {_win_to_wsl(loader32)} {_win_to_wsl(src)}",
         timeout=120,
     )

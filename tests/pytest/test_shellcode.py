@@ -1409,8 +1409,10 @@ def test_04_efi_cpp_exceptions(arch, tmp_path):
 
 _LINUX_LOADER_CFLAGS_32 = [
     "-m32", "-O2",
-    # x86 shellcode clobbers EBX/ESI/EDI; tell GCC not to rely on them after the call
-    "-ffixed-ebx", "-ffixed-esi", "-ffixed-edi",
+    # _FILE_OFFSET_BITS=64: fstat() on DrvFs (/mnt/c/...) fails on 32-bit Linux
+    # without this flag (old 32-bit fstat syscall not supported for Windows mounts).
+    "-D_FILE_OFFSET_BITS=64",
+    # No -ffixed-* needed: main.c uses inline asm with clobbers for the shellcode call.
     "-ldl",
 ]
 
@@ -1572,23 +1574,16 @@ def _compile_cpp_pe(gcc_src: Path, out: Path, use_wsl: Optional[bool],
                 middle = f"{seh_linux64_o} {src_wsl}"
                 extra_libs = ""
             else:
-                # x86: cdecl matches Linux IA-32 ABI; generate import stubs normally.
-                import tempfile as _tempfile
-                _tmp = Path(_tempfile.mkdtemp())
-                libc_def_win      = _tmp / f"libc_cpp_{arch_tag}.def"
-                libpthread_def_win = _tmp / f"libpthread_cpp_{arch_tag}.def"
-                libc_def_win.write_text(_LIBC_CPP_DEF_CONTENT, encoding="ascii")
-                libpthread_def_win.write_text(_LIBPTHREAD_CPP_DEF_CONTENT, encoding="ascii")
-                libc_def      = _win_path_to_wsl(libc_def_win)
-                libpthread_def = _win_path_to_wsl(libpthread_def_win)
-                liblibc_a     = f"/tmp/liblibc_cpp_{arch_tag}.a"
-                libpthread_a  = f"/tmp/libpthread_cpp_{arch_tag}.a"
-                cmds += [
-                    f"{dlltool} -D {_LIBC_DLL_NAME} -d {libc_def} -l {liblibc_a}",
-                    f"{dlltool} -D {_LIBPTHREAD_DLL_NAME} -d {libpthread_def} -l {libpthread_a}",
-                ]
-                middle = src_wsl
-                extra_libs = f"{liblibc_a} {libpthread_a}"
+                # x86 Linux: libsupc++.a(vterminate.o) references Windows CRT symbols
+                # (fwrite, fputs, fputc, _imp____acrt_iob_func, __mingw_vsprintf) that
+                # don't exist in libc.so.6 with those names.  Use freestanding.c with
+                # -DPEOR_EFI to provide all stubs (pthread, malloc/free, stdio no-ops),
+                # just like the x86 EFI path.  No import stubs needed.
+                cmds.append(
+                    f"{gpp} -x c -fexceptions -DPEOR_EFI -c {freestanding_wsl} -o {freestanding_o}"
+                )
+                middle = f"{freestanding_o} {src_wsl}"
+                extra_libs = ""
         else:
             # Windows: use freestanding stubs (without -DPEOR_EFI) and link Windows CRT/kernel32
             cmds.append(f"{gpp} -x c -fexceptions -c {freestanding_wsl} -o {freestanding_o}")
@@ -1681,9 +1676,17 @@ def _compile_cpp_pe(gcc_src: Path, out: Path, use_wsl: Optional[bool],
                 if r.returncode != 0:
                     return r
                 middle_files = [str(seh_linux64_o), str(gcc_src)]
+                extra_libs = [str(liblibc_a), str(libpthread_a)]
             else:
-                middle_files = [str(gcc_src)]
-            extra_libs = [str(liblibc_a), str(libpthread_a)]
+                # x86 Linux: use freestanding.c with -DPEOR_EFI (same as x86 EFI).
+                # libsupc++.a(vterminate.o) references Windows CRT symbols that
+                # don't exist in libc.so.6; freestanding.c provides all stubs.
+                r = _run([gpp, "-x", "c", "-fexceptions", "-DPEOR_EFI",
+                          "-c", str(freestanding_src), "-o", str(freestanding_o)])
+                if r.returncode != 0:
+                    return r
+                middle_files = [str(freestanding_o), str(gcc_src)]
+                extra_libs = []
         else:
             r = _run([gpp, "-x", "c", "-fexceptions", "-c", str(freestanding_src), "-o", str(freestanding_o)])
             if r.returncode != 0:
@@ -1743,7 +1746,7 @@ def _ensure_linux_loader_32(use_wsl: bool) -> "Path | None":
             capture_output=True, timeout=120,
         )
     cmd = (
-        "gcc -m32 -O2 -ffixed-ebx -ffixed-esi -ffixed-edi"
+        "gcc -m32 -O2 -D_FILE_OFFSET_BITS=64"
         f" -o {_win_path_to_wsl(loader)} {_win_path_to_wsl(src)}"
     )
     r = _wsl_bash_run(cmd, capture_output=True, timeout=60)
@@ -1780,7 +1783,7 @@ def _build_linux_write_pe_32(tmp_path: Path, use_wsl: bool) -> "Path | None":
             f"printf '%s' '{_MAIN_STUB}' > /tmp/_peor_stub32.c"
             f" && {_GCC32} " + " ".join(_MINGW_CFLAGS_LINUX)
             + f" /tmp/_peor_stub32.c {src_wsl} {imp_wsl}"
-            f" -Wl,-e,main -Wl,--subsystem,posix -o {exe_wsl}",
+            f" -Wl,-e,_main -Wl,--subsystem,posix -o {exe_wsl}",
             capture_output=True, timeout=30,
         )
     else:
@@ -1799,7 +1802,7 @@ def _build_linux_write_pe_32(tmp_path: Path, use_wsl: bool) -> "Path | None":
             cc = subprocess.run(
                 [_GCC32] + _MINGW_CFLAGS_LINUX
                 + [stub_file, str(src), str(imp_lib),
-                   "-Wl,-e,main", "-Wl,--subsystem,posix", "-o", str(exe)],
+                   "-Wl,-e,_main", "-Wl,--subsystem,posix", "-o", str(exe)],
                 capture_output=True, timeout=30,
             )
         finally:
@@ -1834,6 +1837,8 @@ def _build_linux_crt_pe(tmp_path: Path, use_wsl: bool, *, arch: str = "x64") -> 
         _GCC    = "i686-w64-mingw32-gcc"
         _DLLTOOL = "i686-w64-mingw32-dlltool"
     _MAIN_STUB = "void __main(void) {}"
+    # i686-w64-mingw32 COFF decorates C symbols with a leading underscore
+    _coff_main = "_main" if arch == "x86" else "main"
 
     if use_wsl:
         def_wsl = _win_path_to_wsl(def_file)
@@ -1852,7 +1857,7 @@ def _build_linux_crt_pe(tmp_path: Path, use_wsl: bool, *, arch: str = "x64") -> 
             f"printf '%s' '{_MAIN_STUB}' > /tmp/_peor_crt_stub_{arch}.c"
             f" && {_GCC} " + " ".join(_MINGW_CFLAGS_LINUX)
             + f" /tmp/_peor_crt_stub_{arch}.c {src_wsl} {imp_wsl}"
-            f" -Wl,-e,main -Wl,--subsystem,posix -o {exe_wsl}",
+            f" -Wl,-e,{_coff_main} -Wl,--subsystem,posix -o {exe_wsl}",
             capture_output=True, timeout=30,
         )
     else:
@@ -1871,7 +1876,7 @@ def _build_linux_crt_pe(tmp_path: Path, use_wsl: bool, *, arch: str = "x64") -> 
             cc = subprocess.run(
                 [_GCC] + _MINGW_CFLAGS_LINUX
                 + [stub_file, str(src), str(imp_lib),
-                   "-Wl,-e,main", "-Wl,--subsystem,posix", "-o", str(exe)],
+                   f"-Wl,-e,{_coff_main}", "-Wl,--subsystem,posix", "-o", str(exe)],
                 capture_output=True, timeout=30,
             )
         finally:

@@ -72,7 +72,21 @@ int main(int argc, char *argv[]) {
 
     /* The shellcode finds dlopen/dlsym by itself via /proc/self/maps + ELF parsing.
        No arguments needed from the loader. */
+#ifdef __i386__
+    /* On x86, the shellcode chain leaves EBX=PE_base, ESI=NT_hdrs, EDI=reloc_delta
+     * on return (they're set by the resolver chain and preserved by the cdecl OEP).
+     * List them as clobbers so GCC saves/restores them around this call. */
+    int result;
+    void *_fn = (void *)mem;
+    __asm__ volatile(
+        "call *%1"
+        : "=a"(result)
+        : "m"(_fn)
+        : "ebx", "ecx", "edx", "esi", "edi", "memory", "cc"
+    );
+#else
     int result = ((int (*)(void))mem)();
+#endif
 
     munmap(mem, total);
 

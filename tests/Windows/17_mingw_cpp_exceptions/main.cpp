@@ -6,9 +6,9 @@
  *
  * Compile (x64):
  *   x86_64-w64-mingw32-g++-posix -fexceptions -nostartfiles -nodefaultlibs
- *     peor_crtbegin.o freestanding.o main.cpp peor_crtend.o
+ *     peor_crtbegin.o freestanding.o main.cpp
  *     -lgcc_eh -lsupc++ -lgcc -Wl,-e,WinMain -Wl,--subsystem,windows
- *     -o 17_mingw_cpp.exe
+ *     peor_crtend.o -o 17_mingw_cpp.exe
  */
 
 #define MINGW_CPP_RETURN_CODE 42

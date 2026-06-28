@@ -2,16 +2,16 @@ import os
 import re
 import sys
 import time
+import pytest
 import struct
 import shutil
 import ctypes
 import platform
 import subprocess
 from pathlib import Path
+from typing import Optional
 
-import pytest
 from pefile import PE
-
 from pefile import OPTIONAL_HEADER_MAGIC_PE_PLUS
 
 from peor.__main__ import (
@@ -1464,15 +1464,32 @@ def _find_mingw_gpp_posix_32() -> "tuple[list | None, bool | None]":
 
 
 _CPP_EH_SUPPORT_DIR = TESTS_DIR / "cpp_eh_support"
-_LIBC_CPP_DEF_CONTENT = "EXPORTS\nstrlen\nstrncmp\nmemcpy\nfree\nmalloc\natexit\n"
-_LIBPTHREAD_CPP_DEF_CONTENT = "EXPORTS\npthread_mutex_init\npthread_mutex_destroy\npthread_mutex_lock\npthread_mutex_unlock\n"
+_LIBC_CPP_DEF_CONTENT = (
+    "EXPORTS\n"
+    "strlen\nstrncmp\nstrcmp\nmemcpy\nmemset\nmemcmp\nmemmove\nstrchr\nstrtoul\n"
+    "free\nmalloc\ncalloc\nrealloc\natexit\nabort\ngetenv\n"
+)
+_LIBPTHREAD_CPP_DEF_CONTENT = (
+    "EXPORTS\n"
+    "pthread_mutex_init\npthread_mutex_destroy\npthread_mutex_lock\npthread_mutex_unlock\n"
+    "pthread_once\npthread_key_create\npthread_key_delete\npthread_getspecific\npthread_setspecific\n"
+)
 _LIBPTHREAD_DLL_NAME = "libpthread.so.0"
 
 _MINGW_CPP_EH_FLAGS = ["-fexceptions", "-nostartfiles", "-nodefaultlibs"]
-_MINGW_CPP_STATIC_LIBS = ["-lgcc_eh", "-lsupc++", "-lgcc"]
+# EFI / Linux: only toolchain libs (no OS runtime)
+_MINGW_CPP_STATIC_LIBS = ["-Wl,--start-group", "-lgcc_eh", "-lsupc++", "-lgcc", "-Wl,--end-group"]
+# Windows: toolchain libs + Windows DLL stubs all inside one group.
+# __mingw_vsprintf is stubbed in freestanding.c so libmingwex is NOT needed.
+_MINGW_CPP_STATIC_LIBS_WINDOWS = [
+    "-Wl,--start-group",
+    "-lgcc_eh", "-lsupc++", "-lgcc",
+    "-lmsvcrt", "-lkernel32",
+    "-Wl,--end-group",
+]
 
 
-def _compile_cpp_pe(gcc_src: Path, out: Path, use_wsl: bool,
+def _compile_cpp_pe(gcc_src: Path, out: Path, use_wsl: Optional[bool],
                     entry: str, subsystem: str, *, arch: str = "x64") -> subprocess.CompletedProcess:
     """Compile a C++ source file to a Windows PE with GCC DWARF exception support.
 
@@ -1490,11 +1507,17 @@ def _compile_cpp_pe(gcc_src: Path, out: Path, use_wsl: bool,
     is_efi   = (subsystem == "10" or entry == "efi_main")
     is_linux = (subsystem == "posix")
 
-    crtbegin_src = _CPP_EH_SUPPORT_DIR / "peor_crtbegin.c"
-    crtend_src   = _CPP_EH_SUPPORT_DIR / "peor_crtend.c"
+    crtbegin_src     = _CPP_EH_SUPPORT_DIR / "peor_crtbegin.c"
+    crtend_src       = _CPP_EH_SUPPORT_DIR / "peor_crtend.c"
     freestanding_src = _CPP_EH_SUPPORT_DIR / "freestanding.c"
+    seh_linux64_src  = _CPP_EH_SUPPORT_DIR / "seh_linux64.c"
 
     arch_tag = arch  # "x64" or "x86" — used in temp file names to avoid conflicts
+    use_wsl = use_wsl or False
+
+    # On i686 MinGW COFF, C symbols get a leading underscore prefix, so the
+    # linker entry point name must include it.  x64 COFF has no such prefix.
+    coff_entry = f"_{entry}" if arch == "x86" else entry
 
     if use_wsl:
         crtbegin_wsl     = _win_path_to_wsl(crtbegin_src)
@@ -1503,55 +1526,86 @@ def _compile_cpp_pe(gcc_src: Path, out: Path, use_wsl: bool,
         src_wsl = _win_path_to_wsl(gcc_src)
         out_wsl = _win_path_to_wsl(out)
 
-        crtbegin_o     = f"/tmp/peor_crtbegin_{arch_tag}.o"
-        crtend_o       = f"/tmp/peor_crtend_{arch_tag}.o"
-        freestanding_o = f"/tmp/peor_freestanding_{arch_tag}.o"
+        crtbegin_o      = f"/tmp/peor_crtbegin_{arch_tag}.o"
+        crtend_o        = f"/tmp/peor_crtend_{arch_tag}.o"
+        freestanding_o  = f"/tmp/peor_freestanding_{arch_tag}.o"
+        seh_linux64_o   = f"/tmp/peor_seh_linux64_{arch_tag}.o"
 
         compile_flags = " ".join(_MINGW_CPP_EH_FLAGS)
-        static_libs   = " ".join(_MINGW_CPP_STATIC_LIBS)
+        # Windows chain needs kernel32/msvcrt/mingwex inside the group for circular deps
+        _libs_list  = _MINGW_CPP_STATIC_LIBS_WINDOWS if not (is_efi or is_linux) else _MINGW_CPP_STATIC_LIBS
+        static_libs = " ".join(_libs_list)
 
-        # Step 1: compile crtbegin and crtend
+        # Step 1: compile crtbegin and crtend (-x c forces C mode so g++ doesn't mangle names)
         cmds = [
-            f"{gpp} -fexceptions -c {crtbegin_wsl} -o {crtbegin_o}",
-            f"{gpp} -fexceptions -c {crtend_wsl} -o {crtend_o}",
+            f"{gpp} -x c -fexceptions -c {crtbegin_wsl} -o {crtbegin_o}",
+            f"{gpp} -x c -fexceptions -c {crtend_wsl} -o {crtend_o}",
         ]
 
         if is_efi:
-            cmds.append(f"{gpp} -fexceptions -c {freestanding_wsl} -o {freestanding_o}")
+            # -DPEOR_EFI enables EFI-specific stubs (stdio, kernel32 IAT no-ops)
+            cmds.append(f"{gpp} -x c -fexceptions -DPEOR_EFI -c {freestanding_wsl} -o {freestanding_o}")
             middle = f"{freestanding_o} {src_wsl}"
             extra_libs = ""
         elif is_linux:
-            libc_def      = f"/tmp/libc_cpp_{arch_tag}.def"
-            libpthread_def = f"/tmp/libpthread_cpp_{arch_tag}.def"
+            # Write DEF files via Python to avoid shell newline/quoting issues.
+            import tempfile as _tempfile
+            _tmp = Path(_tempfile.mkdtemp())
+            libc_def_win      = _tmp / f"libc_cpp_{arch_tag}.def"
+            libpthread_def_win = _tmp / f"libpthread_cpp_{arch_tag}.def"
+            libc_def_win.write_text(_LIBC_CPP_DEF_CONTENT, encoding="ascii")
+            libpthread_def_win.write_text(_LIBPTHREAD_CPP_DEF_CONTENT, encoding="ascii")
+            libc_def      = _win_path_to_wsl(libc_def_win)
+            libpthread_def = _win_path_to_wsl(libpthread_def_win)
             liblibc_a     = f"/tmp/liblibc_cpp_{arch_tag}.a"
             libpthread_a  = f"/tmp/libpthread_cpp_{arch_tag}.a"
             cmds += [
-                f"printf '%s' '{_LIBC_CPP_DEF_CONTENT}' > {libc_def}",
-                f"printf '%s' '{_LIBPTHREAD_CPP_DEF_CONTENT}' > {libpthread_def}",
                 f"{dlltool} -D {_LIBC_DLL_NAME} -d {libc_def} -l {liblibc_a}",
                 f"{dlltool} -D {_LIBPTHREAD_DLL_NAME} -d {libpthread_def} -l {libpthread_a}",
             ]
-            middle = src_wsl
+            if arch == "x64":
+                # x64 MinGW GCC 13-posix uses Windows SEH for exceptions.
+                # Provide a freestanding SEH emulator that reads the PE's own .pdata/.xdata.
+                seh_wsl = _win_path_to_wsl(seh_linux64_src)
+                cmds.append(
+                    f"{gpp} -x c -fexceptions -DPEOR_LINUX_SEH -c {seh_wsl} -o {seh_linux64_o}"
+                )
+                middle = f"{seh_linux64_o} {src_wsl}"
+            else:
+                middle = src_wsl
             extra_libs = f"{liblibc_a} {libpthread_a}"
         else:
-            # Windows or other: use freestanding stubs (no OS CRT)
-            cmds.append(f"{gpp} -fexceptions -c {freestanding_wsl} -o {freestanding_o}")
+            # Windows: use freestanding stubs (without -DPEOR_EFI) and link Windows CRT/kernel32
+            cmds.append(f"{gpp} -x c -fexceptions -c {freestanding_wsl} -o {freestanding_o}")
             middle = f"{freestanding_o} {src_wsl}"
             extra_libs = ""
 
-        # Final link command
+        # Final link command (use coff_entry for x86 underscore convention)
         if is_linux:
+            # Import libs (libc/libpthread stubs) go inside --start-group so the linker
+            # rescans them when libgcc_eh/libsupc++ pull in emutls.o / eh_alloc.o.
             link_cmd = (
-                f"{gpp} {compile_flags} {crtbegin_o} {middle} {crtend_o}"
-                f" {extra_libs} {static_libs}"
-                f" -Wl,-e,{entry} -Wl,--subsystem,{subsystem}"
+                f"{gpp} {compile_flags} {crtbegin_o} {middle}"
+                f" -Wl,--start-group {extra_libs} -lgcc_eh -lsupc++ -lgcc -Wl,--end-group"
+                f" {crtend_o}"
+                f" -Wl,-e,{coff_entry} -Wl,--subsystem,{subsystem}"
+                f" -o {out_wsl}"
+            )
+        elif is_efi:
+            link_cmd = (
+                f"{gpp} {compile_flags} {crtbegin_o} {middle}"
+                f" {static_libs}"
+                f" {crtend_o}"
+                f" -Wl,-e,{coff_entry} -Wl,--subsystem,{subsystem}"
                 f" -o {out_wsl}"
             )
         else:
+            # Windows: static_libs already includes kernel32/msvcrt/mingwex in --start-group
             link_cmd = (
-                f"{gpp} {compile_flags} {crtbegin_o} {middle} {crtend_o}"
+                f"{gpp} {compile_flags} {crtbegin_o} {middle}"
                 f" {static_libs}"
-                f" -Wl,-e,{entry} -Wl,--subsystem,{subsystem}"
+                f" {crtend_o}"
+                f" -Wl,-e,{coff_entry} -Wl,--subsystem,{subsystem}"
                 f" -o {out_wsl}"
             )
         cmds.append(link_cmd)
@@ -1561,22 +1615,23 @@ def _compile_cpp_pe(gcc_src: Path, out: Path, use_wsl: bool,
         # Native (Linux CI): use temp dir for intermediate objects
         import tempfile, os
         tmp_dir = Path(tempfile.gettempdir())
-        crtbegin_o   = tmp_dir / f"peor_crtbegin_{arch_tag}.o"
-        crtend_o     = tmp_dir / f"peor_crtend_{arch_tag}.o"
+        crtbegin_o     = tmp_dir / f"peor_crtbegin_{arch_tag}.o"
+        crtend_o       = tmp_dir / f"peor_crtend_{arch_tag}.o"
         freestanding_o = tmp_dir / f"peor_freestanding_{arch_tag}.o"
+        seh_linux64_o  = tmp_dir / f"peor_seh_linux64_{arch_tag}.o"
 
         def _run(args, **kw):
             return subprocess.run(args, capture_output=True, timeout=60)
 
-        r = _run([gpp, "-fexceptions", "-c", str(crtbegin_src), "-o", str(crtbegin_o)])
+        r = _run([gpp, "-x", "c", "-fexceptions", "-c", str(crtbegin_src), "-o", str(crtbegin_o)])
         if r.returncode != 0:
             return r
-        r = _run([gpp, "-fexceptions", "-c", str(crtend_src), "-o", str(crtend_o)])
+        r = _run([gpp, "-x", "c", "-fexceptions", "-c", str(crtend_src), "-o", str(crtend_o)])
         if r.returncode != 0:
             return r
 
         if is_efi:
-            r = _run([gpp, "-fexceptions", "-c", str(freestanding_src), "-o", str(freestanding_o)])
+            r = _run([gpp, "-x", "c", "-fexceptions", "-DPEOR_EFI", "-c", str(freestanding_src), "-o", str(freestanding_o)])
             if r.returncode != 0:
                 return r
             middle_files = [str(freestanding_o), str(gcc_src)]
@@ -1594,24 +1649,45 @@ def _compile_cpp_pe(gcc_src: Path, out: Path, use_wsl: bool,
             r = _run([dlltool, "-D", _LIBPTHREAD_DLL_NAME, "-d", str(libpthread_def), "-l", str(libpthread_a)])
             if r.returncode != 0:
                 return r
-            middle_files = [str(gcc_src)]
+            if arch == "x64":
+                r = _run([gpp, "-x", "c", "-fexceptions", "-DPEOR_LINUX_SEH",
+                          "-c", str(seh_linux64_src), "-o", str(seh_linux64_o)])
+                if r.returncode != 0:
+                    return r
+                middle_files = [str(seh_linux64_o), str(gcc_src)]
+            else:
+                middle_files = [str(gcc_src)]
             extra_libs = [str(liblibc_a), str(libpthread_a)]
         else:
-            r = _run([gpp, "-fexceptions", "-c", str(freestanding_src), "-o", str(freestanding_o)])
+            r = _run([gpp, "-x", "c", "-fexceptions", "-c", str(freestanding_src), "-o", str(freestanding_o)])
             if r.returncode != 0:
                 return r
             middle_files = [str(freestanding_o), str(gcc_src)]
             extra_libs = []
 
-        cmd = (
-            [gpp] + _MINGW_CPP_EH_FLAGS
-            + [str(crtbegin_o)]
-            + middle_files
-            + [str(crtend_o)]
-            + extra_libs
-            + _MINGW_CPP_STATIC_LIBS
-            + [f"-Wl,-e,{entry}", f"-Wl,--subsystem,{subsystem}", "-o", str(out)]
-        )
+        # Windows chain uses the larger group that includes kernel32/msvcrt/mingwex.
+        # Linux: extra_libs (libc/libpthread stubs) go inside --start-group so the linker
+        # rescans them when libgcc_eh/libsupc++ pull in emutls.o / eh_alloc.o.
+        if is_linux:
+            cmd = (
+                [gpp] + _MINGW_CPP_EH_FLAGS
+                + [str(crtbegin_o)]
+                + middle_files
+                + ["-Wl,--start-group"] + extra_libs + ["-lgcc_eh", "-lsupc++", "-lgcc", "-Wl,--end-group"]
+                + [str(crtend_o)]
+                + [f"-Wl,-e,{coff_entry}", f"-Wl,--subsystem,{subsystem}", "-o", str(out)]
+            )
+        else:
+            native_libs = _MINGW_CPP_STATIC_LIBS_WINDOWS if not is_efi else _MINGW_CPP_STATIC_LIBS
+            cmd = (
+                [gpp] + _MINGW_CPP_EH_FLAGS
+                + [str(crtbegin_o)]
+                + middle_files
+                + extra_libs
+                + native_libs
+                + [str(crtend_o)]
+                + [f"-Wl,-e,{coff_entry}", f"-Wl,--subsystem,{subsystem}", "-o", str(out)]
+            )
         return subprocess.run(cmd, capture_output=True, timeout=120)
 
 
@@ -1632,7 +1708,7 @@ def _ensure_linux_loader_32(use_wsl: bool) -> "Path | None":
         capture_output=True, timeout=20,
     )
     if probe.returncode != 0:
-        _wsl_bash_run("sudo apt-get install -y gcc-multilib", capture_output=True, timeout=180)
+        _wsl_bash_run("sudo apt-get install -y gcc-multilib", capture_output=True, timeout=360)
     cmd = (
         "gcc -m32 -O2 -ffixed-ebx -ffixed-esi -ffixed-edi"
         f" -o {_win_path_to_wsl(loader)} {_win_path_to_wsl(src)}"

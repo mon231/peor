@@ -263,10 +263,15 @@ def _find_export_rva(pe: PE, name_or_ordinal: str) -> int:
 
 
 def _find_ctors_section(pe: PE) -> "tuple[int, int] | None":
-    """Return (rva, size) of .init_array or .ctors section, or None if absent."""
+    """Return (rva, size) of .init_array or .ctors section, or None if absent.
+
+    PE/COFF section names are limited to 8 bytes.  '.init_array' (10 chars)
+    is stored as b'.init_ar' in the header — recognise both forms.
+    """
+    _CTORS_NAMES = {b'.init_array', b'.init_ar', b'.ctors'}
     for section in pe.sections:
         name = section.Name.rstrip(b'\x00')
-        if name in (b'.init_array', b'.ctors'):
+        if name in _CTORS_NAMES:
             size = section.Misc_VirtualSize
             if size > 0:
                 return section.VirtualAddress, size

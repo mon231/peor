@@ -23,7 +23,7 @@ extern "C" int main() {
     int result = 0;
     try {
         throw PeorLinuxException{CPP_EH_RETURN_CODE};
-    } catch (PeorLinuxException &e) {
+    } catch (const PeorLinuxException &e) {
         result = e.code;
     } catch (...) {
         result = CPP_EH_CATCH_ALL_CODE;

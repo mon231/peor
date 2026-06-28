@@ -376,6 +376,15 @@ section with non-zero virtual size.
 GCC exception-handling runtime; `peor` runs `.init_array` constructors (including EH
 frame registration) before the entry point.
 
+For **Linux x64** and **EFI x64** targets, MinGW GCC (posix-threading) uses Windows
+SEH mechanics (no DWARF).  `seh_linux64.c` (`tests/cpp_eh_support/`) is compiled
+into x64 Linux/EFI builds to provide a freestanding Windows SEH emulator: it
+implements `RtlCaptureContext`, `RtlLookupFunctionEntry`, `RtlVirtualUnwind`,
+`RaiseException`, and `RtlUnwindEx` as well as all `libc.so.6`/`libpthread.so.0`
+symbols that libsupc++/libgcc\_eh need, with raw Linux syscalls (Linux mode) or a
+128 KB static buffer (EFI mode).  For **Linux x86** and **EFI x86**, cdecl matches
+the Linux IA-32 and SJLJ/DWARF ABIs so no shim is required.
+
 ---
 
 ### Entry Point Dispatcher
@@ -428,9 +437,12 @@ pytest tests/pytest -v
 | — | `clangcl_simple_calc` | x64 | clang-cl `/MT` compiled EXE with static CRT; Windows-only (skipped if `clang-cl` absent) | 4950 |
 | — | `01_linux_write` | x64 | Linux-platform PE (subsystem 7) importing `write` from `libc.so.6`; shellcode finds `dlsym`/`dlopen` itself via `/proc/self/maps`; asserts "PEOR\n" in stdout | stdout=PEOR |
 | — | `01_linux_write_x86` | x86 | Same as above but compiled as PE32 with i686-w64-mingw32-gcc; uses x86 Linux chain and 32-bit loader | stdout=PEOR |
+| — | `02_linux_cpp_exceptions` | x64, x86 | Linux C++ shellcode: `throw`/`catch` a custom type, return code 42 for typed catch, 88 for catch-all; x64 uses Windows-SEH emulator (`seh_linux64.c`) | 42 |
+| — | `03_linux_with_crt` | x64, x86 | Linux PE using `strlen`/`malloc`/`free`/`memcpy` from `libc.so.6`; tests multi-symbol dlopen/dlsym resolver | 73 |
 | — | `01_efi_hello` | x64 | Minimal EFI application PE; peor converts it; EFI loader with embedded shellcode boots under QEMU+OVMF; shellcode scans memory for EFI_SYSTEM_TABLE and calls ResetSystem(Shutdown) | QEMU exit 0 |
 | — | `02_efi_print` | x64 | EFI shellcode uses ConOut->OutputString to print "PEOR\_EFI\_HELLO"; checks QEMU stdout | PEOR\_EFI\_HELLO in stdout |
 | — | `03_efi_simple_calc` | x64 | EFI shellcode computes sum(0..99)=4950, prints "PEOR\_4950" via ConOut; checks QEMU stdout | PEOR\_4950 in stdout |
+| — | `04_efi_cpp_exceptions` | x64, x86 | EFI C++ shellcode: `throw`/`catch` a custom type; x64 uses freestanding Windows-SEH emulator (static heap); x86 uses DWARF/SJLJ; asserts "PEOR\_CPP\_EH\_OK" in QEMU stdout | PEOR\_CPP\_EH\_OK in stdout |
 | — | `test_efi_x86_shellcode_conversion` | x86 | PE32 EFI application compiled with i686-w64-mingw32-gcc; verifies peor produces non-empty shellcode using x86 EFI chain | non-empty bin |
 
 Test 03 requires an interactive desktop and is automatically skipped when the
@@ -485,10 +497,11 @@ For the EFI QEMU tests (Linux/Ubuntu):
 sudo apt-get install -y \
     gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 \
     gcc-mingw-w64-i686   binutils-mingw-w64-i686 \
+    g++-mingw-w64-x86-64 g++-mingw-w64-i686 \
     qemu-system-x86 ovmf
 
 pytest tests/pytest -v -k \
-    "test_01_efi_hello or test_02_efi_print or test_03_efi_simple_calc or test_efi_x86_shellcode_conversion"
+    "test_01_efi_hello or test_02_efi_print or test_03_efi_simple_calc or test_04_efi_cpp_exceptions or test_efi_x86_shellcode_conversion"
 ```
 
 EFI tests build a UEFI application PE, convert it with peor, embed the shellcode

@@ -1543,37 +1543,52 @@ def _compile_cpp_pe(gcc_src: Path, out: Path, use_wsl: Optional[bool],
         ]
 
         if is_efi:
-            # -DPEOR_EFI enables EFI-specific stubs (stdio, kernel32 IAT no-ops)
-            cmds.append(f"{gpp} -x c -fexceptions -DPEOR_EFI -c {freestanding_wsl} -o {freestanding_o}")
-            middle = f"{freestanding_o} {src_wsl}"
+            if arch == "x64":
+                # x64 EFI uses Windows SEH exceptions (same as Linux x64).
+                # seh_linux64.c with -DPEOR_EFI_SEH provides all runtime symbols
+                # (malloc, pthread, kernel32 IAT stubs) using a static heap.
+                seh_wsl = _win_path_to_wsl(seh_linux64_src)
+                cmds.append(
+                    f"{gpp} -x c -fexceptions -DPEOR_EFI_SEH -c {seh_wsl} -o {seh_linux64_o}"
+                )
+                middle = f"{seh_linux64_o} {src_wsl}"
+            else:
+                # x86 EFI uses DWARF exceptions — freestanding.c stubs suffice.
+                cmds.append(
+                    f"{gpp} -x c -fexceptions -DPEOR_EFI -c {freestanding_wsl} -o {freestanding_o}"
+                )
+                middle = f"{freestanding_o} {src_wsl}"
             extra_libs = ""
         elif is_linux:
-            # Write DEF files via Python to avoid shell newline/quoting issues.
-            import tempfile as _tempfile
-            _tmp = Path(_tempfile.mkdtemp())
-            libc_def_win      = _tmp / f"libc_cpp_{arch_tag}.def"
-            libpthread_def_win = _tmp / f"libpthread_cpp_{arch_tag}.def"
-            libc_def_win.write_text(_LIBC_CPP_DEF_CONTENT, encoding="ascii")
-            libpthread_def_win.write_text(_LIBPTHREAD_CPP_DEF_CONTENT, encoding="ascii")
-            libc_def      = _win_path_to_wsl(libc_def_win)
-            libpthread_def = _win_path_to_wsl(libpthread_def_win)
-            liblibc_a     = f"/tmp/liblibc_cpp_{arch_tag}.a"
-            libpthread_a  = f"/tmp/libpthread_cpp_{arch_tag}.a"
-            cmds += [
-                f"{dlltool} -D {_LIBC_DLL_NAME} -d {libc_def} -l {liblibc_a}",
-                f"{dlltool} -D {_LIBPTHREAD_DLL_NAME} -d {libpthread_def} -l {libpthread_a}",
-            ]
             if arch == "x64":
-                # x64 MinGW GCC 13-posix uses Windows SEH for exceptions.
-                # Provide a freestanding SEH emulator that reads the PE's own .pdata/.xdata.
+                # x64: seh_linux64.c supplies freestanding Windows-ABI implementations of ALL
+                # libc.so.6 / libpthread.so.0 symbols via __imp_* variables so that
+                # libsupc++/libgcc_eh (compiled with Windows x64 ABI) don't need to call
+                # glibc (which uses SysV ABI).  No import stubs needed.
                 seh_wsl = _win_path_to_wsl(seh_linux64_src)
                 cmds.append(
                     f"{gpp} -x c -fexceptions -DPEOR_LINUX_SEH -c {seh_wsl} -o {seh_linux64_o}"
                 )
                 middle = f"{seh_linux64_o} {src_wsl}"
+                extra_libs = ""
             else:
+                # x86: cdecl matches Linux IA-32 ABI; generate import stubs normally.
+                import tempfile as _tempfile
+                _tmp = Path(_tempfile.mkdtemp())
+                libc_def_win      = _tmp / f"libc_cpp_{arch_tag}.def"
+                libpthread_def_win = _tmp / f"libpthread_cpp_{arch_tag}.def"
+                libc_def_win.write_text(_LIBC_CPP_DEF_CONTENT, encoding="ascii")
+                libpthread_def_win.write_text(_LIBPTHREAD_CPP_DEF_CONTENT, encoding="ascii")
+                libc_def      = _win_path_to_wsl(libc_def_win)
+                libpthread_def = _win_path_to_wsl(libpthread_def_win)
+                liblibc_a     = f"/tmp/liblibc_cpp_{arch_tag}.a"
+                libpthread_a  = f"/tmp/libpthread_cpp_{arch_tag}.a"
+                cmds += [
+                    f"{dlltool} -D {_LIBC_DLL_NAME} -d {libc_def} -l {liblibc_a}",
+                    f"{dlltool} -D {_LIBPTHREAD_DLL_NAME} -d {libpthread_def} -l {libpthread_a}",
+                ]
                 middle = src_wsl
-            extra_libs = f"{liblibc_a} {libpthread_a}"
+                extra_libs = f"{liblibc_a} {libpthread_a}"
         else:
             # Windows: use freestanding stubs (without -DPEOR_EFI) and link Windows CRT/kernel32
             cmds.append(f"{gpp} -x c -fexceptions -c {freestanding_wsl} -o {freestanding_o}")
@@ -1582,18 +1597,21 @@ def _compile_cpp_pe(gcc_src: Path, out: Path, use_wsl: Optional[bool],
 
         # Final link command (use coff_entry for x86 underscore convention)
         if is_linux:
-            # Import libs (libc/libpthread stubs) go inside --start-group so the linker
-            # rescans them when libgcc_eh/libsupc++ pull in emutls.o / eh_alloc.o.
+            # x64: seh_linux64.o provides all libc/pthread direct and __imp_* exports, so
+            # --disable-auto-import prevents ld from generating pseudo-reloc objects that
+            # would reference _pei386_runtime_relocator (unavailable in -nodefaultlibs).
+            extra_auto_import = "-Wl,--disable-auto-import" if arch == "x64" else ""
             link_cmd = (
-                f"{gpp} {compile_flags} {crtbegin_o} {middle}"
+                f"{gpp} {compile_flags} {extra_auto_import} {crtbegin_o} {middle}"
                 f" -Wl,--start-group {extra_libs} -lgcc_eh -lsupc++ -lgcc -Wl,--end-group"
                 f" {crtend_o}"
                 f" -Wl,-e,{coff_entry} -Wl,--subsystem,{subsystem}"
                 f" -o {out_wsl}"
             )
         elif is_efi:
+            extra_auto_import_efi = "-Wl,--disable-auto-import" if arch == "x64" else ""
             link_cmd = (
-                f"{gpp} {compile_flags} {crtbegin_o} {middle}"
+                f"{gpp} {compile_flags} {extra_auto_import_efi} {crtbegin_o} {middle}"
                 f" {static_libs}"
                 f" {crtend_o}"
                 f" -Wl,-e,{coff_entry} -Wl,--subsystem,{subsystem}"
@@ -1631,10 +1649,18 @@ def _compile_cpp_pe(gcc_src: Path, out: Path, use_wsl: Optional[bool],
             return r
 
         if is_efi:
-            r = _run([gpp, "-x", "c", "-fexceptions", "-DPEOR_EFI", "-c", str(freestanding_src), "-o", str(freestanding_o)])
-            if r.returncode != 0:
-                return r
-            middle_files = [str(freestanding_o), str(gcc_src)]
+            if arch == "x64":
+                r = _run([gpp, "-x", "c", "-fexceptions", "-DPEOR_EFI_SEH",
+                          "-c", str(seh_linux64_src), "-o", str(seh_linux64_o)])
+                if r.returncode != 0:
+                    return r
+                middle_files = [str(seh_linux64_o), str(gcc_src)]
+            else:
+                r = _run([gpp, "-x", "c", "-fexceptions", "-DPEOR_EFI",
+                          "-c", str(freestanding_src), "-o", str(freestanding_o)])
+                if r.returncode != 0:
+                    return r
+                middle_files = [str(freestanding_o), str(gcc_src)]
             extra_libs = []
         elif is_linux:
             libc_def      = tmp_dir / f"libc_cpp_{arch_tag}.def"
@@ -1669,8 +1695,10 @@ def _compile_cpp_pe(gcc_src: Path, out: Path, use_wsl: Optional[bool],
         # Linux: extra_libs (libc/libpthread stubs) go inside --start-group so the linker
         # rescans them when libgcc_eh/libsupc++ pull in emutls.o / eh_alloc.o.
         if is_linux:
+            auto_import_linux = ["-Wl,--disable-auto-import"] if arch == "x64" else []
             cmd = (
                 [gpp] + _MINGW_CPP_EH_FLAGS
+                + auto_import_linux
                 + [str(crtbegin_o)]
                 + middle_files
                 + ["-Wl,--start-group"] + extra_libs + ["-lgcc_eh", "-lsupc++", "-lgcc", "-Wl,--end-group"]
@@ -1679,8 +1707,10 @@ def _compile_cpp_pe(gcc_src: Path, out: Path, use_wsl: Optional[bool],
             )
         else:
             native_libs = _MINGW_CPP_STATIC_LIBS_WINDOWS if not is_efi else _MINGW_CPP_STATIC_LIBS
+            auto_import = ["-Wl,--disable-auto-import"] if is_efi and arch == "x64" else []
             cmd = (
                 [gpp] + _MINGW_CPP_EH_FLAGS
+                + auto_import
                 + [str(crtbegin_o)]
                 + middle_files
                 + extra_libs
@@ -1708,7 +1738,10 @@ def _ensure_linux_loader_32(use_wsl: bool) -> "Path | None":
         capture_output=True, timeout=20,
     )
     if probe.returncode != 0:
-        _wsl_bash_run("sudo apt-get install -y gcc-multilib", capture_output=True, timeout=360)
+        _wsl_bash_run(
+            "DEBIAN_FRONTEND=noninteractive sudo -n apt-get install -y gcc-multilib",
+            capture_output=True, timeout=120,
+        )
     cmd = (
         "gcc -m32 -O2 -ffixed-ebx -ffixed-esi -ffixed-edi"
         f" -o {_win_path_to_wsl(loader)} {_win_path_to_wsl(src)}"

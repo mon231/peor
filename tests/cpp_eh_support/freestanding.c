@@ -180,10 +180,10 @@ typedef void _PEOR_FILE;
 static _PEOR_FILE *_peor_null_iob_fn(unsigned int n) { (void)n; return (_PEOR_FILE *)0; }
 
 /* IAT slot name for __acrt_iob_func differs by arch (COFF underscore rules):
- *   x64: C name == COFF name → C code __imp___acrt_iob_func
- *   x86: COFF = _C_name → need C name imp____acrt_iob_func for COFF _imp____acrt_iob_func */
+ *   x64: COFF name == C name (no prefix)  → C: __imp___acrt_iob_func
+ *   x86: COFF name = "_" + C name         → C: _imp____acrt_iob_func → COFF: __imp____acrt_iob_func */
 #ifdef __i386__
-_PEOR_FILE *(*imp____acrt_iob_func)(unsigned int) = _peor_null_iob_fn;
+_PEOR_FILE *(*_imp____acrt_iob_func)(unsigned int) = _peor_null_iob_fn;
 #else
 _PEOR_FILE *(*__imp___acrt_iob_func)(unsigned int) = _peor_null_iob_fn;
 #endif

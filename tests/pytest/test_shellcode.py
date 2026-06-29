@@ -1216,9 +1216,12 @@ def _find_qemu_ovmf(arch: str = "x64") -> "tuple[str, str, str] | tuple[None, No
         qemu_bin_name = "qemu-system-aarch64"
         qemu_win_path = Path(r"C:\Program Files\qemu\qemu-system-aarch64.exe")
         linux_code_candidates = [
-            "/usr/share/qemu-efi-aarch64/QEMU_EFI.fd",
-            "/usr/share/AAVMF/AAVMF_CODE.fd",
+            "/usr/share/AAVMF/AAVMF_CODE.fd",             # Ubuntu 24.04+ (split)
+            "/usr/share/qemu-efi-aarch64/QEMU_EFI.fd",    # Ubuntu (combined)
             "/usr/share/edk2/aarch64/QEMU_EFI.fd",
+        ]
+        linux_vars_candidates = [
+            "/usr/share/AAVMF/AAVMF_VARS.fd",             # Ubuntu 24.04+ (split)
         ]
         qemu = shutil.which(qemu_bin_name)
         if qemu is None and platform.system() == "Windows" and qemu_win_path.exists():
@@ -1227,21 +1230,25 @@ def _find_qemu_ovmf(arch: str = "x64") -> "tuple[str, str, str] | tuple[None, No
             return None, None, None
         qemu_share = Path(qemu).parent / "share"
         candidates_code = [str(qemu_share / "edk2-aarch64-code.fd")] + linux_code_candidates
+        candidates_vars = linux_vars_candidates + [str(qemu_share / "edk2-aarch64-vars.fd")]
         ovmf_code = next((p for p in candidates_code if Path(p).exists()), None)
         if ovmf_code is None:
             return None, None, None
-        return qemu, ovmf_code, None
+        ovmf_vars = next((p for p in candidates_vars if Path(p).exists()), None)
+        return qemu, ovmf_code, ovmf_vars
     elif arch == "x64":
         qemu_bin_name = "qemu-system-x86_64"
         qemu_win_path = Path(r"C:\Program Files\qemu\qemu-system-x86_64.exe")
         edk2_code = "edk2-x86_64-code.fd"
         edk2_vars = "edk2-x86_64-vars.fd"
         linux_code_candidates = [
+            "/usr/share/OVMF/OVMF_CODE_4M.fd",   # Ubuntu 24.04+
             "/usr/share/OVMF/OVMF_CODE.fd",
             "/usr/share/ovmf/OVMF.fd",
             "/usr/share/edk2/ovmf/OVMF_CODE.fd",
         ]
         linux_vars_candidates = [
+            "/usr/share/OVMF/OVMF_VARS_4M.fd",   # Ubuntu 24.04+
             "/usr/share/OVMF/OVMF_VARS.fd",
             "/usr/share/ovmf/OVMF_VARS.fd",
             "/usr/share/edk2/ovmf/OVMF_VARS.fd",
@@ -1343,7 +1350,7 @@ def _build_and_run_efi(tmp_path: Path, efi_src: Path, expected_stdout_substr: st
     if arch == "arm64":
         clang, use_wsl_clang = _find_clang_arm64_wsl()
         assert clang is not None, "clang with aarch64-w64-mingw32 target not found; install clang+lld"
-        qemu, ovmf_code, _ = _find_qemu_ovmf("arm64")
+        qemu, ovmf_code, ovmf_vars = _find_qemu_ovmf("arm64")
         assert qemu is not None, "qemu-system-aarch64 not found; install qemu-system-arm"
         assert ovmf_code is not None, "AAVMF firmware not found; install qemu-efi-aarch64"
 
@@ -1380,13 +1387,19 @@ def _build_and_run_efi(tmp_path: Path, efi_src: Path, expected_stdout_substr: st
         qemu_cmd = [
             qemu, "-nographic", "-machine", "virt", "-cpu", "cortex-a57",
             "-drive", f"if=pflash,format=raw,readonly=on,file={ovmf_code}",
+        ]
+        if ovmf_vars:
+            aavmf_vars_rw = tmp_path / "AAVMF_VARS.fd"
+            shutil.copy2(ovmf_vars, aavmf_vars_rw)
+            qemu_cmd += ["-drive", f"if=pflash,format=raw,file={aavmf_vars_rw}"]
+        qemu_cmd += [
             "-drive", f"id=boot,if=none,format=vvfat,file=fat:rw:{boot_dir},fat-type=16",
             "-device", "qemu-xhci",
             "-device", "usb-storage,drive=boot",
             "-m", "256M", "-no-reboot",
         ]
         try:
-            result = subprocess.run(qemu_cmd, capture_output=True, timeout=120)
+            result = subprocess.run(qemu_cmd, capture_output=True, timeout=300)
         except subprocess.TimeoutExpired:
             pytest.fail("QEMU ARM64 timed out")
 
@@ -1608,7 +1621,7 @@ _LINUX_LOADER_CFLAGS_32 = [
     # the shellcode breaks).  The relocs-resolver clobbers EBX=PE_base and ESI=past-
     # reloc; entrypoint-resolver further sets ESI=NT_headers.  EDI gets the reloc
     # delta.  Fixing all three makes the clobbers harmless.
-    "-no-pie", "-fno-pic", "-ffixed-ebx", "-ffixed-esi", "-ffixed-edi",
+    "-fno-pie", "-no-pie", "-fno-pic", "-ffixed-ebx", "-ffixed-esi", "-ffixed-edi",
     "-ldl",
 ]
 

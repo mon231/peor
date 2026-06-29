@@ -194,30 +194,40 @@ System V ABI (x64: RDI/RSI/RDX; x86: stack cdecl).
 
 ### EFI Entry Dispatcher
 
-When the PE subsystem is an EFI application (10–13), the EFI entry dispatcher
-(`entrypoint_resolver_efi32/64.asm`) is used instead of the standard Windows
-entry dispatcher.  No import resolver is inserted (EFI applications are
-expected to be importless).
+When the PE subsystem is an EFI application (10–13), an EFI entry dispatcher is
+used instead of the standard Windows entry dispatcher.  No import resolver is
+inserted (EFI applications are expected to be importless).
 
-The shellcode is **fully self-contained** — no runtime parameters are expected
-from the caller.  The reference EFI loader passes `(NULL, NULL)`:
+Three dispatcher variants exist, selected by architecture:
 
-```c
-EFI_STATUS result = ((EFI_STATUS (*)(void *, void *))SHELLCODE_BYTES)(NULL, NULL);
-```
-
+**x86 / x64** (`entrypoint_resolver_efi32/64.asm`): the shellcode is
+**fully self-contained** — no runtime parameters are expected from the caller.
 At runtime the dispatcher:
-1. Scans page-aligned memory from `0x10000` upward looking for
-   `EFI_SYSTEM_TABLE_SIGNATURE` (`0x5453595320494249`), checking that
-   `Revision >= 2.0` and `HeaderSize >= 0x78`.
-2. Once found, calls `efi_main(NULL, SystemTable)`:
-   - x64: Microsoft ABI (RCX = NULL, RDX = SystemTable).
-   - x86: IA-32 cdecl (push SystemTable, push NULL, call).
-3. Returns the `EFI_STATUS` to the caller.
+1. Attempts a fast path: reads the `EFI_SYSTEM_TABLE` pointer from the loader's
+   stack frame at a fixed RSP offset (calibrated to the reference EFI loader
+   compiled with GCC at `-O0`).
+2. Falls back to a memory scan from `SCAN_END` down to `0x10000`, checking each
+   16-byte aligned address for `EFI_SYSTEM_TABLE_SIGNATURE` (`0x5453595320494249`),
+   `Revision >= 2.0`, `HeaderSize >= 0x78`, and valid `BootServices`/`ConOut` pointers.
+   Scan range: `0x10000–0x20000000` for x64, `0x10000–0x10000000` for x86.
+3. Calls `efi_main(NULL, SystemTable)` with the appropriate ABI.
+4. Returns the `EFI_STATUS` to the caller.
 
-The scan range is `0x10000–0x200000000` for x64 and `0x10000–0x10000000` for
-x86.  If the signature is not found, `SystemTable = NULL` is passed and
-`efi_main` is still called (it should handle a NULL table gracefully).
+**ARM64** (`asm/entrypoint_resolver_efi_arm64.asm` + `ARM64_EFI_PREFIX`): uses
+a different approach to avoid scanning unmapped memory (which would cause Data
+Abort exceptions on ARM64).  A 4-byte prefix stub (`mov x24, x1`) is prepended
+to the resolver chain to save the `EFI_SYSTEM_TABLE` pointer (passed in `x1` by
+the EFI firmware) into the callee-saved register `x24` before the relocations
+resolver clobbers `x1`.  The dispatcher then reads `x24` directly to obtain
+`SystemTable` and calls `efi_main(NULL, SystemTable)`.
+
+**ARM64 ADRP alignment requirement**: ARM64 code uses `ADRP` (page-granular
+PC-relative addressing) to access `.rodata` symbols.  `ADRP` is correct only
+when the PE image base is 4 KB page-aligned.  The ARM64 EFI chain is therefore
+padded to exactly 4096 bytes; when the loader allocates `exec_buf` via
+`AllocatePages` (which guarantees page-alignment), the PE starts at
+`exec_buf + 4096` — also page-aligned.  Reference EFI loaders for ARM64 must
+use `AllocatePages` (not `AllocatePool`) for this reason.
 
 ---
 
@@ -439,20 +449,25 @@ pytest tests/pytest -v
 | — | `01_linux_write_x86` | x86 | Same as above but compiled as PE32 with i686-w64-mingw32-gcc; uses x86 Linux chain and 32-bit loader | stdout=PEOR |
 | — | `02_linux_cpp_exceptions` | x64, x86 | Linux C++ shellcode: `throw`/`catch` a custom type, return code 42 for typed catch, 88 for catch-all; x64 uses Windows-SEH emulator (`seh_linux64.c`) | 42 |
 | — | `03_linux_with_crt` | x64, x86 | Linux PE using `strlen`/`malloc`/`free`/`memcpy` from `libc.so.6`; tests multi-symbol dlopen/dlsym resolver | 73 |
-| — | `01_efi_hello` | x64 | Minimal EFI application PE; peor converts it; EFI loader with embedded shellcode boots under QEMU+OVMF; shellcode scans memory for EFI_SYSTEM_TABLE and calls ResetSystem(Shutdown) | QEMU exit 0 |
-| — | `02_efi_print` | x64 | EFI shellcode uses ConOut->OutputString to print "PEOR\_EFI\_HELLO"; checks QEMU stdout | PEOR\_EFI\_HELLO in stdout |
-| — | `03_efi_simple_calc` | x64 | EFI shellcode computes sum(0..99)=4950, prints "PEOR\_4950" via ConOut; checks QEMU stdout | PEOR\_4950 in stdout |
+| — | `04_linux_signal` | x64, x86 | Linux PE installing SIGUSR1 handler via `signal()`, raising it via `raise()`, returns 77; tests signal-handling imports | 77 |
+| — | `05_linux_global_ctor` | x64, x86 | Linux C++ PE with a global constructor that increments a counter; `main` asserts `counter == 99`; tests `.init_array` runner | 99 |
+| — | `01_efi_hello` | x64, x86, arm64 | Minimal EFI application PE; peor converts it; EFI loader with embedded shellcode boots under QEMU+OVMF/AAVMF; shellcode calls ResetSystem(Shutdown) | QEMU exit 0 |
+| — | `02_efi_print` | x64, x86, arm64 | EFI shellcode uses ConOut->OutputString to print "PEOR\_EFI\_HELLO"; checks QEMU stdout | PEOR\_EFI\_HELLO in stdout |
+| — | `03_efi_simple_calc` | x64, x86, arm64 | EFI shellcode computes sum(0..99)=4950, prints "PEOR\_4950" via ConOut; checks QEMU stdout | PEOR\_4950 in stdout |
 | — | `04_efi_cpp_exceptions` | x64, x86 | EFI C++ shellcode: `throw`/`catch` a custom type; x64 uses freestanding Windows-SEH emulator (static heap); x86 uses DWARF/SJLJ; asserts "PEOR\_CPP\_EH\_OK" in QEMU stdout | PEOR\_CPP\_EH\_OK in stdout |
+| — | `05_efi_memory_services` | x64, x86, arm64 | EFI shellcode calls AllocatePool/FreePool to exercise BootServices memory management; asserts "PEOR\_MEM\_OK" in QEMU stdout | PEOR\_MEM\_OK in stdout |
 | — | `test_efi_x86_shellcode_conversion` | x86 | PE32 EFI application compiled with i686-w64-mingw32-gcc; verifies peor produces non-empty shellcode using x86 EFI chain | non-empty bin |
 
 Test 03 requires an interactive desktop and is automatically skipped when the
 `CI` environment variable is set.
 
-Tests `01_linux_write`, `01_linux_write_x86`, `01_efi_hello`, `02_efi_print`,
-`03_efi_simple_calc`, and `test_efi_x86_shellcode_conversion` require a Linux
-runner with `gcc-mingw-w64-x86-64`, `gcc-mingw-w64-i686`, `binutils-mingw-w64-*`,
-`gcc`, `gcc-multilib`, and (for EFI QEMU tests) `qemu-system-x86`/`ovmf`.
-They are automatically skipped on Windows.
+Linux tests (`01_linux_write` through `05_linux_global_ctor`, both x64 and x86 variants)
+and EFI QEMU tests (`01_efi_hello` through `05_efi_memory_services`) require a Linux
+runner.  Building the Linux PE test binaries requires `gcc-mingw-w64-x86-64`,
+`gcc-mingw-w64-i686`, `binutils-mingw-w64-*`, `g++-mingw-w64-x86-64`,
+`g++-mingw-w64-i686`, `gcc`, and `gcc-multilib`.  EFI QEMU tests additionally
+require `qemu-system-x86` and `ovmf`.  On Windows, tests use WSL for compilation
+and the native Windows loader for execution.
 
 ---
 
@@ -476,20 +491,29 @@ For the MinGW cross-platform and Linux import tests (Linux/Ubuntu):
 sudo apt-get install -y \
     gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 \
     gcc-mingw-w64-i686   binutils-mingw-w64-i686 \
+    g++-mingw-w64-x86-64 g++-mingw-w64-i686 \
     gcc gcc-multilib
 
 # x64 Linux test loader (-ffixed-* prevents GCC clobbering shellcode regs)
 gcc -O2 -ffixed-rbx -ffixed-r12 -ffixed-r13 -ffixed-r14 -ffixed-r15 \
-    -o tests/test_loader_linux/test_loader_linux \
+    -o tests/test_loader_linux/test_loader_linux.pe \
     tests/test_loader_linux/main.c -ldl
 
 # x86 Linux test loader
 gcc -m32 -O2 -ffixed-ebx -ffixed-esi -ffixed-edi \
-    -o tests/test_loader_linux/test_loader_linux_32 \
+    -o tests/test_loader_linux/test_loader_linux_32.pe \
     tests/test_loader_linux/main.c -ldl
 
-pytest tests/pytest -v -k "test_mingw_simple_calc or test_01_linux_write"
+pytest tests/pytest -v -k "linux"
 ```
+
+Linux test PEs (compiled by `pytest` on first run or by `build-linux-mingw` CI) are
+cached in `tests/Linux_x64/` and `tests/Linux_x86/`.  Subsequent runs use the
+pre-built PEs directly — MinGW is not required if these directories are populated.
+The Linux NMakefile vcxproj files (`tests/Linux/0[1-5]_*.vcxproj`) can be opened in
+Visual Studio and built individually; they are listed in `tests.sln` for IDE
+visibility but excluded from the default MSBuild target (no `Build.0` entry) to keep
+the Windows build independent of MinGW availability.
 
 For the EFI QEMU tests (Linux/Ubuntu):
 

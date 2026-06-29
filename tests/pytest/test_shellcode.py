@@ -32,8 +32,15 @@ ARCH_DIRS = {
     "x64": TESTS_DIR / "Win_x64",
 }
 
+# Pre-built Linux PE directories (populated by build-linux-mingw CI job or first local run).
+# Tests check these dirs first; compilation only happens when the PE is absent.
+_LINUX_PREBUILD_X64 = TESTS_DIR / "Linux_x64"
+_LINUX_PREBUILD_X86 = TESTS_DIR / "Linux_x86"
+
 MINGW_CPP_EH_RETURN_CODE = 42
 LINUX_CRT_RETURN_CODE = 73
+LINUX_SIGNAL_RETURN_CODE = 77
+LINUX_GLOBAL_CTOR_RETURN_CODE = 99
 
 # v1 and v2: importless, verified by exit code
 _EXIT_CODE_CASES = [
@@ -893,7 +900,7 @@ def test_clangcl_simple_calc(arch, tmp_path):
     exe = tmp_path / "simple_calc_clangcl.exe"
     cc = subprocess.run(
         [clangcl, "/MT", "/Ox", f"/Fe{exe}", str(src)],
-        capture_output=True, timeout=30,
+        capture_output=True, timeout=120,
     )
     assert cc.returncode == 0, (
         f"clang-cl compile failed:\n{cc.stderr.decode(errors='replace')}"
@@ -928,14 +935,20 @@ _MINGW_CFLAGS_LINUX = [
 def _build_linux_write_pe(tmp_path: Path, use_wsl: bool) -> "Path | None":
     """Cross-compile tests/Linux/01_linux_write/main.c as a Windows PE with libc.so.6 imports.
 
-    Returns the path to the compiled .exe or None on failure.
-    Creates a .def file, generates an import library via dlltool, then compiles.
+    Returns the path to the compiled PE, or None on failure.
+    Output goes to the stable tests/Linux_x64/ directory; the pre-built PE is reused on
+    subsequent calls so the build-linux-mingw CI job can pre-populate it.
     """
+    stable = _LINUX_PREBUILD_X64 / "01_linux_write_x64.pe"
+    if stable.exists():
+        return stable
+    _LINUX_PREBUILD_X64.mkdir(parents=True, exist_ok=True)
+
     src = TESTS_DIR / "Linux" / "01_linux_write" / "main.c"
     if not src.exists():
         return None
 
-    exe     = tmp_path / "linux_write.exe"
+    exe     = stable
     def_file = tmp_path / "libc.so.6.def"
     imp_lib  = tmp_path / "liblibc_import.a"
     def_file.write_text(_LIBC_DEF_CONTENT, encoding="ascii")
@@ -1004,25 +1017,31 @@ def test_01_linux_write(arch, tmp_path):
     Tested for both x64 (x86_64-w64-mingw32-gcc) and x86 (i686-w64-mingw32-gcc).
     """
     if arch == "x64":
+        prebuilt = _LINUX_PREBUILD_X64 / "01_linux_write_x64.pe"
         mingw_cmd, use_wsl = _find_mingw_gcc()
-        if mingw_cmd is None:
+        if not prebuilt.exists() and mingw_cmd is None:
             pytest.skip("x86_64-w64-mingw32-gcc not found (native PATH or WSL)")
+        if use_wsl is None:
+            use_wsl = platform.system() == "Windows"
         loader = _ensure_linux_loader(use_wsl)
         if loader is None:
             pytest.skip("Linux test_loader not found and could not be built via WSL")
         exe = _build_linux_write_pe(tmp_path, use_wsl)
         if exe is None:
-            pytest.skip("Failed to build linux_write PE (dlltool or mingw-gcc unavailable)")
+            pytest.fail("Failed to build linux_write PE (dlltool or mingw-gcc unavailable)")
     else:
+        prebuilt = _LINUX_PREBUILD_X86 / "01_linux_write_x86.pe"
         mingw_cmd, use_wsl = _find_mingw_gcc_32()
-        if mingw_cmd is None:
+        if not prebuilt.exists() and mingw_cmd is None:
             pytest.skip("i686-w64-mingw32-gcc not found (native PATH or WSL)")
+        if use_wsl is None:
+            use_wsl = platform.system() == "Windows"
         loader = _ensure_linux_loader_32(use_wsl)
         if loader is None:
             pytest.fail("32-bit Linux test_loader not found and could not be built via WSL — run: wsl sudo apt-get install gcc-multilib")
         exe = _build_linux_write_pe_32(tmp_path, use_wsl)
         if exe is None:
-            pytest.skip("Failed to build x86 linux_write PE")
+            pytest.fail("Failed to build x86 linux_write PE")
 
     sc = tmp_path / f"linux_write_{arch}.bin"
     _shellcodify_platform(exe, sc, _PLATFORM_LINUX)
@@ -1060,6 +1079,9 @@ def test_02_linux_cpp_exceptions(arch, tmp_path):
     main runs.  The Linux loader prints the return value; test checks stdout == '42'.
     Tested for x64 and x86.
     """
+    prebuild_dir = _LINUX_PREBUILD_X64 if arch == "x64" else _LINUX_PREBUILD_X86
+    prebuilt = prebuild_dir / f"02_linux_cpp_exceptions_{arch}.pe"
+
     if arch == "x64":
         gpp_cmd, use_wsl = _find_mingw_gpp_posix()
         gpp_skip = "x86_64-w64-mingw32-g++-posix not found (install g++-mingw-w64-x86-64)"
@@ -1069,16 +1091,20 @@ def test_02_linux_cpp_exceptions(arch, tmp_path):
         gpp_skip = "i686-w64-mingw32-g++-posix not found (install g++-mingw-w64-i686)"
         loader = _ensure_linux_loader_32(use_wsl)
 
-    if gpp_cmd is None:
+    if not prebuilt.exists() and gpp_cmd is None:
         pytest.skip(gpp_skip)
+    if use_wsl is None:
+        use_wsl = platform.system() == "Windows"
     if loader is None:
         pytest.fail("Linux test_loader not found and could not be built — install gcc-multilib")
 
-    exe = tmp_path / f"linux_cpp_except_{arch}.pe"
-    cc = _compile_cpp_pe(_LINUX_CPP_EXCEPTIONS_SRC, exe, use_wsl, "main", "posix", arch=arch)
-    assert cc.returncode == 0, (
-        f"[linux_cpp {arch}] compile failed:\n{cc.stderr.decode(errors='replace')}"
-    )
+    if not prebuilt.exists():
+        prebuild_dir.mkdir(parents=True, exist_ok=True)
+        cc = _compile_cpp_pe(_LINUX_CPP_EXCEPTIONS_SRC, prebuilt, use_wsl, "main", "posix", arch=arch)
+        assert cc.returncode == 0, (
+            f"[linux_cpp {arch}] compile failed:\n{cc.stderr.decode(errors='replace')}"
+        )
+    exe = prebuilt
 
     sc = tmp_path / f"linux_cpp_except_{arch}.bin"
     _shellcodify_platform(exe, sc, _PLATFORM_LINUX)
@@ -1103,18 +1129,100 @@ def test_02_linux_cpp_exceptions(arch, tmp_path):
 
 # ── P4-20: EFI via QEMU ───────────────────────────────────────────────────────
 
-_EFI_LOADER_SRC = TESTS_DIR / "EFI" / "efi_loader" / "main.c"
-_EFI_HELLO_SRC  = TESTS_DIR / "EFI" / "01_efi_hello" / "main.c"
+_EFI_LOADER_SRC    = TESTS_DIR / "EFI" / "efi_loader" / "main.c"
+_EFI_HELLO_SRC     = TESTS_DIR / "EFI" / "01_efi_hello" / "main.c"
+_EFI_PREBUILT_ARM64 = TESTS_DIR / "Win_ARM64"
 
 _MINGW_CFLAGS_EFI = [
     "-nostdlib", "-nodefaultlibs", "-nostartfiles",
     "-fno-unwind-tables", "-fno-asynchronous-unwind-tables",
 ]
 
+_CLANG_CFLAGS_EFI_ARM64 = [
+    "--target=aarch64-w64-mingw32",
+    "-fuse-ld=lld",
+    "-nostdlib", "-nodefaultlibs", "-nostartfiles",
+    "-fno-unwind-tables", "-fno-asynchronous-unwind-tables",
+]
+
+
+def _find_clang_arm64() -> "str | None":
+    """Return path to clang supporting aarch64-w64-mingw32 target, or None."""
+    for clang in ("clang", "clang-18", "clang-17", "clang-16", "clang-15"):
+        path = shutil.which(clang)
+        if path:
+            r = subprocess.run(
+                [path, "--target=aarch64-w64-mingw32", "-print-effective-triple"],
+                capture_output=True, timeout=10,
+            )
+            if r.returncode == 0 and b"aarch64" in r.stdout:
+                return path
+    return None
+
+
+def _find_clang_arm64_wsl() -> "tuple[str | None, bool]":
+    """Return (clang_path_or_cmd, use_wsl) for aarch64-w64-mingw32 clang, or (None, None)."""
+    native = _find_clang_arm64()
+    if native:
+        return native, False
+    if platform.system() == "Windows":
+        try:
+            r = _wsl_bash_run(
+                "clang --target=aarch64-w64-mingw32 -print-effective-triple 2>/dev/null"
+                " || clang-18 --target=aarch64-w64-mingw32 -print-effective-triple 2>/dev/null",
+                capture_output=True, timeout=15,
+            )
+            if r.returncode == 0 and b"aarch64" in r.stdout:
+                return "__wsl_clang__", True
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+    return None, None
+
+
+def _compile_efi_pe_arm64(src: Path, out: Path, extra_includes: "Path | None",
+                           entry_fn: str) -> subprocess.CompletedProcess:
+    """Compile an EFI PE for ARM64 using clang with aarch64-w64-mingw32 target."""
+    clang, use_wsl = _find_clang_arm64_wsl()
+    assert clang is not None, "clang with aarch64-w64-mingw32 target not found"
+    include_flag = [f"-I{extra_includes}"] if extra_includes else []
+    if use_wsl:
+        inc_flag = f"-I{_win_path_to_wsl(extra_includes)}" if extra_includes else ""
+        flags = " ".join(_CLANG_CFLAGS_EFI_ARM64)
+        cmd = (f"clang {flags} {inc_flag}"
+               f" -Wl,--entry={entry_fn} -Wl,--subsystem=efi_application"
+               f" -o {_win_path_to_wsl(out)} {_win_path_to_wsl(src)}")
+        return _wsl_bash_run(cmd, capture_output=True, timeout=30)
+    return subprocess.run(
+        [clang] + _CLANG_CFLAGS_EFI_ARM64
+        + include_flag
+        + [f"-Wl,--entry={entry_fn}", "-Wl,--subsystem=efi_application",
+           "-o", str(out), str(src)],
+        capture_output=True, timeout=30,
+    )
+
 
 def _find_qemu_ovmf(arch: str = "x64") -> "tuple[str, str, str] | tuple[None, None, None]":
     """Return (qemu_bin, ovmf_code, ovmf_vars) or (None, None, None) if unavailable."""
-    if arch == "x64":
+    if arch == "arm64":
+        qemu_bin_name = "qemu-system-aarch64"
+        qemu_win_path = Path(r"C:\Program Files\qemu\qemu-system-aarch64.exe")
+        linux_code_candidates = [
+            "/usr/share/qemu-efi-aarch64/QEMU_EFI.fd",
+            "/usr/share/AAVMF/AAVMF_CODE.fd",
+            "/usr/share/edk2/aarch64/QEMU_EFI.fd",
+        ]
+        qemu = shutil.which(qemu_bin_name)
+        if qemu is None and platform.system() == "Windows" and qemu_win_path.exists():
+            qemu = str(qemu_win_path)
+        if qemu is None:
+            return None, None, None
+        qemu_share = Path(qemu).parent / "share"
+        candidates_code = [str(qemu_share / "edk2-aarch64-code.fd")] + linux_code_candidates
+        ovmf_code = next((p for p in candidates_code if Path(p).exists()), None)
+        if ovmf_code is None:
+            return None, None, None
+        return qemu, ovmf_code, None
+    elif arch == "x64":
         qemu_bin_name = "qemu-system-x86_64"
         qemu_win_path = Path(r"C:\Program Files\qemu\qemu-system-x86_64.exe")
         edk2_code = "edk2-x86_64-code.fd"
@@ -1189,11 +1297,16 @@ def _make_efi_boot_dir(efi_pe: Path, boot_dir: Path, arch: str = "x64") -> None:
     """Populate boot_dir/EFI/BOOT/BOOT*.EFI for QEMU vvfat presentation."""
     efi_boot = boot_dir / "EFI" / "BOOT"
     efi_boot.mkdir(parents=True, exist_ok=True)
-    boot_filename = "BOOTX64.EFI" if arch == "x64" else "BOOTIA32.EFI"
+    if arch == "x64":
+        boot_filename = "BOOTX64.EFI"
+    elif arch == "arm64":
+        boot_filename = "BOOTAA64.EFI"
+    else:
+        boot_filename = "BOOTIA32.EFI"
     shutil.copy2(efi_pe, efi_boot / boot_filename)
 
 
-@pytest.mark.parametrize("arch", ["x64", "x86"])
+@pytest.mark.parametrize("arch", ["x64", "x86", "arm64"])
 def test_01_efi_hello(arch, tmp_path):
     """EFI shellcode: peor converts an EFI application PE; QEMU+OVMF boots it and shuts down.
 
@@ -1212,11 +1325,73 @@ def _build_and_run_efi(tmp_path: Path, efi_src: Path, expected_stdout_substr: st
                         *, arch: str = "x64") -> str:
     """Build an EFI PE, convert to shellcode, embed in loader, boot in QEMU.
 
-    arch="x64" uses qemu-system-x86_64 + OVMF + x86_64 MinGW.
-    arch="x86" uses qemu-system-i386  + OVMF32 + i686 MinGW.
-    Returns QEMU stdout.  Skips via pytest.skip if any required tool is absent.
+    arch="x64"   uses qemu-system-x86_64 + OVMF    + x86_64 MinGW.
+    arch="x86"   uses qemu-system-i386   + OVMF32   + i686 MinGW.
+    arch="arm64" uses qemu-system-aarch64 + AAVMF   + clang aarch64-w64-mingw32.
+    Returns QEMU stdout.  Fails (not skips) if required tools are absent.
     Asserts QEMU exits 0 (ResetSystem called on EFI_SUCCESS).
     """
+    if arch == "arm64":
+        clang, use_wsl_clang = _find_clang_arm64_wsl()
+        assert clang is not None, "clang with aarch64-w64-mingw32 target not found; install clang+lld"
+        qemu, ovmf_code, _ = _find_qemu_ovmf("arm64")
+        assert qemu is not None, "qemu-system-aarch64 not found; install qemu-system-arm"
+        assert ovmf_code is not None, "AAVMF firmware not found; install qemu-efi-aarch64"
+
+        prebuilt_pe = _EFI_PREBUILT_ARM64 / (efi_src.parent.name + ".efi")
+        if prebuilt_pe.exists():
+            efi_pe = prebuilt_pe
+        else:
+            efi_pe = tmp_path / (efi_src.stem + ".efi")
+            cc = _compile_efi_pe_arm64(efi_src, efi_pe, None, "efi_main")
+            assert cc.returncode == 0, (
+                f"ARM64 EFI PE compile failed:\n{cc.stderr.decode(errors='replace')}"
+            )
+
+        sc = tmp_path / (efi_src.stem + ".bin")
+        _shellcodify(efi_pe, sc)
+
+        sc_bytes = sc.read_bytes()
+        hex_bytes = ", ".join(f"0x{b:02x}" for b in sc_bytes)
+        header = (
+            f"static const unsigned char SHELLCODE_BYTES[] = {{{hex_bytes}}};\n"
+            f"static const unsigned long long SHELLCODE_SIZE = {len(sc_bytes)}ULL;\n"
+        )
+        (tmp_path / "shellcode_data.h").write_text(header, encoding="ascii")
+
+        loader_efi = tmp_path / "efi_loader.efi"
+        cc = _compile_efi_pe_arm64(_EFI_LOADER_SRC, loader_efi, tmp_path, "efi_loader_main")
+        assert cc.returncode == 0, (
+            f"ARM64 EFI loader compile failed:\n{cc.stderr.decode(errors='replace')}"
+        )
+
+        boot_dir = tmp_path / "efi_boot"
+        _make_efi_boot_dir(loader_efi, boot_dir, "arm64")
+
+        qemu_cmd = [
+            qemu, "-nographic", "-machine", "virt", "-cpu", "cortex-a57",
+            "-drive", f"if=pflash,format=raw,readonly=on,file={ovmf_code}",
+            "-drive", f"id=boot,if=none,format=vvfat,file=fat:rw:{boot_dir},fat-type=16",
+            "-device", "qemu-xhci",
+            "-device", "usb-storage,drive=boot",
+            "-m", "256M", "-no-reboot",
+        ]
+        try:
+            result = subprocess.run(qemu_cmd, capture_output=True, timeout=120)
+        except subprocess.TimeoutExpired:
+            pytest.fail("QEMU ARM64 timed out")
+
+        stdout = result.stdout.decode(errors="replace")
+        assert result.returncode == 0, (
+            f"[arm64 EFI] QEMU exited {result.returncode} (expected 0 = clean shutdown)\n"
+            f"stdout: {stdout[:2000]}\nstderr: {result.stderr.decode(errors='replace')[:500]}"
+        )
+        if expected_stdout_substr is not None:
+            assert expected_stdout_substr in stdout, (
+                f"[arm64 EFI] Expected {expected_stdout_substr!r} in stdout\nstdout: {stdout[:2000]}"
+            )
+        return stdout
+
     if arch == "x64":
         mingw_cmd, use_wsl = _find_mingw_gcc()
         gcc_skip_msg = "x86_64-w64-mingw32-gcc not found (native or WSL)"
@@ -1300,7 +1475,7 @@ _EFI_PRINT_SRC       = TESTS_DIR / "EFI" / "02_efi_print"       / "main.c"
 _EFI_SIMPLE_CALC_SRC = TESTS_DIR / "EFI" / "03_efi_simple_calc" / "main.c"
 
 
-@pytest.mark.parametrize("arch", ["x64", "x86"])
+@pytest.mark.parametrize("arch", ["x64", "x86", "arm64"])
 def test_02_efi_print(arch, tmp_path):
     """EFI shellcode uses ConOut->OutputString to print PEOR_EFI_HELLO.
 
@@ -1311,7 +1486,7 @@ def test_02_efi_print(arch, tmp_path):
                         arch=arch)
 
 
-@pytest.mark.parametrize("arch", ["x64", "x86"])
+@pytest.mark.parametrize("arch", ["x64", "x86", "arm64"])
 def test_03_efi_simple_calc(arch, tmp_path):
     """EFI shellcode computes sum(0..99)=4950 and prints PEOR_4950 via ConOut.
 
@@ -1755,11 +1930,16 @@ def _ensure_linux_loader_32(use_wsl: bool) -> "Path | None":
 
 def _build_linux_write_pe_32(tmp_path: Path, use_wsl: bool) -> "Path | None":
     """Cross-compile tests/Linux/01_linux_write/main.c as a PE32 with libc.so.6 import."""
+    stable = _LINUX_PREBUILD_X86 / "01_linux_write_x86.pe"
+    if stable.exists():
+        return stable
+    _LINUX_PREBUILD_X86.mkdir(parents=True, exist_ok=True)
+
     src = TESTS_DIR / "Linux" / "01_linux_write" / "main.c"
     if not src.exists():
         return None
 
-    exe      = tmp_path / "linux_write_x86.exe"
+    exe      = stable
     def_file = tmp_path / "libc.so.6.def"
     imp_lib  = tmp_path / "liblibc_import32.a"
     def_file.write_text(_LIBC_DEF_CONTENT_32, encoding="ascii")
@@ -1820,12 +2000,19 @@ def _build_linux_crt_pe(tmp_path: Path, use_wsl: bool, *, arch: str = "x64") -> 
     """Cross-compile tests/Linux/03_linux_with_crt/main.c as a PE with libc.so.6 imports.
 
     Returns the path to the compiled PE, or None on failure.
+    Output goes to the stable tests/Linux_x{64,86}/ directory.
     """
+    prebuild_dir = _LINUX_PREBUILD_X64 if arch == "x64" else _LINUX_PREBUILD_X86
+    stable = prebuild_dir / f"03_linux_with_crt_{arch}.pe"
+    if stable.exists():
+        return stable
+    prebuild_dir.mkdir(parents=True, exist_ok=True)
+
     src = TESTS_DIR / "Linux" / "03_linux_with_crt" / "main.c"
     if not src.exists():
         return None
 
-    exe      = tmp_path / f"linux_crt_{arch}.exe"
+    exe      = stable
     def_file = tmp_path / f"libc_crt_{arch}.def"
     imp_lib  = tmp_path / f"liblibc_crt_{arch}.a"
     def_file.write_text(_LIBC_DEF_CONTENT_CRT, encoding="ascii")
@@ -1895,25 +2082,31 @@ def test_03_linux_with_crt(arch, tmp_path):
     resolver dlopen()s libc.so.6 at runtime.  Returns 73 on success.
     Tested for both x64 and x86.
     """
+    prebuilt = (_LINUX_PREBUILD_X64 if arch == "x64" else _LINUX_PREBUILD_X86) / f"03_linux_with_crt_{arch}.pe"
+
     if arch == "x64":
         mingw_cmd, use_wsl = _find_mingw_gcc()
-        if mingw_cmd is None:
+        if not prebuilt.exists() and mingw_cmd is None:
             pytest.skip("x86_64-w64-mingw32-gcc not found (native PATH or WSL)")
+        if use_wsl is None:
+            use_wsl = platform.system() == "Windows"
         loader = _ensure_linux_loader(use_wsl)
         if loader is None:
             pytest.skip("Linux test_loader not found and could not be built via WSL")
         exe = _build_linux_crt_pe(tmp_path, use_wsl, arch=arch)
     else:
         mingw_cmd, use_wsl = _find_mingw_gcc_32()
-        if mingw_cmd is None:
+        if not prebuilt.exists() and mingw_cmd is None:
             pytest.skip("i686-w64-mingw32-gcc not found (native PATH or WSL)")
+        if use_wsl is None:
+            use_wsl = platform.system() == "Windows"
         loader = _ensure_linux_loader_32(use_wsl)
         if loader is None:
             pytest.fail("32-bit Linux test_loader not found and could not be built via WSL — run: wsl sudo apt-get install gcc-multilib")
         exe = _build_linux_crt_pe(tmp_path, use_wsl, arch=arch)
 
     if exe is None:
-        pytest.skip("Failed to build linux_crt PE (dlltool or mingw-gcc unavailable)")
+        pytest.fail("Failed to build linux_crt PE (dlltool or mingw-gcc unavailable)")
 
     sc = tmp_path / f"linux_crt_{arch}.bin"
     _shellcodify_platform(exe, sc, _PLATFORM_LINUX)
@@ -1936,6 +2129,203 @@ def test_03_linux_with_crt(arch, tmp_path):
         f"[linux_crt {arch}] expected stdout '{LINUX_CRT_RETURN_CODE}', got {stdout!r}\n"
         f"stderr: {result.stderr.decode(errors='replace')}"
     )
+
+
+_LIBC_DEF_CONTENT_SIGNAL = "EXPORTS\nsignal\nraise\n"
+_LINUX_SIGNAL_SRC = TESTS_DIR / "Linux" / "04_linux_signal" / "main.c"
+
+
+def _build_linux_signal_pe(tmp_path: Path, use_wsl: bool, *, arch: str = "x64") -> "Path | None":
+    """Cross-compile tests/Linux/04_linux_signal/main.c as a PE with libc.so.6 signal/raise imports."""
+    prebuild_dir = _LINUX_PREBUILD_X64 if arch == "x64" else _LINUX_PREBUILD_X86
+    stable = prebuild_dir / f"04_linux_signal_{arch}.pe"
+    if stable.exists():
+        return stable
+    prebuild_dir.mkdir(parents=True, exist_ok=True)
+
+    src = _LINUX_SIGNAL_SRC
+    if not src.exists():
+        return None
+
+    exe      = stable
+    def_file = tmp_path / f"libc_signal_{arch}.def"
+    imp_lib  = tmp_path / f"liblibc_signal_{arch}.a"
+    def_file.write_text(_LIBC_DEF_CONTENT_SIGNAL, encoding="ascii")
+
+    if arch == "x64":
+        _GCC    = "x86_64-w64-mingw32-gcc"
+        _DLLTOOL = "x86_64-w64-mingw32-dlltool"
+    else:
+        _GCC    = "i686-w64-mingw32-gcc"
+        _DLLTOOL = "i686-w64-mingw32-dlltool"
+    _MAIN_STUB = "void __main(void) {}"
+    _coff_main = "_main" if arch == "x86" else "main"
+
+    if use_wsl:
+        def_wsl = _win_path_to_wsl(def_file)
+        imp_wsl = _win_path_to_wsl(imp_lib)
+        src_wsl = _win_path_to_wsl(src)
+        exe_wsl = _win_path_to_wsl(exe)
+
+        r = _wsl_bash_run(
+            f"{_DLLTOOL} -D {_LIBC_DLL_NAME} -d {def_wsl} -l {imp_wsl}",
+            capture_output=True, timeout=30,
+        )
+        if r.returncode != 0:
+            return None
+
+        cc = _wsl_bash_run(
+            f"printf '%s' '{_MAIN_STUB}' > /tmp/_peor_sig_stub_{arch}.c"
+            f" && {_GCC} " + " ".join(_MINGW_CFLAGS_LINUX)
+            + f" /tmp/_peor_sig_stub_{arch}.c {src_wsl} {imp_wsl}"
+            f" -Wl,-e,{_coff_main} -Wl,--subsystem,posix -o {exe_wsl}",
+            capture_output=True, timeout=30,
+        )
+    else:
+        r = subprocess.run(
+            [_DLLTOOL, "-D", _LIBC_DLL_NAME, "-d", str(def_file), "-l", str(imp_lib)],
+            capture_output=True, timeout=30,
+        )
+        if r.returncode != 0:
+            return None
+
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".c", mode="w", delete=False) as f:
+            f.write(_MAIN_STUB)
+            stub_file = f.name
+        try:
+            cc = subprocess.run(
+                [_GCC] + _MINGW_CFLAGS_LINUX
+                + [stub_file, str(src), str(imp_lib),
+                   f"-Wl,-e,{_coff_main}", "-Wl,--subsystem,posix", "-o", str(exe)],
+                capture_output=True, timeout=30,
+            )
+        finally:
+            Path(stub_file).unlink(missing_ok=True)
+
+    if cc.returncode != 0 or not exe.exists():
+        return None
+    return exe
+
+
+@pytest.mark.parametrize("arch", ["x64", "x86"])
+def test_04_linux_signal(arch, tmp_path):
+    """Linux import resolver: PE imports signal()/raise() from libc.so.6; shellcode installs
+    SIGUSR1 handler and raises it; returns 77 (SIGNAL_RETURN_CODE) when handler is called.
+    Tested for both x64 and x86.
+    """
+    prebuilt = (_LINUX_PREBUILD_X64 if arch == "x64" else _LINUX_PREBUILD_X86) / f"04_linux_signal_{arch}.pe"
+
+    if arch == "x64":
+        mingw_cmd, use_wsl = _find_mingw_gcc()
+        if not prebuilt.exists() and mingw_cmd is None:
+            pytest.skip("x86_64-w64-mingw32-gcc not found (native PATH or WSL)")
+        if use_wsl is None:
+            use_wsl = platform.system() == "Windows"
+        loader = _ensure_linux_loader(use_wsl)
+        if loader is None:
+            pytest.skip("Linux test_loader not found and could not be built via WSL")
+    else:
+        mingw_cmd, use_wsl = _find_mingw_gcc_32()
+        if not prebuilt.exists() and mingw_cmd is None:
+            pytest.skip("i686-w64-mingw32-gcc not found (native PATH or WSL)")
+        if use_wsl is None:
+            use_wsl = platform.system() == "Windows"
+        loader = _ensure_linux_loader_32(use_wsl)
+        if loader is None:
+            pytest.fail("32-bit Linux test_loader not found and could not be built via WSL — run: wsl sudo apt-get install gcc-multilib")
+
+    exe = _build_linux_signal_pe(tmp_path, use_wsl, arch=arch)
+    if exe is None:
+        pytest.fail("Failed to build linux_signal PE (dlltool or mingw-gcc unavailable)")
+
+    sc = tmp_path / f"linux_signal_{arch}.bin"
+    _shellcodify_platform(exe, sc, _PLATFORM_LINUX)
+
+    if use_wsl:
+        sc_wsl     = _win_path_to_wsl(sc)
+        loader_wsl = _win_path_to_wsl(loader)
+        result = subprocess.run(["wsl", "--", loader_wsl, sc_wsl], capture_output=True, timeout=15)
+    else:
+        result = subprocess.run([str(loader), str(sc)], capture_output=True, timeout=15)
+
+    assert result.returncode == 0, (
+        f"[linux_signal {arch}] loader crashed with code {result.returncode}\n"
+        f"stderr: {result.stderr.decode(errors='replace')}"
+    )
+    stdout = result.stdout.decode(errors="replace").strip()
+    assert stdout == str(LINUX_SIGNAL_RETURN_CODE), (
+        f"[linux_signal {arch}] expected stdout '{LINUX_SIGNAL_RETURN_CODE}', got {stdout!r}\n"
+        f"stderr: {result.stderr.decode(errors='replace')}"
+    )
+
+
+_LINUX_GLOBAL_CTOR_SRC = TESTS_DIR / "Linux" / "05_linux_global_ctor" / "main.cpp"
+
+
+@pytest.mark.parametrize("arch", ["x64", "x86"])
+def test_05_linux_global_ctor(arch, tmp_path):
+    """Linux global C++ constructor test: peor's ctors runner fires two Adder constructors
+    before main(); counter reaches 99; main returns 99.  Tested for x64 and x86.
+    """
+    prebuild_dir = _LINUX_PREBUILD_X64 if arch == "x64" else _LINUX_PREBUILD_X86
+    prebuilt = prebuild_dir / f"05_linux_global_ctor_{arch}.pe"
+
+    if arch == "x64":
+        gpp_cmd, use_wsl = _find_mingw_gpp_posix()
+        gpp_skip = "x86_64-w64-mingw32-g++-posix not found (install g++-mingw-w64-x86-64)"
+        loader = _ensure_linux_loader(use_wsl)
+    else:
+        gpp_cmd, use_wsl = _find_mingw_gpp_posix_32()
+        gpp_skip = "i686-w64-mingw32-g++-posix not found (install g++-mingw-w64-i686)"
+        loader = _ensure_linux_loader_32(use_wsl)
+
+    if not prebuilt.exists() and gpp_cmd is None:
+        pytest.skip(gpp_skip)
+    if use_wsl is None:
+        use_wsl = platform.system() == "Windows"
+    if loader is None:
+        pytest.fail("Linux test_loader not found and could not be built — install gcc-multilib")
+
+    if not prebuilt.exists():
+        prebuild_dir.mkdir(parents=True, exist_ok=True)
+        cc = _compile_cpp_pe(_LINUX_GLOBAL_CTOR_SRC, prebuilt, use_wsl, "main", "posix", arch=arch)
+        assert cc.returncode == 0, (
+            f"[linux_global_ctor {arch}] compile failed:\n{cc.stderr.decode(errors='replace')}"
+        )
+    exe = prebuilt
+
+    sc = tmp_path / f"linux_global_ctor_{arch}.bin"
+    _shellcodify_platform(exe, sc, _PLATFORM_LINUX)
+
+    if use_wsl:
+        sc_wsl     = _win_path_to_wsl(sc)
+        loader_wsl = _win_path_to_wsl(loader)
+        result = subprocess.run(["wsl", "--", loader_wsl, sc_wsl], capture_output=True, timeout=15)
+    else:
+        result = subprocess.run([str(loader), str(sc)], capture_output=True, timeout=15)
+
+    assert result.returncode == 0, (
+        f"[linux_global_ctor {arch}] loader crashed with code {result.returncode}\n"
+        f"stderr: {result.stderr.decode(errors='replace')}"
+    )
+    stdout = result.stdout.decode(errors="replace").strip()
+    assert stdout == str(LINUX_GLOBAL_CTOR_RETURN_CODE), (
+        f"[linux_global_ctor {arch}] expected stdout '{LINUX_GLOBAL_CTOR_RETURN_CODE}', got {stdout!r}\n"
+        f"stderr: {result.stderr.decode(errors='replace')}"
+    )
+
+
+_EFI_MEMORY_SERVICES_SRC = TESTS_DIR / "EFI" / "05_efi_memory_services" / "main.c"
+
+
+@pytest.mark.parametrize("arch", ["x64", "x86", "arm64"])
+def test_05_efi_memory_services(arch, tmp_path):
+    """EFI shellcode calls AllocatePool from EFI_BOOT_SERVICES, writes magic byte 66,
+    reads it back; returns EFI_SUCCESS on match so QEMU shuts down cleanly.
+    Tested for both x64 and x86.
+    """
+    _build_and_run_efi(tmp_path, _EFI_MEMORY_SERVICES_SRC, arch=arch)
 
 
 @pytest.mark.parametrize("arch", ["x64", "x86"])

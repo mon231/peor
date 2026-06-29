@@ -6,10 +6,10 @@
  *     msvcrt.dll (linked via -lmsvcrt) supplies all other C runtime symbols
  *     (malloc/free/abort/memcpy/string functions, stdio, etc.).
  *
- *   -DPEOR_EFI (EFI builds): ALSO provide all stdlib stubs so no OS library
- *     is needed.  Includes stdio no-ops and kernel32 IAT no-ops for x64.
- *
- * NOT used for the Linux chain; Linux imports these symbols from libc.so.6. */
+ *   -DPEOR_EFI (EFI / freestanding builds): ALSO provide all stdlib stubs so
+ *     no OS library is needed.  Includes stdio no-ops and kernel32 IAT no-ops
+ *     for x64.  Used for EFI targets and x86 Linux C++ builds where
+ *     libsupc++.a(vterminate.o) pulls in Windows CRT symbols. */
 
 typedef __SIZE_TYPE__ size_t;
 
@@ -83,16 +83,23 @@ int __mingw_vsprintf(char *buf, const char *fmt, void *ap) {
 #ifdef PEOR_EFI
 
 /* ─── Bump allocator (malloc / free / calloc / realloc) ──────────────────── */
-#define _EH_HEAP_SIZE 65536u
+/* Each allocation is preceded by a header storing the usable size so that
+ * realloc() can copy exactly min(old_size, new_size) bytes. */
+#define _EH_HEAP_SIZE    65536u
+#define _EH_ALLOC_ALIGN  16u
+typedef struct { size_t size; } _peor_alloc_hdr;
+
 static char   _eh_heap[_EH_HEAP_SIZE];
 static size_t _eh_heap_pos = 0;
 
 void *malloc(size_t n) {
-    n = (n + 15u) & ~(size_t)15u;
-    if (_eh_heap_pos + n > _EH_HEAP_SIZE) return (void *)0;
-    void *p = _eh_heap + _eh_heap_pos;
-    _eh_heap_pos += n;
-    return p;
+    n = (n + (_EH_ALLOC_ALIGN - 1u)) & ~(size_t)(_EH_ALLOC_ALIGN - 1u);
+    size_t need = sizeof(_peor_alloc_hdr) + n;
+    if (_eh_heap_pos + need > _EH_HEAP_SIZE) return (void *)0;
+    _peor_alloc_hdr *hdr = (_peor_alloc_hdr *)(_eh_heap + _eh_heap_pos);
+    hdr->size = n;
+    _eh_heap_pos += need;
+    return (void *)(hdr + 1);
 }
 
 void free(void *p) { (void)p; }
@@ -110,8 +117,10 @@ void *calloc(size_t n, size_t size) {
 void *realloc(void *p, size_t n) {
     void *np = malloc(n);
     if (np && p) {
+        _peor_alloc_hdr *hdr = ((_peor_alloc_hdr *)p) - 1;
+        size_t copy = hdr->size < n ? hdr->size : n;
         char *dst = (char *)np, *src = (char *)p;
-        for (size_t i = 0; i < n; i++) dst[i] = src[i];
+        for (size_t i = 0; i < copy; i++) dst[i] = src[i];
     }
     return np;
 }
@@ -166,7 +175,26 @@ char *strchr(const char *s, int c) {
 }
 
 unsigned long strtoul(const char *s, char **end, int base) {
-    (void)base; if (end) *end = (char *)s; return 0;
+    while (*s == ' ' || *s == '\t') s++;
+    if (*s == '+') s++;
+    if ((base == 0 || base == 16) && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+        s += 2; if (!base) base = 16;
+    } else if (base == 0) {
+        base = (s[0] == '0') ? 8 : 10;
+    }
+    unsigned long r = 0;
+    while (*s) {
+        int d;
+        if (*s >= '0' && *s <= '9') d = *s - '0';
+        else if (*s >= 'a' && *s <= 'z') d = *s - 'a' + 10;
+        else if (*s >= 'A' && *s <= 'Z') d = *s - 'A' + 10;
+        else break;
+        if (d >= base) break;
+        r = r * (unsigned long)base + (unsigned long)d;
+        s++;
+    }
+    if (end) *end = (char *)s;
+    return r;
 }
 
 /* ─── Environment / Process ───────────────────────────────────────────────── */

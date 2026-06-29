@@ -43,6 +43,18 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "02_efi_print", "EFI\02_efi_
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "03_efi_simple_calc", "EFI\03_efi_simple_calc\03_efi_simple_calc.vcxproj", "{AAAA0003-0003-0003-0003-000000000003}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "05_efi_memory_services", "EFI\05_efi_memory_services\05_efi_memory_services.vcxproj", "{AAAA0005-0005-0005-0005-000000000005}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "01_linux_write", "Linux\01_linux_write\01_linux_write.vcxproj", "{BBBB0001-0001-0001-0001-000000000001}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "02_linux_cpp_exceptions", "Linux\02_linux_cpp_exceptions\02_linux_cpp_exceptions.vcxproj", "{BBBB0002-0002-0002-0002-000000000002}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "03_linux_with_crt", "Linux\03_linux_with_crt\03_linux_with_crt.vcxproj", "{BBBB0003-0003-0003-0003-000000000003}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "04_linux_signal", "Linux\04_linux_signal\04_linux_signal.vcxproj", "{BBBB0004-0004-0004-0004-000000000004}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "05_linux_global_ctor", "Linux\05_linux_global_ctor\05_linux_global_ctor.vcxproj", "{BBBB0005-0005-0005-0005-000000000005}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Win32 = Debug|Win32
@@ -188,29 +200,41 @@ Global
 		{3A3A3A3A-3A3A-3A3A-3A3A-3A3A3A3A3A3A}.Release|x64.ActiveCfg = Release|x64
 		{3A3A3A3A-3A3A-3A3A-3A3A-3A3A3A3A3A3A}.Release|x64.Build.0 = Release|x64
 		{AAAA0001-0001-0001-0001-000000000001}.Debug|Win32.ActiveCfg = Debug|Win32
-		{AAAA0001-0001-0001-0001-000000000001}.Debug|Win32.Build.0 = Debug|Win32
 		{AAAA0001-0001-0001-0001-000000000001}.Debug|x64.ActiveCfg = Debug|x64
-		{AAAA0001-0001-0001-0001-000000000001}.Debug|x64.Build.0 = Debug|x64
 		{AAAA0001-0001-0001-0001-000000000001}.Release|Win32.ActiveCfg = Release|Win32
-		{AAAA0001-0001-0001-0001-000000000001}.Release|Win32.Build.0 = Release|Win32
 		{AAAA0001-0001-0001-0001-000000000001}.Release|x64.ActiveCfg = Release|x64
-		{AAAA0001-0001-0001-0001-000000000001}.Release|x64.Build.0 = Release|x64
 		{AAAA0002-0002-0002-0002-000000000002}.Debug|Win32.ActiveCfg = Debug|Win32
-		{AAAA0002-0002-0002-0002-000000000002}.Debug|Win32.Build.0 = Debug|Win32
 		{AAAA0002-0002-0002-0002-000000000002}.Debug|x64.ActiveCfg = Debug|x64
-		{AAAA0002-0002-0002-0002-000000000002}.Debug|x64.Build.0 = Debug|x64
 		{AAAA0002-0002-0002-0002-000000000002}.Release|Win32.ActiveCfg = Release|Win32
-		{AAAA0002-0002-0002-0002-000000000002}.Release|Win32.Build.0 = Release|Win32
 		{AAAA0002-0002-0002-0002-000000000002}.Release|x64.ActiveCfg = Release|x64
-		{AAAA0002-0002-0002-0002-000000000002}.Release|x64.Build.0 = Release|x64
 		{AAAA0003-0003-0003-0003-000000000003}.Debug|Win32.ActiveCfg = Debug|Win32
-		{AAAA0003-0003-0003-0003-000000000003}.Debug|Win32.Build.0 = Debug|Win32
 		{AAAA0003-0003-0003-0003-000000000003}.Debug|x64.ActiveCfg = Debug|x64
-		{AAAA0003-0003-0003-0003-000000000003}.Debug|x64.Build.0 = Debug|x64
 		{AAAA0003-0003-0003-0003-000000000003}.Release|Win32.ActiveCfg = Release|Win32
-		{AAAA0003-0003-0003-0003-000000000003}.Release|Win32.Build.0 = Release|Win32
 		{AAAA0003-0003-0003-0003-000000000003}.Release|x64.ActiveCfg = Release|x64
-		{AAAA0003-0003-0003-0003-000000000003}.Release|x64.Build.0 = Release|x64
+		{AAAA0005-0005-0005-0005-000000000005}.Debug|Win32.ActiveCfg = Debug|Win32
+		{AAAA0005-0005-0005-0005-000000000005}.Debug|x64.ActiveCfg = Debug|x64
+		{AAAA0005-0005-0005-0005-000000000005}.Release|Win32.ActiveCfg = Release|Win32
+		{AAAA0005-0005-0005-0005-000000000005}.Release|x64.ActiveCfg = Release|x64
+		{BBBB0001-0001-0001-0001-000000000001}.Debug|Win32.ActiveCfg = Debug|Win32
+		{BBBB0001-0001-0001-0001-000000000001}.Debug|x64.ActiveCfg = Debug|x64
+		{BBBB0001-0001-0001-0001-000000000001}.Release|Win32.ActiveCfg = Release|Win32
+		{BBBB0001-0001-0001-0001-000000000001}.Release|x64.ActiveCfg = Release|x64
+		{BBBB0002-0002-0002-0002-000000000002}.Debug|Win32.ActiveCfg = Debug|Win32
+		{BBBB0002-0002-0002-0002-000000000002}.Debug|x64.ActiveCfg = Debug|x64
+		{BBBB0002-0002-0002-0002-000000000002}.Release|Win32.ActiveCfg = Release|Win32
+		{BBBB0002-0002-0002-0002-000000000002}.Release|x64.ActiveCfg = Release|x64
+		{BBBB0003-0003-0003-0003-000000000003}.Debug|Win32.ActiveCfg = Debug|Win32
+		{BBBB0003-0003-0003-0003-000000000003}.Debug|x64.ActiveCfg = Debug|x64
+		{BBBB0003-0003-0003-0003-000000000003}.Release|Win32.ActiveCfg = Release|Win32
+		{BBBB0003-0003-0003-0003-000000000003}.Release|x64.ActiveCfg = Release|x64
+		{BBBB0004-0004-0004-0004-000000000004}.Debug|Win32.ActiveCfg = Debug|Win32
+		{BBBB0004-0004-0004-0004-000000000004}.Debug|x64.ActiveCfg = Debug|x64
+		{BBBB0004-0004-0004-0004-000000000004}.Release|Win32.ActiveCfg = Release|Win32
+		{BBBB0004-0004-0004-0004-000000000004}.Release|x64.ActiveCfg = Release|x64
+		{BBBB0005-0005-0005-0005-000000000005}.Debug|Win32.ActiveCfg = Debug|Win32
+		{BBBB0005-0005-0005-0005-000000000005}.Debug|x64.ActiveCfg = Debug|x64
+		{BBBB0005-0005-0005-0005-000000000005}.Release|Win32.ActiveCfg = Release|Win32
+		{BBBB0005-0005-0005-0005-000000000005}.Release|x64.ActiveCfg = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

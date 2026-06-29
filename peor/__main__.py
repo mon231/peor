@@ -14,6 +14,8 @@ from peor._shellcodes import (
     TLS_CALLBACKS_32, TLS_CALLBACKS_64,
     CXX_EH_FIXER_64,
     CTORS_RUNNER_64, CTORS_RUNNER_32,
+    RELOCS_ARM64, CTORS_RUNNER_ARM64, ENTRYPOINT_EFI_ARM64,
+    ARM64_EFI_PREFIX,
 )
 
 # PE Optional Header Data Directory indices (PECOFF spec §3.4)
@@ -60,6 +62,9 @@ _NATIVE_SUBSYSTEM       = 1   # Windows native (kernel-mode drivers)
 _POSIX_CUI_SUBSYSTEM    = 7   # POSIX CUI — auto-selects Linux shellcode chain
 _EFI_SUBSYSTEMS = frozenset({10, 11, 12, 13})   # EFI_APPLICATION / BOOT_SERVICE / RUNTIME / ROM
 
+# Machine types (PECOFF spec §2.3.1).
+_MACHINE_ARM64 = 0xAA64   # IMAGE_FILE_MACHINE_ARM64
+
 # Platform keys used to select a shellcode chain in _SHELLCODES.
 # User-facing platform names (_PLATFORM_LINUX / _PLATFORM_EFI) select the
 # architecture-specific variant based on pe.PE_TYPE at validation time.
@@ -67,6 +72,7 @@ _PLATFORM_LINUX    = 'linux'
 _PLATFORM_EFI      = 'efi'
 _PLATFORM_LINUX_32 = 'linux32'   # internal key for x86 Linux chain
 _PLATFORM_EFI_32   = 'efi32'     # internal key for x86 EFI chain
+_PLATFORM_EFI_ARM64 = 'efi_arm64'  # internal key for ARM64 EFI chain
 
 # Per-architecture shellcode table.
 # dir_array_offset: bytes from the optional-header start to the DataDirectory array
@@ -183,6 +189,30 @@ _SHELLCODES = {
         'dir_array_offset':  96,
         'disp32_off':        8,
         'ep_rva_magic':      _EP_RVA_MAGIC,
+    },
+    # EFI ARM64: ARM64_EFI_PREFIX (mov x24, x1) is prepended before the relocs resolver to
+    # save the EFI_SYSTEM_TABLE pointer (x1) into x24 before the relocs resolver clobbers
+    # x1 (and x20-x23).  The entrypoint resolver reads x24 directly (no scan).
+    # The loader must call the shellcode with (image_handle, system_table) parameters.
+    # Selected when Subsystem in _EFI_SUBSYSTEMS and Machine == _MACHINE_ARM64, or --platform efi.
+    # disp64_off=8: the relocs resolver uses an 8-byte literal pool at offset 8 for PE_OFFSET.
+    _PLATFORM_EFI_ARM64: {
+        'prefix':            ARM64_EFI_PREFIX,
+        'relocs':            RELOCS_ARM64,
+        'imports':           b'',
+        'delay_imports':     b'',
+        'entrypoint':        ENTRYPOINT_EFI_ARM64,
+        'seh':               b'',
+        'seh_always':        False,
+        'tls':               b'',
+        'ctors':             CTORS_RUNNER_ARM64,
+        'ctors_rva_magic':   _CTORS_RVA_MAGIC,
+        'ctors_size_magic':  _CTORS_SIZE_MAGIC,
+        'tail':              b'',
+        'dir_array_offset':  112,
+        'disp64_off':        8,
+        'ep_rva_magic':      _EP_RVA_MAGIC,
+        'pe_align':          4096,
     },
 }
 
@@ -301,12 +331,16 @@ def _validate_pe(pe: PE, platform: str | None = None) -> dict:
         return _SHELLCODES[_PLATFORM_LINUX]
 
     if platform == _PLATFORM_EFI:
+        if pe.FILE_HEADER.Machine == _MACHINE_ARM64:
+            return _SHELLCODES[_PLATFORM_EFI_ARM64]
         if pe.PE_TYPE == OPTIONAL_HEADER_MAGIC_PE:
             return _SHELLCODES[_PLATFORM_EFI_32]
         return _SHELLCODES[_PLATFORM_EFI]
 
     # Auto-detect EFI or Linux from subsystem.
     if subsystem in _EFI_SUBSYSTEMS:
+        if pe.FILE_HEADER.Machine == _MACHINE_ARM64:
+            return _SHELLCODES[_PLATFORM_EFI_ARM64]
         if pe.PE_TYPE == OPTIONAL_HEADER_MAGIC_PE:
             return _SHELLCODES[_PLATFORM_EFI_32]
         return _SHELLCODES[_PLATFORM_EFI]
@@ -408,29 +442,41 @@ def _build_shellcode_chain(pe: PE, entry: dict, skip_imports: bool = False,
         entrypoint[idx:idx + 4] = struct.pack('<I', ep_rva)
     entrypoint = bytes(entrypoint)
 
-    # PE image must be 16-byte aligned in the buffer for MOVDQA/MOVAPS safety.
+    # PE image alignment: normally 16-byte for MOVDQA/MOVAPS safety (x86/x64).
+    # ARM64 EFI uses 4096-byte (page) alignment so that PE_base is page-aligned when the
+    # loader allocates exec_buf via AllocatePages; ADRP instructions in ARM64 PE code use
+    # page-granular offsets that only work correctly when PE_base falls on a page boundary.
+    prefix = bytes(entry.get('prefix', b''))
+    pe_align = entry.get('pe_align', 16)
     align_pad = (
-        -len(imports) - len(relocs) - len(delay_imports)
+        -len(prefix) - len(imports) - len(relocs) - len(delay_imports)
         - len(cxx_fixer) - len(seh) - len(tls) - len(ctors) - len(entrypoint)
-    ) % 16
+    ) % pe_align
 
-    # Patch the disp32 in the relocs resolver.
-    # setup.py bakes in disp32 = len(relocs_assembled) - 5 (PE follows relocs standalone).
-    # We add the remaining shellcodes + alignment padding that come after relocs.
-    # delay_imports comes after relocs so it is included in extra.
+    # Patch the PE_OFFSET in the relocs resolver.
+    # For x86/x64: disp32_off points to a 4-byte signed LEA disp32; setup.py bakes in
+    #   len(relocs_assembled) - 5 (call+pop prologue, _base is 5 bytes from start).
+    # For ARM64: disp64_off=8 points to an 8-byte literal pool; setup.py bakes in
+    #   len(relocs_assembled) (_base is at offset 0, PE follows the entire blob).
+    # In both cases we add the extra bytes that come after relocs in the chain.
     extra    = len(delay_imports) + len(cxx_fixer) + len(seh) + len(tls) + len(ctors) + len(entrypoint) + align_pad
-    off      = entry['disp32_off']
     relocs   = bytearray(relocs)
-    old      = int.from_bytes(relocs[off:off + 4], 'little')
-    new_disp = old + extra
-    if new_disp > _MAX_SHELLCODE_DISP32:
-        raise ValueError(
-            f"shellcode chain too large: relocs resolver disp32 {new_disp:#010x} "
-            f"would overflow the signed 32-bit LEA field (max {_MAX_SHELLCODE_DISP32:#010x})"
-        )
-    relocs[off:off + 4] = new_disp.to_bytes(4, 'little')
+    if 'disp64_off' in entry:
+        off      = entry['disp64_off']
+        old      = int.from_bytes(relocs[off:off + 8], 'little')
+        relocs[off:off + 8] = (old + extra).to_bytes(8, 'little')
+    else:
+        off      = entry['disp32_off']
+        old      = int.from_bytes(relocs[off:off + 4], 'little')
+        new_disp = old + extra
+        if new_disp > _MAX_SHELLCODE_DISP32:
+            raise ValueError(
+                f"shellcode chain too large: relocs resolver disp32 {new_disp:#010x} "
+                f"would overflow the signed 32-bit LEA field (max {_MAX_SHELLCODE_DISP32:#010x})"
+            )
+        relocs[off:off + 4] = new_disp.to_bytes(4, 'little')
 
-    return (imports + bytes(relocs) + delay_imports + cxx_fixer + seh
+    return (prefix + imports + bytes(relocs) + delay_imports + cxx_fixer + seh
             + tls + ctors + entrypoint + (b'\x90' * align_pad))
 
 

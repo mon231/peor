@@ -75,6 +75,27 @@ def _assemble_shellcodes():
 
         return bytes(result)
 
+    def assemble_arm64(asm_path, patch_pe_offset_pool=False):
+        # IMPORTANT: KS_OPT_SYNTAX_NASM (set by any x86 Ks instance) permanently poisons
+        # the Keystone global state for ARM64 assembly. All ARM64 files must be assembled
+        # BEFORE any x86 `assemble()` call that sets KS_OPT_SYNTAX_NASM.
+        ks = keystone.Ks(keystone.KS_ARCH_ARM64, keystone.KS_MODE_LITTLE_ENDIAN)
+        src = _preprocess_asm(Path(asm_path).read_text())
+        encoding, _ = ks.asm(src)
+        if encoding is None:
+            raise RuntimeError(f"keystone ARM64 assembly failed for {asm_path}")
+        result = bytearray(encoding)
+        if patch_pe_offset_pool:
+            # _base is at offset 0; pool is at offsets [8:16] (two NOPs patched here).
+            # Initial PE_OFFSET = len(blob) because _base + len(blob) = address of PE.
+            result[8:16] = struct.pack('<Q', len(result))
+        return bytes(result)
+
+    # ARM64 assembly MUST happen before any x86 assemble() call (see comment in assemble_arm64).
+    r_arm64     = assemble_arm64(ASM_DIR / 'relocations_resolver_arm64.asm', patch_pe_offset_pool=True)
+    ctors_arm64 = assemble_arm64(ASM_DIR / 'ctors_runner_arm64.asm')
+    e_efi_arm64_raw = assemble_arm64(ASM_DIR / 'entrypoint_resolver_efi_arm64.asm')
+
     r32      = assemble(ASM_DIR / 'relocations_resolver32.asm',       keystone.KS_ARCH_X86, keystone.KS_MODE_32, patch_pe_offset=True)
     r64      = assemble(ASM_DIR / 'relocations_resolver64.asm',       keystone.KS_ARCH_X86, keystone.KS_MODE_64, patch_pe_offset=True)
     i32      = assemble(ASM_DIR / 'imports_resolver32.asm',           keystone.KS_ARCH_X86, keystone.KS_MODE_32)
@@ -86,33 +107,35 @@ def _assemble_shellcodes():
 
     e32_raw  = assemble(ASM_DIR / 'entrypoint_resolver32.asm',        keystone.KS_ARCH_X86, keystone.KS_MODE_32)
     e64_raw  = assemble(ASM_DIR / 'entrypoint_resolver64.asm',        keystone.KS_ARCH_X86, keystone.KS_MODE_64)
-    e_efi64_raw = assemble(ASM_DIR / 'entrypoint_resolver_efi64.asm', keystone.KS_ARCH_X86, keystone.KS_MODE_64)
-    e_efi32_raw = assemble(ASM_DIR / 'entrypoint_resolver_efi32.asm', keystone.KS_ARCH_X86, keystone.KS_MODE_32)
+    e_efi64_raw     = assemble(ASM_DIR / 'entrypoint_resolver_efi64.asm',      keystone.KS_ARCH_X86, keystone.KS_MODE_64)
+    e_efi32_raw     = assemble(ASM_DIR / 'entrypoint_resolver_efi32.asm',      keystone.KS_ARCH_X86, keystone.KS_MODE_32)
     # Verify EP_RVA_MAGIC appears exactly once in each entrypoint resolver (peor patches it at conversion time)
     for ep_name, ep_raw in [
-        ('entrypoint_resolver32.asm',     e32_raw),
-        ('entrypoint_resolver64.asm',     e64_raw),
-        ('entrypoint_resolver_efi64.asm', e_efi64_raw),
-        ('entrypoint_resolver_efi32.asm', e_efi32_raw),
+        ('entrypoint_resolver32.asm',          e32_raw),
+        ('entrypoint_resolver64.asm',          e64_raw),
+        ('entrypoint_resolver_efi64.asm',      e_efi64_raw),
+        ('entrypoint_resolver_efi32.asm',      e_efi32_raw),
+        ('entrypoint_resolver_efi_arm64.asm',  e_efi_arm64_raw),
     ]:
         if bytes(ep_raw).count(_EP_RVA_PLACEHOLDER) != 1:
             raise RuntimeError(f"Expected exactly one EP_RVA_MAGIC 0xCECECECE in {ep_name}")
-    e32     = e32_raw
-    e64     = e64_raw
-    e_efi64 = e_efi64_raw
-    e_efi32 = e_efi32_raw
+    e32         = e32_raw
+    e64         = e64_raw
+    e_efi64     = e_efi64_raw
+    e_efi32     = e_efi32_raw
+    e_efi_arm64 = e_efi_arm64_raw
 
     s64  = assemble(ASM_DIR / 'seh_registrar64.asm',         keystone.KS_ARCH_X86, keystone.KS_MODE_64)
     s32  = assemble(ASM_DIR / 'seh_registrar32.asm',         keystone.KS_ARCH_X86, keystone.KS_MODE_32)
     t32  = assemble(ASM_DIR / 'tls_callbacks32.asm',         keystone.KS_ARCH_X86, keystone.KS_MODE_32)
     t64  = assemble(ASM_DIR / 'tls_callbacks64.asm',         keystone.KS_ARCH_X86, keystone.KS_MODE_64)
-    ctors64 = assemble(ASM_DIR / 'ctors_runner64.asm',       keystone.KS_ARCH_X86, keystone.KS_MODE_64)
-    ctors32 = assemble(ASM_DIR / 'ctors_runner32.asm',       keystone.KS_ARCH_X86, keystone.KS_MODE_32)
+    ctors64     = assemble(ASM_DIR / 'ctors_runner64.asm',       keystone.KS_ARCH_X86, keystone.KS_MODE_64)
+    ctors32     = assemble(ASM_DIR / 'ctors_runner32.asm',       keystone.KS_ARCH_X86, keystone.KS_MODE_32)
 
     # Verify ctors magic bytes appear exactly once in each assembled ctors runner.
     _CTORS_RVA_MAGIC_BYTES  = b'\xfd\xfc\xfb\xfa'
     _CTORS_SIZE_MAGIC_BYTES = b'\xe4\xe3\xe2\xe1'
-    for _name, _raw in [('ctors_runner64.asm', ctors64), ('ctors_runner32.asm', ctors32)]:
+    for _name, _raw in [('ctors_runner64.asm', ctors64), ('ctors_runner32.asm', ctors32), ('ctors_runner_arm64.asm', ctors_arm64)]:
         if _raw.count(_CTORS_RVA_MAGIC_BYTES) != 1:
             raise RuntimeError(f"CTORS_RVA_MAGIC not unique in {_name}")
         if _raw.count(_CTORS_SIZE_MAGIC_BYTES) != 1:
@@ -167,6 +190,10 @@ def _assemble_shellcodes():
         f"CXX_EH_FIXER_64        = bytes.fromhex('{f64.hex()}')\n"
         f"CTORS_RUNNER_64        = bytes.fromhex('{ctors64.hex()}')\n"
         f"CTORS_RUNNER_32        = bytes.fromhex('{ctors32.hex()}')\n"
+        f"RELOCS_ARM64           = bytes.fromhex('{r_arm64.hex()}')\n"
+        f"CTORS_RUNNER_ARM64     = bytes.fromhex('{ctors_arm64.hex()}')\n"
+        f"ENTRYPOINT_EFI_ARM64   = bytes.fromhex('{e_efi_arm64.hex()}')\n"
+        "ARM64_EFI_PREFIX       = bytes.fromhex('f80301aa')\n"
     )
 
     print(f"[peor] assembled shellcodes -> {SHELLCODES_PY}")

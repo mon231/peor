@@ -33,29 +33,93 @@ jobs:
       - name: Set up MSBuild
         uses: microsoft/setup-msbuild@v2
 
-      - name: Cache test binaries
-        id: cache-bins
+      - name: Cache Release test binaries
+        id: cache-bins-release
         uses: actions/cache@v4
         with:
           path: |
             tests/Win_x86
             tests/Win_x64
-          key: test-bins-${{ runner.os }}-${{ hashFiles('tests/**/*.cpp', 'tests/**/*.c', 'tests/**/*.vcxproj', 'tests/tests.sln') }}
+            tests/Win_ARM64
+          key: test-bins-release-${{ runner.os }}-${{ hashFiles('tests/**/*.cpp', 'tests/**/*.c', 'tests/**/*.vcxproj', 'tests/tests.sln') }}
 
-      - name: Build test suite (Win32)
-        if: steps.cache-bins.outputs.cache-hit != 'true'
+      - name: Build test suite Release (Win32)
+        if: steps.cache-bins-release.outputs.cache-hit != 'true'
         working-directory: tests
         run: msbuild tests.sln /p:Configuration=Release /p:Platform=Win32 /m /nologo /verbosity:minimal
 
-      - name: Build test suite (x64)
-        if: steps.cache-bins.outputs.cache-hit != 'true'
+      - name: Build test suite Release (x64)
+        if: steps.cache-bins-release.outputs.cache-hit != 'true'
         working-directory: tests
         run: msbuild tests.sln /p:Configuration=Release /p:Platform=x64 /m /nologo /verbosity:minimal
 
-      - name: Upload test binaries
+      - name: Build EFI tests Release (ARM64)
+        if: steps.cache-bins-release.outputs.cache-hit != 'true'
+        working-directory: tests
+        shell: pwsh
+        run: |
+          $slnDir = (Resolve-Path ".").Path + "\"
+          foreach ($p in @(
+            "EFI\01_efi_hello\01_efi_hello.vcxproj",
+            "EFI\02_efi_print\02_efi_print.vcxproj",
+            "EFI\03_efi_simple_calc\03_efi_simple_calc.vcxproj",
+            "EFI\05_efi_memory_services\05_efi_memory_services.vcxproj"
+          )) {
+            msbuild $p /p:Configuration=Release /p:Platform=ARM64 "/p:SolutionDir=$slnDir" /m /nologo /verbosity:minimal
+            if ($LASTEXITCODE -ne 0) { throw "MSBuild failed for $p" }
+          }
+
+      - name: Upload Release test binaries
         uses: actions/upload-artifact@v4
         with:
-          name: test-bins-windows
+          name: test-bins-windows-release
+          path: |
+            tests/Win_x86
+            tests/Win_x64
+          retention-days: 1
+
+      - name: Upload ARM64 EFI binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-bins-efi-arm64
+          path: tests/Win_ARM64
+          retention-days: 1
+
+# ─────────────────────────────────────────────────────────────────────────────
+# build-windows-debug: compile all test PEs in Debug mode
+# ─────────────────────────────────────────────────────────────────────────────
+  build-windows-debug:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Cache Debug test binaries
+        id: cache-bins-debug
+        uses: actions/cache@v4
+        with:
+          path: |
+            tests/Win_x86
+            tests/Win_x64
+          key: test-bins-debug-${{ runner.os }}-${{ hashFiles('tests/**/*.cpp', 'tests/**/*.c', 'tests/**/*.vcxproj', 'tests/tests.sln') }}
+
+      - name: Build test suite Debug (Win32)
+        if: steps.cache-bins-debug.outputs.cache-hit != 'true'
+        working-directory: tests
+        run: msbuild tests.sln /p:Configuration=Debug /p:Platform=Win32 /m /nologo /verbosity:minimal
+
+      - name: Build test suite Debug (x64)
+        if: steps.cache-bins-debug.outputs.cache-hit != 'true'
+        working-directory: tests
+        run: msbuild tests.sln /p:Configuration=Debug /p:Platform=x64 /m /nologo /verbosity:minimal
+
+      - name: Upload Debug test binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-bins-windows-debug
           path: |
             tests/Win_x86
             tests/Win_x64
@@ -78,12 +142,12 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e .
-          pip install pytest pytest-cov
+          pip install pytest pytest-cov pytest-timeout
 
-      - name: Download test binaries
+      - name: Download Release test binaries
         uses: actions/download-artifact@v4
         with:
-          name: test-bins-windows
+          name: test-bins-windows-release
           path: .
 
       - name: Add VS-bundled clang-cl to PATH
@@ -98,10 +162,44 @@ jobs:
             echo "clang-cl not found in VS install; test_clangcl will skip"
           }
 
-      - name: Run pytest (Windows)
-        run: pytest tests/pytest/ -v --cov=peor --cov-report=xml --cov-report=term-missing
+      - name: Run pytest (Windows Release)
+        run: pytest tests/pytest/ -v --cov=peor --cov-report=xml --cov-report=term-missing --timeout=60
 
-  test-linux-mingw:
+# ─────────────────────────────────────────────────────────────────────────────
+# test-windows-debug: run shellcode tests against Debug-mode PE binaries
+# ─────────────────────────────────────────────────────────────────────────────
+  test-windows-debug:
+    runs-on: windows-latest
+    needs: build-windows-debug
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pytest pytest-timeout
+
+      - name: Download Debug test binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: test-bins-windows-debug
+          path: .
+
+      - name: Run pytest (Windows Debug)
+        run: pytest tests/pytest/ -v --timeout=60
+
+# ─────────────────────────────────────────────────────────────────────────────
+# build-linux-mingw: cross-compile all Linux PE tests and build the test loaders
+# ─────────────────────────────────────────────────────────────────────────────
+  build-linux-mingw:
     runs-on: ubuntu-latest
 
     steps:
@@ -147,10 +245,54 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e .
-          pip install pytest
+          pip install pytest pytest-timeout
 
-      - name: Run MinGW and Linux import tests (x64 + x86)
-        run: pytest tests/pytest -v
+      - name: Cross-compile all Linux PE tests (x64 + x86)
+        run: pytest tests/pytest -v --timeout=120 -k "linux"
+
+      - name: Upload Linux build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-bins-linux
+          path: |
+            tests/Linux_x64
+            tests/Linux_x86
+            tests/test_loader_linux
+          retention-days: 1
+
+# ─────────────────────────────────────────────────────────────────────────────
+# test-linux-mingw: run Linux shellcode tests against pre-built PEs (no MinGW)
+# ─────────────────────────────────────────────────────────────────────────────
+  test-linux-mingw:
+    runs-on: ubuntu-latest
+    needs: build-linux-mingw
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Download Linux build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: test-bins-linux
+          path: tests
+
+      - name: Mark test loaders executable
+        run: chmod +x tests/test_loader_linux/test_loader_linux.pe tests/test_loader_linux/test_loader_linux_32.pe
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pytest pytest-timeout
+
+      - name: Run Linux shellcode tests (x64 + x86)
+        run: pytest tests/pytest -v --timeout=60 -k "linux"
 
   test-efi-qemu:
     runs-on: ubuntu-latest
@@ -168,8 +310,14 @@ jobs:
       - name: Download test binaries (for MSVC EFI tests)
         uses: actions/download-artifact@v4
         with:
-          name: test-bins-windows
+          name: test-bins-windows-release
           path: .
+
+      - name: Download ARM64 EFI binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: test-bins-efi-arm64
+          path: tests/Win_ARM64
 
       - name: Cache apt packages
         uses: actions/cache@v4
@@ -178,20 +326,22 @@ jobs:
           key: apt-efi-${{ runner.os }}-${{ hashFiles('.github/workflows/test.yml') }}
           restore-keys: apt-efi-${{ runner.os }}-
 
-      - name: Install MinGW (x64 + x86), QEMU, and OVMF
+      - name: Install MinGW (x64 + x86), QEMU, OVMF, and ARM64 tools
         run: |
           sudo apt-get update -y
           sudo apt-get install -y \
             gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 \
             gcc-mingw-w64-i686   binutils-mingw-w64-i686 \
             g++-mingw-w64-x86-64 g++-mingw-w64-i686 \
-            qemu-system-x86 ovmf
+            qemu-system-x86 ovmf \
+            clang lld \
+            qemu-system-arm qemu-efi-aarch64
 
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -e .
-          pip install pytest
+          pip install pytest pytest-timeout
 
-      - name: Run EFI shellcode tests (x64 + x86 QEMU)
-        run: pytest tests/pytest -v
+      - name: Run EFI shellcode tests (x64 + x86 + ARM64 QEMU)
+        run: pytest tests/pytest -v --timeout=120

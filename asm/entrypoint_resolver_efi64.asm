@@ -48,11 +48,15 @@
 %define EFI_FIRMWARE_ADDR_MIN                   0x100000
 
 ; Stack offset to the system_table pointer saved by efi_loader_main.
-; efi_loader_main (GCC MS-ABI) saves system_table at [rbp+0x18].
-; With `push rbp + sub rsp, 0x60 + call SHELLCODE`, RSP at shellcode entry satisfies:
+; efi_loader_main (GCC MS-ABI, -O0) saves system_table (rdx) at [rbp+0x18].
+; With `push rbp + sub rsp, 0x50 + call SHELLCODE`, RSP at shellcode entry satisfies:
 ;   [RSP + EFI_LOADER_SYSPTAB_RSP_OFFSET] = system_table
-;   offset = 0x68 (frame alloc) + 8 (push rbp) + 8 (call ret addr) = 0x80
-%define EFI_LOADER_SYSPTAB_RSP_OFFSET           0x80
+;   offset = 0x50 (frame alloc) + 8 (push rbp) + 8 (call ret addr) + 0x10 (param offset) = 0x70
+; IMPORTANT: This offset depends on the exact size of the efi_loader_main stack frame.
+; The frame size is 0x50 when efi_loader_main has 5 local pointer variables.
+; If locals are added/removed from efi_loader_main, this offset must be recalculated as:
+;   (sub_rsp_value) + 8 + 8 + 0x10, where sub_rsp_value = frame alloc from `subq $N, %rsp`.
+%define EFI_LOADER_SYSPTAB_RSP_OFFSET           0x70
 
 ; Windows x64 ABI shadow space (32 bytes) + 8-byte alignment slot = 40 bytes.
 %define MSABI_SHADOW_ALLOC                      0x28

@@ -1,94 +1,127 @@
 /*
  * EFI loader - runs an embedded shellcode buffer, prints result, then shuts down.
  * The shellcode bytes are injected at compile time via shellcode_data.h.
- * Supports both x64 (PE32+) and IA-32 (PE32) EFI builds via #ifdef _WIN64.
+ * Supports x64 (PE32+), IA-32 (PE32), and ARM64 (PE32+) EFI builds.
  *
- * UEFI pre-boot memory is executable by default (no NX enforcement in OVMF),
- * so calling a static array directly works without AllocatePool.
+ * x86/x64: OVMF does not enforce XN on pre-boot memory, so the shellcode
+ * static array can be called directly.
+ *
+ * ARM64: EDK2 enforces XN on rodata sections.  The loader uses AllocatePages
+ * (which guarantees 4 KB page-alignment) to get executable memory, then copies
+ * the shellcode there.  Page-alignment is required because the peor ARM64 EFI
+ * shellcode pads the resolver chain to exactly 4096 bytes so the embedded PE
+ * starts at a page boundary; ARM64 ADRP instructions are page-granular and only
+ * resolve correctly when the PE base is 4 KB aligned.
  *
  * Success detection: on EFI_SUCCESS the loader calls ResetSystem(EfiResetShutdown),
  * which causes QEMU to exit with code 0.  On failure the loader loops forever,
  * causing the test to exceed its QEMU timeout.
- *
- * Compile (after generating shellcode_data.h):
- *   x86_64-w64-mingw32-gcc -nostdlib -nodefaultlibs -nostartfiles \
- *     -fno-unwind-tables -fno-asynchronous-unwind-tables \
- *     -I. -Wl,-e,efi_loader_main -Wl,--subsystem,10 \
- *     -o efi_loader.efi main.c
- *   i686-w64-mingw32-gcc ... same flags ... -o efi_loader_ia32.efi main.c
  */
 
 #include <stddef.h>
-#include "shellcode_data.h"   /* defines: static const unsigned char SHELLCODE_BYTES[]; */
+#include "shellcode_data.h"   /* defines: SHELLCODE_BYTES[], SHELLCODE_SIZE */
 
 typedef unsigned char  UINT8;
 typedef unsigned short UINT16;
 
 #ifdef _WIN64
 typedef unsigned long long UINTN;
+typedef unsigned long long EFI_PHYSICAL_ADDRESS;
 
-/* Byte offsets into EFI_SYSTEM_TABLE (UEFI spec, x64 / 64-bit pointers). */
-#define EFI_SYSTEM_TABLE_CONOUT_OFFSET           0x40
-#define EFI_SYSTEM_TABLE_RUNTIME_SERVICES_OFFSET 0x58
-/* EFI_RUNTIME_SERVICES.ResetSystem — 11th entry, each pointer is 8 bytes.
-   Header is 24 bytes; entries 0-9 (GetTime..GetNextHighMonotonicCount) take 80 bytes. */
-#define EFI_RUNTIME_SERVICES_RESET_SYSTEM_OFFSET 0x68
-/* EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL.OutputString — 2nd member, 8-byte pointer. */
-#define EFI_SIMPLE_TEXT_OUTPUT_OUTPUT_STRING_OFF 0x08
+/* EFI_SYSTEM_TABLE offsets (64-bit / 8-byte pointers). */
+#define EFI_ST_CONOUT_OFF    0x40
+#define EFI_ST_RUNTIME_OFF   0x58
+#define EFI_ST_BOOTSVCS_OFF  0x60
+/* EFI_RUNTIME_SERVICES.ResetSystem: header(24) + 10 entries × 8 = offset 0x68. */
+#define EFI_RT_RESET_OFF     0x68
+/* EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL.OutputString: 2nd member at 8. */
+#define EFI_CONOUT_OUTSTR_OFF 0x08
+/* EFI_BOOT_SERVICES.AllocatePages: header(24) + 1 entry × 8 = offset 0x28. */
+#define EFI_BS_ALLOC_PAGES_OFF 0x28
+/* EFI_BOOT_SERVICES.FreePages: offset 0x30. */
+#define EFI_BS_FREE_PAGES_OFF  0x30
+/* EFI_BOOT_SERVICES.AllocatePool: header(24) + 4 entries × 8 = offset 0x40. */
+#define EFI_BS_ALLOC_POOL_OFF 0x40
+/* EFI_BOOT_SERVICES.FreePool: offset 0x48. */
+#define EFI_BS_FREE_POOL_OFF  0x48
 #else
 typedef unsigned int UINTN;
 
-/* Byte offsets into EFI_SYSTEM_TABLE (UEFI spec, IA-32 / 32-bit pointers). */
-#define EFI_SYSTEM_TABLE_CONOUT_OFFSET           0x2C
-#define EFI_SYSTEM_TABLE_RUNTIME_SERVICES_OFFSET 0x38
-/* EFI_RUNTIME_SERVICES.ResetSystem — 11th entry, each pointer is 4 bytes.
-   Header is 24 bytes; entries 0-9 take 40 bytes. */
-#define EFI_RUNTIME_SERVICES_RESET_SYSTEM_OFFSET 0x40
-/* EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL.OutputString — 2nd member, 4-byte pointer. */
-#define EFI_SIMPLE_TEXT_OUTPUT_OUTPUT_STRING_OFF 0x04
+/* EFI_SYSTEM_TABLE offsets (32-bit / 4-byte pointers). */
+#define EFI_ST_CONOUT_OFF    0x2C
+#define EFI_ST_RUNTIME_OFF   0x38
+#define EFI_ST_BOOTSVCS_OFF  0x3C
+/* EFI_RUNTIME_SERVICES.ResetSystem: header(24) + 10 entries × 4 = offset 0x40. */
+#define EFI_RT_RESET_OFF     0x40
+/* EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL.OutputString: 2nd member at 4. */
+#define EFI_CONOUT_OUTSTR_OFF 0x04
+/* EFI_BOOT_SERVICES.AllocatePool: header(24) + 4 entries × 4 = offset 0x2C. */
+#define EFI_BS_ALLOC_POOL_OFF 0x2C
+/* EFI_BOOT_SERVICES.FreePool: offset 0x30. */
+#define EFI_BS_FREE_POOL_OFF  0x30
 #endif
 
 typedef UINTN EFI_STATUS;
 
-#define EFI_SUCCESS      ((EFI_STATUS)0)
-#define EFI_RESET_SHUTDOWN 2
+#define EFI_SUCCESS              ((EFI_STATUS)0)
+#define EFI_RESET_SHUTDOWN       2
+#define EFI_MEMORY_BOOT_SVC_CODE 3
+#define EFI_PAGE_SIZE            4096
 
 static const UINT16 OK_MSG[]   = {'P','E','O','R','_','E','F','I','_','O','K','\r','\n',0};
 static const UINT16 FAIL_MSG[] = {'P','E','O','R','_','E','F','I','_','F','A','I','L','\r','\n',0};
 
 EFI_STATUS efi_loader_main(void *image_handle, void *system_table) {
-    (void)image_handle;
+    EFI_STATUS result;
 
-    /* The EFI shellcode is self-contained: it scans memory for EFI_SYSTEM_TABLE_SIGNATURE
-       by itself.  No parameters are passed from the loader. */
-    EFI_STATUS result = ((EFI_STATUS (*)(void))SHELLCODE_BYTES)();
+#ifdef __aarch64__
+    /* ARM64: EDK2 marks rodata XN (execute-never).  Use AllocatePages for page-aligned
+     * executable memory.  Page-alignment is required because peor pads the ARM64 EFI
+     * resolver chain to 4096 bytes so the PE starts at page boundary, making ADRP work. */
+    typedef EFI_STATUS (*ALLOC_PAGES_FN)(int alloc_type, int mem_type, UINTN pages,
+                                          EFI_PHYSICAL_ADDRESS *mem);
+    typedef EFI_STATUS (*FREE_PAGES_FN)(EFI_PHYSICAL_ADDRESS mem, UINTN pages);
+
+    void *bs = *(void **)((UINT8 *)system_table + EFI_ST_BOOTSVCS_OFF);
+    ALLOC_PAGES_FN alloc_pages = *(ALLOC_PAGES_FN *)((UINT8 *)bs + EFI_BS_ALLOC_PAGES_OFF);
+    FREE_PAGES_FN  free_pages  = *(FREE_PAGES_FN  *)((UINT8 *)bs + EFI_BS_FREE_PAGES_OFF);
+
+    UINTN pages = ((UINTN)SHELLCODE_SIZE + EFI_PAGE_SIZE - 1) / EFI_PAGE_SIZE;
+    EFI_PHYSICAL_ADDRESS exec_phys = 0;
+    if (alloc_pages(0 /*AllocateAnyPages*/, EFI_MEMORY_BOOT_SVC_CODE, pages, &exec_phys) != EFI_SUCCESS
+            || exec_phys == 0) {
+        while (1) {}
+    }
+
+    UINT8 *exec_buf = (UINT8 *)exec_phys;
+    const UINT8 *src = (const UINT8 *)SHELLCODE_BYTES;
+    for (UINTN i = 0; i < (UINTN)SHELLCODE_SIZE; i++) {
+        exec_buf[i] = src[i];
+    }
+
+    /* ARM64 EFI shellcode expects (image_handle, system_table) in x0/x1.
+     * The prefix stub (mov x24, x1) saves system_table to x24 before the relocs
+     * resolver clobbers x1 (and x20-x23); the entrypoint resolver reads x24. */
+    result = ((EFI_STATUS (*)(void *, void *))exec_buf)(image_handle, system_table);
+    free_pages(exec_phys, pages);
+#else
+    /* x86 / x64: OVMF does not enforce XN on pre-boot memory. */
+    result = ((EFI_STATUS (*)(void))SHELLCODE_BYTES)();
+#endif
 
     /* Print result via ConOut->OutputString. */
-    void **conout_slot = (void **)((UINT8 *)system_table
-                                   + EFI_SYSTEM_TABLE_CONOUT_OFFSET);
-    void *conout = *conout_slot;
-
+    void *conout = *(void **)((UINT8 *)system_table + EFI_ST_CONOUT_OFF);
     typedef EFI_STATUS (*OUTPUT_FN)(void *proto, const UINT16 *str);
-    OUTPUT_FN output_string =
-        *(OUTPUT_FN *)((UINT8 *)conout + EFI_SIMPLE_TEXT_OUTPUT_OUTPUT_STRING_OFF);
+    OUTPUT_FN output_string = *(OUTPUT_FN *)((UINT8 *)conout + EFI_CONOUT_OUTSTR_OFF);
 
-    if (result == EFI_SUCCESS) {
-        output_string(conout, OK_MSG);
-    } else {
-        output_string(conout, FAIL_MSG);
-    }
+    output_string(conout, result == EFI_SUCCESS ? OK_MSG : FAIL_MSG);
 
     /* Shut down the machine on success so QEMU exits 0. */
     if (result == EFI_SUCCESS) {
-        void **rt_slot = (void **)((UINT8 *)system_table
-                                   + EFI_SYSTEM_TABLE_RUNTIME_SERVICES_OFFSET);
-        void *rt = *rt_slot;
-
+        void *rt = *(void **)((UINT8 *)system_table + EFI_ST_RUNTIME_OFF);
         typedef void (*RESET_FN)(int reset_type, EFI_STATUS status,
                                  UINTN data_size, void *data);
-        RESET_FN reset_system =
-            *(RESET_FN *)((UINT8 *)rt + EFI_RUNTIME_SERVICES_RESET_SYSTEM_OFFSET);
-
+        RESET_FN reset_system = *(RESET_FN *)((UINT8 *)rt + EFI_RT_RESET_OFF);
         reset_system(EFI_RESET_SHUTDOWN, EFI_SUCCESS, 0, NULL);
     }
 

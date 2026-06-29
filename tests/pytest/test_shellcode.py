@@ -1587,7 +1587,9 @@ _LINUX_LOADER_CFLAGS_32 = [
     # _FILE_OFFSET_BITS=64: fstat() on DrvFs (/mnt/c/...) fails on 32-bit Linux
     # without this flag (old 32-bit fstat syscall not supported for Windows mounts).
     "-D_FILE_OFFSET_BITS=64",
-    # No -ffixed-* needed: main.c uses inline asm with clobbers for the shellcode call.
+    # -ffixed-ebx: the x86-32 resolver chain sets EBX=PE_base and the PE OEP
+    # (cdecl) restores EBX to that same value, not the original pre-call value.
+    "-ffixed-ebx",
     "-ldl",
 ]
 
@@ -1920,8 +1922,9 @@ def _ensure_linux_loader_32(use_wsl: bool) -> "Path | None":
             "DEBIAN_FRONTEND=noninteractive sudo -n apt-get install -y gcc-multilib",
             capture_output=True, timeout=120,
         )
+    flags = " ".join(_LINUX_LOADER_CFLAGS_32)
     cmd = (
-        "gcc -m32 -O2 -D_FILE_OFFSET_BITS=64"
+        f"gcc {flags}"
         f" -o {_win_path_to_wsl(loader)} {_win_path_to_wsl(src)}"
     )
     r = _wsl_bash_run(cmd, capture_output=True, timeout=60)

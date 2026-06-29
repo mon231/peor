@@ -499,8 +499,8 @@ gcc -O2 -ffixed-rbx -ffixed-r12 -ffixed-r13 -ffixed-r14 -ffixed-r15 \
     -o tests/test_loader_linux/test_loader_linux.pe \
     tests/test_loader_linux/main.c -ldl
 
-# x86 Linux test loader
-gcc -m32 -O2 -ffixed-ebx -ffixed-esi -ffixed-edi \
+# x86 Linux test loader (-ffixed-ebx: resolver sets EBX=PE_base; volatile guards ESI/EDI)
+gcc -m32 -O2 -D_FILE_OFFSET_BITS=64 -ffixed-ebx \
     -o tests/test_loader_linux/test_loader_linux_32.pe \
     tests/test_loader_linux/main.c -ldl
 

@@ -44,9 +44,14 @@ int main(int argc, char *argv[]) {
     size_t nop_offset = (size_t)(1 + (rand() % (NOP_SLED_MAX_OFFSET / 16))) * 16;
     size_t total      = size + NOP_SLED_MAX_OFFSET + 4096;
 
-    uint8_t *mem = (uint8_t *)mmap(NULL, total,
+    /* Declare as volatile so GCC always reloads mem/total from the stack slot
+     * after the shellcode call.  On x86-32, the resolver chain leaves ESI/EDI
+     * with stale shellcode values on return; volatile prevents GCC from caching
+     * mem or total in those registers across the call. */
+    uint8_t * volatile mem = (uint8_t *)mmap(NULL, total,
                                    PROT_READ | PROT_WRITE,
                                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    volatile size_t vtotal = total;
     if (mem == MAP_FAILED) {
         perror("mmap");
         close(fd);
@@ -71,24 +76,12 @@ int main(int argc, char *argv[]) {
     }
 
     /* The shellcode finds dlopen/dlsym by itself via /proc/self/maps + ELF parsing.
-       No arguments needed from the loader. */
-#ifdef __i386__
-    /* On x86, the shellcode chain leaves EBX=PE_base, ESI=NT_hdrs, EDI=reloc_delta
-     * on return (they're set by the resolver chain and preserved by the cdecl OEP).
-     * List them as clobbers so GCC saves/restores them around this call. */
-    int result;
-    void *_fn = (void *)mem;
-    __asm__ volatile(
-        "call *%1"
-        : "=a"(result)
-        : "m"(_fn)
-        : "ebx", "ecx", "edx", "esi", "edi", "memory", "cc"
-    );
-#else
+       No arguments needed from the loader. The -ffixed-* build flags ensure GCC
+       never allocates EBX (which the x86 resolver chain sets to PE_base) to any
+       variable; volatile mem/vtotal protect against ESI/EDI being used for those. */
     int result = ((int (*)(void))mem)();
-#endif
 
-    munmap(mem, total);
+    munmap(mem, vtotal);
 
     /* Print full int value so callers bypass the 8-bit Linux exit code limit. */
     fprintf(stdout, "%d\n", result);

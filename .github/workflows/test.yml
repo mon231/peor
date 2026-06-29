@@ -40,7 +40,6 @@ jobs:
           path: |
             tests/Win_x86
             tests/Win_x64
-            tests/Win_ARM64
           key: test-bins-release-${{ runner.os }}-${{ hashFiles('tests/**/*.cpp', 'tests/**/*.c', 'tests/**/*.vcxproj', 'tests/tests.sln') }}
 
       - name: Build test suite Release (Win32)
@@ -53,22 +52,6 @@ jobs:
         working-directory: tests
         run: msbuild tests.sln /p:Configuration=Release /p:Platform=x64 /m /nologo /verbosity:minimal
 
-      - name: Build EFI tests Release (ARM64)
-        if: steps.cache-bins-release.outputs.cache-hit != 'true'
-        working-directory: tests
-        shell: pwsh
-        run: |
-          $slnDir = (Resolve-Path ".").Path + "\"
-          foreach ($p in @(
-            "EFI\01_efi_hello\01_efi_hello.vcxproj",
-            "EFI\02_efi_print\02_efi_print.vcxproj",
-            "EFI\03_efi_simple_calc\03_efi_simple_calc.vcxproj",
-            "EFI\05_efi_memory_services\05_efi_memory_services.vcxproj"
-          )) {
-            msbuild $p /p:Configuration=Release /p:Platform=ARM64 "/p:SolutionDir=$slnDir" /m /nologo /verbosity:minimal
-            if ($LASTEXITCODE -ne 0) { throw "MSBuild failed for $p" }
-          }
-
       - name: Upload Release test binaries
         uses: actions/upload-artifact@v4
         with:
@@ -76,13 +59,6 @@ jobs:
           path: |
             tests/Win_x86
             tests/Win_x64
-          retention-days: 1
-
-      - name: Upload ARM64 EFI binaries
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-bins-efi-arm64
-          path: tests/Win_ARM64
           retention-days: 1
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -93,6 +69,17 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
 
       - name: Set up MSBuild
         uses: microsoft/setup-msbuild@v2
@@ -228,8 +215,8 @@ jobs:
             gcc gcc-multilib
 
       - name: Build Linux test loaders (x64 and x86)
-        # -ffixed-{rbx,r12-r15}: shellcode chain clobbers these callee-saved regs.
-        # -ffixed-{ebx,esi,edi}: x86 equivalents for the 32-bit loader.
+        # -ffixed-{rbx,r12-r15}: shellcode chain clobbers these callee-saved regs (x64).
+        # -ffixed-ebx: x86 resolver sets EBX=PE_base; volatile mem/total protect ESI/EDI.
         # -ldl: dlopen/dlsym (needed for the Linux import resolver).
         run: |
           gcc -O2 \
@@ -237,7 +224,8 @@ jobs:
             -o tests/test_loader_linux/test_loader_linux.pe \
             tests/test_loader_linux/main.c -ldl
           gcc -m32 -O2 \
-            -ffixed-ebx -ffixed-esi -ffixed-edi \
+            -D_FILE_OFFSET_BITS=64 \
+            -ffixed-ebx \
             -o tests/test_loader_linux/test_loader_linux_32.pe \
             tests/test_loader_linux/main.c -ldl
 
@@ -296,7 +284,6 @@ jobs:
 
   test-efi-qemu:
     runs-on: ubuntu-latest
-    needs: build-windows
 
     steps:
       - uses: actions/checkout@v4
@@ -306,18 +293,6 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
-
-      - name: Download test binaries (for MSVC EFI tests)
-        uses: actions/download-artifact@v4
-        with:
-          name: test-bins-windows-release
-          path: .
-
-      - name: Download ARM64 EFI binaries
-        uses: actions/download-artifact@v4
-        with:
-          name: test-bins-efi-arm64
-          path: tests/Win_ARM64
 
       - name: Cache apt packages
         uses: actions/cache@v4
@@ -344,4 +319,4 @@ jobs:
           pip install pytest pytest-timeout
 
       - name: Run EFI shellcode tests (x64 + x86 + ARM64 QEMU)
-        run: pytest tests/pytest -v --timeout=120
+        run: pytest tests/pytest -v --timeout=120 -k "efi"

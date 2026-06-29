@@ -135,7 +135,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: test-bins-windows-release
-          path: .
+          path: tests
 
       - name: Add VS-bundled clang-cl to PATH
         shell: pwsh
@@ -178,7 +178,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: test-bins-windows-debug
-          path: .
+          path: tests
 
       - name: Run pytest (Windows Debug)
         run: pytest tests/pytest/ -v --timeout=60
@@ -215,9 +215,12 @@ jobs:
             gcc gcc-multilib
 
       - name: Build Linux test loaders (x64 and x86)
-        # -ffixed-{rbx,r12-r15}: shellcode chain clobbers these callee-saved regs (x64).
-        # -ffixed-ebx: x86 resolver sets EBX=PE_base; volatile mem/total protect ESI/EDI.
-        # -ldl: dlopen/dlsym (needed for the Linux import resolver).
+        # x64: -ffixed-{rbx,r12-r15} prevents the shellcode's callee-save clobbers (EBX=PE_base etc.)
+        # from corrupting the loader's return value.  -ldl for dlopen/dlsym.
+        # x86: -no-pie -fno-pic: default PIE uses EBX for GOT; PLT stubs are "jmp [ebx+N]".
+        # The relocs-resolver sets EBX=PE_base, so any PLT call after the shellcode crashes.
+        # -ffixed-{ebx,esi,edi}: prevents GCC from allocating the three clobbered callee-saved
+        # regs for local variables (e.g. storing the "return 0" value then "mov eax,<reg>").
         run: |
           gcc -O2 \
             -ffixed-rbx -ffixed-r12 -ffixed-r13 -ffixed-r14 -ffixed-r15 \
@@ -225,7 +228,7 @@ jobs:
             tests/test_loader_linux/main.c -ldl
           gcc -m32 -O2 \
             -D_FILE_OFFSET_BITS=64 \
-            -ffixed-ebx \
+            -no-pie -fno-pic -ffixed-ebx -ffixed-esi -ffixed-edi \
             -o tests/test_loader_linux/test_loader_linux_32.pe \
             tests/test_loader_linux/main.c -ldl
 

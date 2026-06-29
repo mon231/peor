@@ -45,9 +45,8 @@ int main(int argc, char *argv[]) {
     size_t total      = size + NOP_SLED_MAX_OFFSET + 4096;
 
     /* Declare as volatile so GCC always reloads mem/total from the stack slot
-     * after the shellcode call.  On x86-32, the resolver chain leaves ESI/EDI
-     * with stale shellcode values on return; volatile prevents GCC from caching
-     * mem or total in those registers across the call. */
+     * after the shellcode call (avoids caching them in caller-saved regs that
+     * the shellcode may clobber). */
     uint8_t * volatile mem = (uint8_t *)mmap(NULL, total,
                                    PROT_READ | PROT_WRITE,
                                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -76,9 +75,9 @@ int main(int argc, char *argv[]) {
     }
 
     /* The shellcode finds dlopen/dlsym by itself via /proc/self/maps + ELF parsing.
-       No arguments needed from the loader. The -ffixed-* build flags ensure GCC
-       never allocates EBX (which the x86 resolver chain sets to PE_base) to any
-       variable; volatile mem/vtotal protect against ESI/EDI being used for those. */
+       No arguments needed from the loader.  The x86-32 loader is built with
+       -no-pie so PLT stubs use absolute addresses instead of [ebx+N]; this
+       makes the relocs-resolver's EBX=PE_base side-effect harmless. */
     int result = ((int (*)(void))mem)();
 
     munmap(mem, vtotal);

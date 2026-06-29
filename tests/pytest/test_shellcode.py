@@ -95,6 +95,9 @@ def _poll_and_dismiss_msgbox(title: str, timeout: float = 10.0) -> dict:
 
     result["found"] = True
 
+    # Small delay so the dialog finishes creating child controls before we query them.
+    time.sleep(0.15)
+
     # Iterate Static children to find the message text (skip blank icon placeholder)
     hwnd_child = user32.FindWindowExA(hwnd, None, b"Static", None)
     while hwnd_child:
@@ -106,14 +109,20 @@ def _poll_and_dismiss_msgbox(title: str, timeout: float = 10.0) -> dict:
             break
         hwnd_child = user32.FindWindowExA(hwnd, hwnd_child, b"Static", None)
 
-    # BM_CLICK via SendMessageA is the most reliable cross-process, cross-bitness way to
-    # dismiss a MessageBox: it blocks until the dialog's message loop processes the click
-    # (which guarantees MessageBoxA has returned before we do), then ExitProcess runs.
+    # PostMessageA+BM_CLICK avoids cross-architecture SendMessage hangs (64-bit Python →
+    # 32-bit WOW64 dialog). After posting, poll until the window disappears.
     hwnd_ok = user32.FindWindowExA(hwnd, None, b"Button", None)
     if hwnd_ok:
-        user32.SendMessageA(hwnd_ok, 0x00F5, 0, 0)  # BM_CLICK
+        user32.PostMessageA(hwnd_ok, 0x00F5, 0, 0)  # BM_CLICK
     else:
-        user32.SendMessageA(hwnd, _WM_COMMAND, _IDOK, 0)
+        user32.PostMessageA(hwnd, _WM_COMMAND, _IDOK, 0)
+
+    dismiss_deadline = time.monotonic() + 5.0
+    while time.monotonic() < dismiss_deadline:
+        if not user32.IsWindow(hwnd):
+            break
+        time.sleep(0.05)
+
     return result
 
 
@@ -1587,9 +1596,19 @@ _LINUX_LOADER_CFLAGS_32 = [
     # _FILE_OFFSET_BITS=64: fstat() on DrvFs (/mnt/c/...) fails on 32-bit Linux
     # without this flag (old 32-bit fstat syscall not supported for Windows mounts).
     "-D_FILE_OFFSET_BITS=64",
-    # -ffixed-ebx: the x86-32 resolver chain sets EBX=PE_base and the PE OEP
-    # (cdecl) restores EBX to that same value, not the original pre-call value.
-    "-ffixed-ebx",
+    # -no-pie -fno-pic: x86-32 PIE uses EBX as the GOT base register; every PLT
+    # stub emits "jmp [ebx+N]".  The shellcode's relocs-resolver sets EBX=PE_base
+    # and never restores it, so the first PLT call after the shellcode returns
+    # (munmap, fprintf, …) would dereference PE_base+N → SIGSEGV.
+    # Building as a plain non-PIE executable changes PLT stubs to absolute-address
+    # JMPs.
+    # -ffixed-{ebx,esi,edi}: even in non-PIE, GCC uses EBX/ESI/EDI as callee-saved
+    # scratch registers (e.g. stores the "return 0" value in one of them, then
+    # emits "mov eax,<reg>" at the epilogue, relying on callee-save semantics that
+    # the shellcode breaks).  The relocs-resolver clobbers EBX=PE_base and ESI=past-
+    # reloc; entrypoint-resolver further sets ESI=NT_headers.  EDI gets the reloc
+    # delta.  Fixing all three makes the clobbers harmless.
+    "-no-pie", "-fno-pic", "-ffixed-ebx", "-ffixed-esi", "-ffixed-edi",
     "-ldl",
 ]
 
@@ -2398,4 +2417,95 @@ def test_cmdexe(arch, cmd_path, loader_subdir, tmp_path):
     assert "PEOR_CMD_TEST" in stdout, (
         f"[cmdexe {arch}] 'PEOR_CMD_TEST' not found in output\n"
         f"stdout: {stdout[:500]!r}\nstderr: {result.stderr.decode(errors='replace')[:200]}"
+    )
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_18_bss_gap(arch, tmp_path):
+    """Static zero-initialized array must be zero in shellcode output; returns 88 if all zero."""
+    win_dir     = ARCH_DIRS[arch]
+    pe_path     = win_dir / "18_bss_gap.exe"
+    loader_path = win_dir / "test_loader.exe"
+    _skip_if_missing(loader_path, pe_path)
+
+    shellcode_path = tmp_path / f"18_bss_gap_{arch}.bin"
+    _shellcodify(pe_path, shellcode_path)
+
+    result = subprocess.run(
+        [str(loader_path), str(shellcode_path)],
+        capture_output=True, timeout=10,
+    )
+    assert result.returncode == 88, (
+        f"[{arch}] expected exit code 88 (BSS was zero), got {result.returncode}\n"
+        f"stdout: {result.stdout.decode(errors='replace')}\n"
+        f"stderr: {result.stderr.decode(errors='replace')}"
+    )
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_19_ordinal_imports(arch, tmp_path):
+    """EXE imports ByNameFunc by name and OrdinalOnlyFunc by ordinal 7; sum must be 42."""
+    win_dir     = ARCH_DIRS[arch]
+    pe_path     = win_dir / "19_ordinal_imports.exe"
+    loader_path = win_dir / "test_loader.exe"
+    _skip_if_missing(loader_path, pe_path)
+
+    shellcode_path = tmp_path / f"19_ordinal_imports_{arch}.bin"
+    _shellcodify(pe_path, shellcode_path)
+
+    result = subprocess.run(
+        [str(loader_path), str(shellcode_path)],
+        capture_output=True, timeout=10,
+        cwd=str(win_dir),  # ordinal_helper.dll must be findable from test_loader cwd
+    )
+    assert result.returncode == 42, (
+        f"[{arch}] expected exit code 42 (ordinal import resolved), got {result.returncode}\n"
+        f"stdout: {result.stdout.decode(errors='replace')}\n"
+        f"stderr: {result.stderr.decode(errors='replace')}"
+    )
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_20_forwarded_exports(arch, tmp_path):
+    """EXE imports GetCurrentProcessId_via_forward from forwarded_helper.dll (a forwarded export
+    to KERNEL32.GetCurrentProcessId); verifies peor's resolver handles forwarded exports."""
+    win_dir     = ARCH_DIRS[arch]
+    pe_path     = win_dir / "20_forwarded_exports.exe"
+    loader_path = win_dir / "test_loader.exe"
+    _skip_if_missing(loader_path, pe_path)
+
+    shellcode_path = tmp_path / f"20_forwarded_exports_{arch}.bin"
+    _shellcodify(pe_path, shellcode_path)
+
+    result = subprocess.run(
+        [str(loader_path), str(shellcode_path)],
+        capture_output=True, timeout=10,
+        cwd=str(win_dir),  # forwarded_helper.dll must be findable in the app dir
+    )
+    assert result.returncode == 77, (
+        f"[{arch}] expected exit code 77 (RtlMoveMemory resolved), got {result.returncode}\n"
+        f"stdout: {result.stdout.decode(errors='replace')}\n"
+        f"stderr: {result.stderr.decode(errors='replace')}"
+    )
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_21_api_sets(arch, tmp_path):
+    """EXE imports HeapAlloc from api-ms-win-core-heap-l1-1-0.dll (virtual API set DLL)."""
+    win_dir     = ARCH_DIRS[arch]
+    pe_path     = win_dir / "21_api_sets.exe"
+    loader_path = win_dir / "test_loader.exe"
+    _skip_if_missing(loader_path, pe_path)
+
+    shellcode_path = tmp_path / f"21_api_sets_{arch}.bin"
+    _shellcodify(pe_path, shellcode_path)
+
+    result = subprocess.run(
+        [str(loader_path), str(shellcode_path)],
+        capture_output=True, timeout=10,
+    )
+    assert result.returncode == 42, (
+        f"[{arch}] expected exit code 42 (API set DLL resolved), got {result.returncode}\n"
+        f"stdout: {result.stdout.decode(errors='replace')}\n"
+        f"stderr: {result.stderr.decode(errors='replace')}"
     )

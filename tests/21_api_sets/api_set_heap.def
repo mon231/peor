@@ -1,0 +1,5 @@
+LIBRARY api-ms-win-core-heap-l1-1-0
+EXPORTS
+    HeapAlloc
+    HeapFree
+    GetProcessHeap

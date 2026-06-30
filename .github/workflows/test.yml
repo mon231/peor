@@ -135,7 +135,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: test-bins-windows-release
-          path: .
+          path: tests
 
       - name: Add VS-bundled clang-cl to PATH
         shell: pwsh
@@ -178,7 +178,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: test-bins-windows-debug
-          path: .
+          path: tests
 
       - name: Run pytest (Windows Debug)
         run: pytest tests/pytest/ -v --timeout=60 -k "not linux and not efi"
@@ -271,7 +271,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: test-bins-linux
-          path: .
+          path: tests
 
       - name: Mark test loaders executable
         run: chmod +x tests/test_loader_linux/test_loader_linux.pe tests/test_loader_linux/test_loader_linux_32.pe

@@ -779,20 +779,26 @@ def _ensure_linux_loader(use_wsl: bool) -> "Path | None":
 
 
 def _find_clangcl() -> "str | None":
-    """Return path to clang-cl or None if not found.
-
-    Tries PATH first, then common LLVM install locations on Windows.
-    """
-    if shutil.which("clang-cl"):
-        return shutil.which("clang-cl")
-    candidates = [
+    """Return path to clang-cl or None if not found or not runnable on this machine."""
+    candidates = []
+    from_path = shutil.which("clang-cl")
+    if from_path:
+        candidates.append(from_path)
+    candidates += [
         r"C:\Program Files\LLVM\bin\clang-cl.exe",
         r"C:\Program Files (x86)\LLVM\bin\clang-cl.exe",
-        # VS-bundled LLVM (present on GitHub windows-latest runners)
         r"C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\Llvm\x64\bin\clang-cl.exe",
         r"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\Llvm\x64\bin\clang-cl.exe",
     ]
-    return next((p for p in candidates if Path(p).exists()), None)
+    for p in candidates:
+        if not Path(p).exists():
+            continue
+        try:
+            subprocess.run([p, "--version"], capture_output=True, timeout=10)
+            return p
+        except OSError:
+            continue
+    return None
 
 
 # ── P2-16 tests ───────────────────────────────────────────────────────────────

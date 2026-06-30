@@ -1,12 +1,17 @@
-#define BSS_ARRAY_SIZE 4096
-#define RETURN_ALL_ZERO 88
+// Test shellcode has the bss zero-initialized
+#define BSS_ARRAY_SIZE (4096)
+#define PROGRAM_EXIT_CODE (88)
 
-static int g_arr[BSS_ARRAY_SIZE] = {0}; /* zero-initialized by C spec — lives in BSS */
+static volatile int g_arr[BSS_ARRAY_SIZE] = {0};
 
-int main(void) {
+int main(void)
+{
     int sum = 0;
-    int i;
-    for (i = 0; i < BSS_ARRAY_SIZE; i++)
+
+    for (int i = 0; i < BSS_ARRAY_SIZE; i++)
+    {
         sum += g_arr[i];
-    return (sum == 0) ? RETURN_ALL_ZERO : 0;
+    }
+
+    return (sum == 0) ? PROGRAM_EXIT_CODE : 0;
 }

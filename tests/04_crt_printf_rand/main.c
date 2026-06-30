@@ -3,7 +3,8 @@
 #include <stdlib.h>
 #include <time.h>
 
-int main(void) {
+int main(void)
+{
     srand((unsigned int)time(NULL));
     printf("Random: %d\n", rand());
     return 0;

@@ -1,20 +1,29 @@
-// Tests that peor correctly handles nested try/rethrow C++ exceptions.
-// Inner catch rethrows; outer catch must fire and return 55.
+// Test shellcode handles nested try/rethrow C++ exceptions
 #include <windows.h>
 
 static int nested_rethrow() {
-    try {
-        try {
-            throw 1;
-        } catch (int) {
+    try
+    {
+        try
+        {
+            throw 123;
+        }
+        catch (int)
+        {
             throw;
         }
-    } catch (int) {
+
+        return 0;
+    }
+    catch (int)
+    {
         return 55;
     }
+
     return 0;
 }
 
-int main() {
+int main()
+{
     return nested_rethrow();
 }

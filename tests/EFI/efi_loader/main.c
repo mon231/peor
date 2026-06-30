@@ -1,25 +1,7 @@
-/*
- * EFI loader - runs an embedded shellcode buffer, prints result, then shuts down.
- * The shellcode bytes are injected at compile time via shellcode_data.h.
- * Supports x64 (PE32+), IA-32 (PE32), and ARM64 (PE32+) EFI builds.
- *
- * x86/x64: OVMF does not enforce XN on pre-boot memory, so the shellcode
- * static array can be called directly.
- *
- * ARM64: EDK2 enforces XN on rodata sections.  The loader uses AllocatePages
- * (which guarantees 4 KB page-alignment) to get executable memory, then copies
- * the shellcode there.  Page-alignment is required because the peor ARM64 EFI
- * shellcode pads the resolver chain to exactly 4096 bytes so the embedded PE
- * starts at a page boundary; ARM64 ADRP instructions are page-granular and only
- * resolve correctly when the PE base is 4 KB aligned.
- *
- * Success detection: on EFI_SUCCESS the loader calls ResetSystem(EfiResetShutdown),
- * which causes QEMU to exit with code 0.  On failure the loader loops forever,
- * causing the test to exceed its QEMU timeout.
- */
+// EFI loader - runs an embedded shellcode buffer, prints result, then shuts down
 
 #include <stddef.h>
-#include "shellcode_data.h"   /* defines: SHELLCODE_BYTES[], SHELLCODE_SIZE */
+#include "shellcode_data.h"
 
 typedef unsigned char  UINT8;
 typedef unsigned short UINT16;
@@ -27,37 +9,23 @@ typedef unsigned short UINT16;
 #ifdef _WIN64
 typedef unsigned long long UINTN;
 typedef unsigned long long EFI_PHYSICAL_ADDRESS;
-
-/* EFI_SYSTEM_TABLE offsets (64-bit / 8-byte pointers). */
 #define EFI_ST_CONOUT_OFF    0x40
 #define EFI_ST_RUNTIME_OFF   0x58
 #define EFI_ST_BOOTSVCS_OFF  0x60
-/* EFI_RUNTIME_SERVICES.ResetSystem: header(24) + 10 entries × 8 = offset 0x68. */
 #define EFI_RT_RESET_OFF     0x68
-/* EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL.OutputString: 2nd member at 8. */
 #define EFI_CONOUT_OUTSTR_OFF 0x08
-/* EFI_BOOT_SERVICES.AllocatePages: header(24) + 1 entry × 8 = offset 0x28. */
 #define EFI_BS_ALLOC_PAGES_OFF 0x28
-/* EFI_BOOT_SERVICES.FreePages: offset 0x30. */
 #define EFI_BS_FREE_PAGES_OFF  0x30
-/* EFI_BOOT_SERVICES.AllocatePool: header(24) + 4 entries × 8 = offset 0x40. */
 #define EFI_BS_ALLOC_POOL_OFF 0x40
-/* EFI_BOOT_SERVICES.FreePool: offset 0x48. */
 #define EFI_BS_FREE_POOL_OFF  0x48
 #else
 typedef unsigned int UINTN;
-
-/* EFI_SYSTEM_TABLE offsets (32-bit / 4-byte pointers). */
 #define EFI_ST_CONOUT_OFF    0x2C
 #define EFI_ST_RUNTIME_OFF   0x38
 #define EFI_ST_BOOTSVCS_OFF  0x3C
-/* EFI_RUNTIME_SERVICES.ResetSystem: header(24) + 10 entries × 4 = offset 0x40. */
 #define EFI_RT_RESET_OFF     0x40
-/* EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL.OutputString: 2nd member at 4. */
 #define EFI_CONOUT_OUTSTR_OFF 0x04
-/* EFI_BOOT_SERVICES.AllocatePool: header(24) + 4 entries × 4 = offset 0x2C. */
 #define EFI_BS_ALLOC_POOL_OFF 0x2C
-/* EFI_BOOT_SERVICES.FreePool: offset 0x30. */
 #define EFI_BS_FREE_POOL_OFF  0x30
 #endif
 
@@ -71,7 +39,8 @@ typedef UINTN EFI_STATUS;
 static const UINT16 OK_MSG[]   = {'P','E','O','R','_','E','F','I','_','O','K','\r','\n',0};
 static const UINT16 FAIL_MSG[] = {'P','E','O','R','_','E','F','I','_','F','A','I','L','\r','\n',0};
 
-EFI_STATUS efi_loader_main(void *image_handle, void *system_table) {
+EFI_STATUS efi_loader_main(void* image_handle, void* system_table)
+{
     EFI_STATUS result;
 
 #ifdef __aarch64__
@@ -104,6 +73,35 @@ EFI_STATUS efi_loader_main(void *image_handle, void *system_table) {
      * resolver clobbers x1 (and x20-x23); the entrypoint resolver reads x24. */
     result = ((EFI_STATUS (*)(void *, void *))exec_buf)(image_handle, system_table);
     free_pages(exec_phys, pages);
+#elif defined(__arm__)
+    /* ARM32: EDK2 enforces XN on rodata.  Use AllocatePages for page-aligned executable
+     * memory (same requirement as ARM64: peor pads the chain to 4096 bytes so the PE
+     * starts at a page boundary).  32-bit pointer offsets match the #else (x86) path. */
+    typedef EFI_STATUS (*ALLOC_PAGES_FN32)(int alloc_type, int mem_type, UINTN pages,
+                                            EFI_PHYSICAL_ADDRESS *mem);
+    typedef EFI_STATUS (*FREE_PAGES_FN32)(EFI_PHYSICAL_ADDRESS mem, UINTN pages);
+
+    void *bs32 = *(void **)((UINT8 *)system_table + EFI_ST_BOOTSVCS_OFF);
+    ALLOC_PAGES_FN32 alloc_pages32 = *(ALLOC_PAGES_FN32 *)((UINT8 *)bs32 + EFI_BS_ALLOC_PAGES_OFF);
+    FREE_PAGES_FN32  free_pages32  = *(FREE_PAGES_FN32  *)((UINT8 *)bs32 + EFI_BS_FREE_PAGES_OFF);
+
+    UINTN pages32 = ((UINTN)SHELLCODE_SIZE + EFI_PAGE_SIZE - 1) / EFI_PAGE_SIZE;
+    EFI_PHYSICAL_ADDRESS exec_phys32 = 0;
+    if (alloc_pages32(0 /*AllocateAnyPages*/, EFI_MEMORY_BOOT_SVC_CODE, pages32, &exec_phys32) != EFI_SUCCESS
+            || exec_phys32 == 0) {
+        while (1) {}
+    }
+
+    UINT8 *exec_buf32 = (UINT8 *)(UINTN)exec_phys32;
+    const UINT8 *src32 = (const UINT8 *)SHELLCODE_BYTES;
+    for (UINTN i = 0; i < (UINTN)SHELLCODE_SIZE; i++) {
+        exec_buf32[i] = src32[i];
+    }
+
+    /* ARM32 EFI shellcode expects (image_handle, system_table) in r0/r1.
+     * The prefix stub saves them to r9/r10 before the relocs resolver runs. */
+    result = ((EFI_STATUS (*)(void *, void *))exec_buf32)(image_handle, system_table);
+    free_pages32(exec_phys32, pages32);
 #else
     /* x86 / x64: OVMF does not enforce XN on pre-boot memory. */
     result = ((EFI_STATUS (*)(void))SHELLCODE_BYTES)();

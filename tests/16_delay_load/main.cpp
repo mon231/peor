@@ -1,9 +1,14 @@
-#pragma comment(lib, "delayimp.lib")
+// Test shellcode resolves delay-load dependencies
 #pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "delayimp.lib")
+
 #include <windows.h>
 #include <mmsystem.h>
 
-int main() {
-    DWORD tick = timeGetTime();
-    return (int)((tick % 250) + 1);  // always 1..250
+int main()
+{
+    const DWORD start = timeGetTime();
+    const DWORD end = timeGetTime();
+    const DWORD duration = end - start;
+    return static_cast<int>((duration % 137) + 67);
 }

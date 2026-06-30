@@ -1,18 +1,17 @@
-// Tests that peor runs global C++ constructors (CRT .CXX initializers).
-// Counter() sets g_value = 42 before main(); main returns g_value.
+// Test the shellcode runs global C++ constructors (CRT .CXX initializers)
 #include <windows.h>
-
 static int g_value = 0;
 
-class Counter {
+class Counter
+{
 public:
-    Counter()  { g_value = 42; }
-    ~Counter() = default;
+    explicit Counter()  { g_value = 42; }
     int get() const { return g_value; }
 };
 
 static Counter g_counter;
 
-int main() {
+int main()
+{
     return g_counter.get();
 }

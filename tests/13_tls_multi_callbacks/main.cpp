@@ -1,23 +1,29 @@
-// Tests that peor invokes multiple TLS callbacks in declaration order.
-// Five callbacks accumulate g_counter = g_counter * 10 + callback_index (1-based).
-// After all five fire: g_counter = ((((0*10+1)*10+2)*10+3)*10+4)*10+5 = 12345.
+// Tests the shellcode invokes multiple TLS-callbacks (and follows the declaration order)
 #include <windows.h>
-
 static volatile int g_counter = 0;
 
-static void NTAPI cb1(PVOID, DWORD reason, PVOID) {
+static void NTAPI cb1(PVOID, DWORD reason, PVOID)
+{
     if (reason == DLL_PROCESS_ATTACH) g_counter = g_counter * 10 + 1;
 }
-static void NTAPI cb2(PVOID, DWORD reason, PVOID) {
+
+static void NTAPI cb2(PVOID, DWORD reason, PVOID)
+{
     if (reason == DLL_PROCESS_ATTACH) g_counter = g_counter * 10 + 2;
 }
-static void NTAPI cb3(PVOID, DWORD reason, PVOID) {
+
+static void NTAPI cb3(PVOID, DWORD reason, PVOID)
+{
     if (reason == DLL_PROCESS_ATTACH) g_counter = g_counter * 10 + 3;
 }
-static void NTAPI cb4(PVOID, DWORD reason, PVOID) {
+
+static void NTAPI cb4(PVOID, DWORD reason, PVOID)
+{
     if (reason == DLL_PROCESS_ATTACH) g_counter = g_counter * 10 + 4;
 }
-static void NTAPI cb5(PVOID, DWORD reason, PVOID) {
+
+static void NTAPI cb5(PVOID, DWORD reason, PVOID)
+{
     if (reason == DLL_PROCESS_ATTACH) g_counter = g_counter * 10 + 5;
 }
 
@@ -39,6 +45,7 @@ __declspec(allocate(".CRT$XLF")) PIMAGE_TLS_CALLBACK p_cb5 = cb5;
 #pragma comment(linker, "/INCLUDE:__tls_used")
 #endif
 
-int main() {
+int main()
+{
     return g_counter;
 }

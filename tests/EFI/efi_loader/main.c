@@ -20,11 +20,14 @@ typedef unsigned long long EFI_PHYSICAL_ADDRESS;
 #define EFI_BS_FREE_POOL_OFF  0x48
 #else
 typedef unsigned int UINTN;
-#define EFI_ST_CONOUT_OFF    0x2C
-#define EFI_ST_RUNTIME_OFF   0x38
-#define EFI_ST_BOOTSVCS_OFF  0x3C
-#define EFI_RT_RESET_OFF     0x40
+typedef unsigned long long EFI_PHYSICAL_ADDRESS;
+#define EFI_ST_CONOUT_OFF     0x2C
+#define EFI_ST_RUNTIME_OFF    0x38
+#define EFI_ST_BOOTSVCS_OFF   0x3C
+#define EFI_RT_RESET_OFF      0x40
 #define EFI_CONOUT_OUTSTR_OFF 0x04
+#define EFI_BS_ALLOC_PAGES_OFF 0x20
+#define EFI_BS_FREE_PAGES_OFF  0x24
 #define EFI_BS_ALLOC_POOL_OFF 0x2C
 #define EFI_BS_FREE_POOL_OFF  0x30
 #endif
@@ -99,8 +102,10 @@ EFI_STATUS efi_loader_main(void* image_handle, void* system_table)
     }
 
     /* ARM32 EFI shellcode expects (image_handle, system_table) in r0/r1.
-     * The prefix stub saves them to r9/r10 before the relocs resolver runs. */
-    result = ((EFI_STATUS (*)(void *, void *))exec_buf32)(image_handle, system_table);
+     * The prefix stub saves them to r9/r10 before the relocs resolver runs.
+     * Thumb-2 functions must be called with bit 0 of address set; the allocated
+     * page is naturally aligned (bit 0 = 0), so OR 1 to enter Thumb mode. */
+    result = ((EFI_STATUS (*)(void *, void *))(((UINTN)exec_buf32) | 1))(image_handle, system_table);
     free_pages32(exec_phys32, pages32);
 #else
     /* x86 / x64: OVMF does not enforce XN on pre-boot memory. */

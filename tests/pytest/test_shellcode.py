@@ -14,15 +14,20 @@ from typing import Optional
 from pefile import PE
 from pefile import OPTIONAL_HEADER_MAGIC_PE_PLUS
 
-from peor.__main__ import (
-    dump_memory_layout,
-    _build_shellcode_chain,
-    _find_export_rva,
-    _SHELLCODES,
+from peor._pe_features import (
+    PeorUnsupportedError,
+    _detect_pe_features,
     _PLATFORM_LINUX,
     _PLATFORM_EFI,
     IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR,
     IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT,
+    _find_export_rva,
+)
+from peor._chain_builder import (
+    dump_memory_layout,
+    _build_shellcode_chain,
+    _SHELLCODES,
+    _validate_pe,
 )
 
 TESTS_DIR = Path(__file__).parent.parent
@@ -500,7 +505,7 @@ def test_stdout_output(arch, tmp_path):
 
 @pytest.mark.parametrize("arch", ["x64"])
 def test_info_mode(arch, tmp_path):
-    """`peor --info` must print cxx_eh and seh rows (x64 + resolve-imports) without writing a file."""
+    """`peor --info` must print feature flags and stub sizes without writing a file."""
     pe_path = ARCH_DIRS[arch] / "11_cpp_exceptions.exe"
     if not pe_path.exists():
         pytest.skip("test binaries not built")
@@ -510,11 +515,88 @@ def test_info_mode(arch, tmp_path):
         capture_output=True, text=True, timeout=30,
     )
     assert result.returncode == 0, f"peor --info exited with {result.returncode}: {result.stderr}"
-    assert "cxx_eh"   in result.stdout, f"'cxx_eh' not in --info output:\n{result.stdout}"
-    assert "seh"      in result.stdout, f"'seh' not in --info output:\n{result.stdout}"
-    assert "total"    in result.stdout, f"'total' not in --info output:\n{result.stdout}"
-    assert "PE image" in result.stdout, f"'PE image' not in --info output:\n{result.stdout}"
+    # Stub sizes section
+    assert "cxx_eh"         in result.stdout, f"'cxx_eh' not in --info output:\n{result.stdout}"
+    assert "seh"            in result.stdout, f"'seh' not in --info output:\n{result.stdout}"
+    assert "total"          in result.stdout, f"'total' not in --info output:\n{result.stdout}"
+    assert "PE image"       in result.stdout, f"'PE image' not in --info output:\n{result.stdout}"
+    # Feature flags section
+    assert "PE features"    in result.stdout, f"'PE features' not in --info output:\n{result.stdout}"
+    assert "arch"           in result.stdout, f"'arch' not in --info output:\n{result.stdout}"
+    assert "x64"            in result.stdout, f"'x64' not in --info output:\n{result.stdout}"
+    assert "has_imports"    in result.stdout, f"'has_imports' not in --info output:\n{result.stdout}"
+    assert "required_stubs" in result.stdout, f"'required_stubs' not in --info output:\n{result.stdout}"
+    assert "issues"         in result.stdout, f"'issues' not in --info output:\n{result.stdout}"
     assert not list(tmp_path.iterdir()), "--info must not write any output files"
+
+
+def _make_packer_pe_bytes() -> bytes:
+    """Build a minimal PE64 with a .upx0 section name for testing rejection."""
+    e_lfanew   = 0x40
+    file_align = 0x200
+    sec_align  = 0x1000
+
+    dos = bytearray(e_lfanew)
+    dos[0:2] = b'MZ'
+    struct.pack_into('<I', dos, 60, e_lfanew)
+
+    size_of_opt_hdr = 240
+    file_hdr = struct.pack('<HHIIIHH',
+        0x8664, 1, 0, 0, 0, size_of_opt_hdr, 0x0022)
+
+    hdr_raw_size = e_lfanew + 4 + 20 + size_of_opt_hdr + 40
+    siz_hdrs     = (hdr_raw_size + file_align - 1) & ~(file_align - 1)
+    siz_image    = siz_hdrs + sec_align
+
+    opt = bytearray(size_of_opt_hdr)
+    struct.pack_into('<H', opt, 0x00, 0x020B)
+    struct.pack_into('<I', opt, 0x10, sec_align)
+    struct.pack_into('<I', opt, 0x14, sec_align)
+    struct.pack_into('<Q', opt, 0x18, 0x140000000)
+    struct.pack_into('<I', opt, 0x20, sec_align)
+    struct.pack_into('<I', opt, 0x24, file_align)
+    struct.pack_into('<H', opt, 0x30, 6)
+    struct.pack_into('<I', opt, 0x38, siz_image)
+    struct.pack_into('<I', opt, 0x3C, siz_hdrs)
+    struct.pack_into('<H', opt, 0x44, 2)
+    struct.pack_into('<I', opt, 0x6C, 0)
+
+    sec_hdr = struct.pack('<8sIIIIIIHHI',
+        b'.upx0\x00\x00\x00', sec_align, sec_align, file_align,
+        siz_hdrs, 0, 0, 0, 0, 0x60000020)
+
+    blob = bytes(dos) + b'PE\x00\x00' + file_hdr + bytes(opt) + sec_hdr
+    blob += b'\x00' * (siz_hdrs - len(blob))
+    blob += b'\x00' * file_align
+    return blob
+
+
+def test_packed_pe_rejected(tmp_path):
+    """peor must exit non-zero and print 'packed' in stderr for a PE with a packer section name."""
+    packed_pe = tmp_path / "packed.exe"
+    packed_pe.write_bytes(_make_packer_pe_bytes())
+
+    result = subprocess.run(
+        [sys.executable, "-m", "peor", "-i", str(packed_pe), "-o", str(tmp_path / "out.bin")],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode != 0, "peor should reject packed PE but returned 0"
+    assert "packed" in result.stderr.lower(), (
+        f"'packed' not in stderr:\n{result.stderr}"
+    )
+
+
+def test_packed_pe_features(tmp_path):
+    """_detect_pe_features must set packed=True and populate issues for packer section."""
+    packed_pe = tmp_path / "packed.exe"
+    packed_pe.write_bytes(_make_packer_pe_bytes())
+    pe = PE(str(packed_pe))
+    features = _detect_pe_features(pe)
+    assert features.packed, "packed should be True"
+    assert features.issues, "issues should be non-empty"
+    assert "packed" in features.issues[0].lower()
+    with pytest.raises(PeorUnsupportedError, match="packed"):
+        _validate_pe(pe)
 
 
 # ── P2 tests ──────────────────────────────────────────────────────────────────
@@ -635,8 +717,9 @@ def test_large_pe_disp32_guard():
     entry = dict(entry, relocs=bytes(relocs_bytes))
 
     pe = PE(str(pe_path))
+    features = _detect_pe_features(pe)
     with pytest.raises(ValueError, match="disp32"):
-        _build_shellcode_chain(pe, entry, skip_imports=True)
+        _build_shellcode_chain(features, entry, skip_imports=True)
 
 
 # ── P2-14 ─────────────────────────────────────────────────────────────────────
@@ -657,8 +740,8 @@ def test_16_delay_load(arch, tmp_path):
         [str(loader_path), str(shellcode_path)],
         capture_output=True, timeout=10,
     )
-    assert 1 <= result.returncode <= 250, (
-        f"[{arch}] expected exit code 1..250 (GetTickCount resolved), got {result.returncode}\n"
+    assert 67 <= result.returncode <= 203, (
+        f"[{arch}] expected exit code 67..203 (GetTickCount resolved), got {result.returncode}\n"
         f"stdout: {result.stdout.decode(errors='replace')}\n"
         f"stderr: {result.stderr.decode(errors='replace')}"
     )
@@ -1160,6 +1243,19 @@ _CLANG_CFLAGS_EFI_ARM64 = [
     "-fno-unwind-tables", "-fno-asynchronous-unwind-tables",
 ]
 
+_EFI_PREBUILT_ARM32 = TESTS_DIR / "Win_ARM32"
+
+_CLANG_CFLAGS_EFI_ARM32 = [
+    "--target=armv7-w64-mingw32",
+    "-mthumb",
+    "-mno-movt",          # force LDR literal pool (TYPE_3) instead of MOVW/MOVT (TYPE_7)
+    "-mfpu=none",         # UEFI ARM32 does not enable FPU; prevents NEON autovectorization
+    "-fsjlj-exceptions",  # use SJLJ EH (no OS dispatcher needed; works in freestanding EFI)
+    "-fuse-ld=lld",
+    "-nostdlib", "-nodefaultlibs", "-nostartfiles",
+    "-fno-unwind-tables", "-fno-asynchronous-unwind-tables",
+]
+
 
 def _find_clang_arm64() -> "str | None":
     """Return path to clang supporting aarch64-w64-mingw32 target, or None."""
@@ -1216,6 +1312,87 @@ def _compile_efi_pe_arm64(src: Path, out: Path, extra_includes: "Path | None",
     )
 
 
+def _find_clang_arm32() -> "str | None":
+    """Return path to clang supporting armv7-w64-mingw32 target, or None."""
+    for clang in ("clang", "clang-18", "clang-17", "clang-16", "clang-15"):
+        path = shutil.which(clang)
+        if path:
+            r = subprocess.run(
+                [path, "--target=armv7-w64-mingw32", "-print-effective-triple"],
+                capture_output=True, timeout=10,
+            )
+            if r.returncode == 0 and (b"arm" in r.stdout or b"thumb" in r.stdout):
+                return path
+    return None
+
+
+def _find_clang_arm32_wsl() -> "tuple[str | None, bool]":
+    """Return (clang_path_or_cmd, use_wsl) for armv7-w64-mingw32 clang, or (None, None)."""
+    native = _find_clang_arm32()
+    if native:
+        return native, False
+    if platform.system() == "Windows":
+        try:
+            r = _wsl_bash_run(
+                "clang --target=armv7-w64-mingw32 -print-effective-triple 2>/dev/null"
+                " || clang-18 --target=armv7-w64-mingw32 -print-effective-triple 2>/dev/null",
+                capture_output=True, timeout=15,
+            )
+            if r.returncode == 0 and (b"arm" in r.stdout or b"thumb" in r.stdout):
+                return "__wsl_clang__", True
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+    return None, None
+
+
+def _fix_arm32_pe_machine_type(pe_path: Path) -> None:
+    """Patch Machine field from ARMNT (0x01C4) to ARMTHUMB_MIXED (0x01C2).
+
+    lld --target=armv7-w64-mingw32 produces ARMNT (0x01C4) PEs.  EDK2 ARM32 EFI
+    (edk2-arm-code.fd) only accepts ARMTHUMB_MIXED (0x01C2) in LoadImage.
+    The code and relocation types are identical for both; only the header differs.
+    """
+    _ARMNT       = 0x01C4
+    _ARMTHUMB    = 0x01C2
+    data = bytearray(pe_path.read_bytes())
+    pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
+    machine_offset = pe_offset + 4  # Machine field is first in COFF header
+    machine = struct.unpack_from("<H", data, machine_offset)[0]
+    if machine == _ARMNT:
+        struct.pack_into("<H", data, machine_offset, _ARMTHUMB)
+        pe_path.write_bytes(bytes(data))
+
+
+def _compile_efi_pe_arm32(src: Path, out: Path, extra_includes: "Path | None",
+                           entry_fn: str,
+                           extra_srcs: "list[Path] | None" = None) -> subprocess.CompletedProcess:
+    """Compile an EFI PE for ARM32 using clang with armv7-w64-mingw32 target."""
+    clang, use_wsl = _find_clang_arm32_wsl()
+    assert clang is not None, "clang with armv7-w64-mingw32 target not found"
+    include_flag = [f"-I{extra_includes}"] if extra_includes else []
+    extra_srcs_list = list(extra_srcs) if extra_srcs else []
+    if use_wsl:
+        inc_flag = f"-I{_win_path_to_wsl(extra_includes)}" if extra_includes else ""
+        extra_srcs_str = " ".join(_win_path_to_wsl(s) for s in extra_srcs_list)
+        flags = " ".join(_CLANG_CFLAGS_EFI_ARM32)
+        cmd = (f"clang {flags} {inc_flag}"
+               f" -Wl,--entry={entry_fn} -Wl,--subsystem=efi_application"
+               f" -o {_win_path_to_wsl(out)} {_win_path_to_wsl(src)} {extra_srcs_str}")
+        r = _wsl_bash_run(cmd, capture_output=True, timeout=30)
+    else:
+        r = subprocess.run(
+            [clang] + _CLANG_CFLAGS_EFI_ARM32
+            + include_flag
+            + [f"-Wl,--entry={entry_fn}", "-Wl,--subsystem=efi_application",
+               "-o", str(out), str(src)]
+            + [str(s) for s in extra_srcs_list],
+            capture_output=True, timeout=30,
+        )
+    if r.returncode == 0 and out.exists():
+        _fix_arm32_pe_machine_type(out)
+    return r
+
+
 def _find_qemu_ovmf(arch: str = "x64") -> "tuple[str, str, str] | tuple[None, None, None]":
     """Return (qemu_bin, ovmf_code, ovmf_vars) or (None, None, None) if unavailable."""
     if arch == "arm64":
@@ -1237,6 +1414,29 @@ def _find_qemu_ovmf(arch: str = "x64") -> "tuple[str, str, str] | tuple[None, No
         qemu_share = Path(qemu).parent / "share"
         candidates_code = [str(qemu_share / "edk2-aarch64-code.fd")] + linux_code_candidates
         candidates_vars = linux_vars_candidates + [str(qemu_share / "edk2-aarch64-vars.fd")]
+        ovmf_code = next((p for p in candidates_code if Path(p).exists()), None)
+        if ovmf_code is None:
+            return None, None, None
+        ovmf_vars = next((p for p in candidates_vars if Path(p).exists()), None)
+        return qemu, ovmf_code, ovmf_vars
+    elif arch == "arm32":
+        qemu_bin_name = "qemu-system-arm"
+        qemu_win_path = Path(r"C:\Program Files\qemu\qemu-system-arm.exe")
+        linux_code_candidates = [
+            "/usr/share/AAVMF/AAVMF32_CODE.fd",           # Ubuntu 24.04+
+            "/usr/share/qemu-efi-arm/QEMU_EFI.fd",        # Ubuntu qemu-efi-arm package
+        ]
+        linux_vars_candidates = [
+            "/usr/share/AAVMF/AAVMF32_VARS.fd",           # Ubuntu 24.04+
+        ]
+        qemu = shutil.which(qemu_bin_name)
+        if qemu is None and platform.system() == "Windows" and qemu_win_path.exists():
+            qemu = str(qemu_win_path)
+        if qemu is None:
+            return None, None, None
+        qemu_share = Path(qemu).parent / "share"
+        candidates_code = [str(qemu_share / "edk2-arm-code.fd")] + linux_code_candidates
+        candidates_vars = linux_vars_candidates + [str(qemu_share / "edk2-arm-vars.fd")]
         ovmf_code = next((p for p in candidates_code if Path(p).exists()), None)
         if ovmf_code is None:
             return None, None, None
@@ -1298,10 +1498,12 @@ def _compile_efi_pe(gcc_src: Path, out: Path, extra_includes: "Path | None",
     Subsystem 10 = EFI_APPLICATION; numeric form avoids older-binutils parsing bugs.
     """
     _gcc = "x86_64-w64-mingw32-gcc" if arch == "x64" else "i686-w64-mingw32-gcc"
+    # i686-w64-mingw32 CDECL prepends '_' to C symbols; x86_64 does not.
+    entry_sym = f"_{entry_fn}" if arch == "x86" else entry_fn
     if use_wsl:
         inc = f"-I{_win_path_to_wsl(extra_includes)}" if extra_includes else ""
         flags = " ".join(_MINGW_CFLAGS_EFI)
-        cmd = (f"{_gcc} {flags} {inc} -Wl,-e,{entry_fn}"
+        cmd = (f"{_gcc} {flags} {inc} -Wl,-e,{entry_sym}"
                f" -Wl,--subsystem,10"
                f" -o {_win_path_to_wsl(out)} {_win_path_to_wsl(gcc_src)}")
         return _wsl_bash_run(cmd, capture_output=True, timeout=30)
@@ -1309,7 +1511,7 @@ def _compile_efi_pe(gcc_src: Path, out: Path, extra_includes: "Path | None",
     return subprocess.run(
         [_gcc] + _MINGW_CFLAGS_EFI
         + include_flag
-        + [f"-Wl,-e,{entry_fn}", "-Wl,--subsystem,10",
+        + [f"-Wl,-e,{entry_sym}", "-Wl,--subsystem,10",
            "-o", str(out), str(gcc_src)],
         capture_output=True, timeout=30,
     )
@@ -1323,12 +1525,14 @@ def _make_efi_boot_dir(efi_pe: Path, boot_dir: Path, arch: str = "x64") -> None:
         boot_filename = "BOOTX64.EFI"
     elif arch == "arm64":
         boot_filename = "BOOTAA64.EFI"
+    elif arch == "arm32":
+        boot_filename = "BOOTARM.EFI"
     else:
         boot_filename = "BOOTIA32.EFI"
     shutil.copy2(efi_pe, efi_boot / boot_filename)
 
 
-@pytest.mark.parametrize("arch", ["x64", "x86", "arm64"])
+@pytest.mark.parametrize("arch", ["x64", "x86", "arm64", "arm32"])
 def test_01_efi_hello(arch, tmp_path):
     """EFI shellcode: peor converts an EFI application PE; QEMU+OVMF boots it and shuts down.
 
@@ -1350,6 +1554,7 @@ def _build_and_run_efi(tmp_path: Path, efi_src: Path, expected_stdout_substr: st
     arch="x64"   uses qemu-system-x86_64 + OVMF    + x86_64 MinGW.
     arch="x86"   uses qemu-system-i386   + OVMF32   + i686 MinGW.
     arch="arm64" uses qemu-system-aarch64 + AAVMF   + clang aarch64-w64-mingw32.
+    arch="arm32" uses qemu-system-arm     + AAVMF32 + clang armv7-w64-mingw32.
     Returns QEMU stdout.  Fails (not skips) if required tools are absent.
     Asserts QEMU exits 0 (ResetSystem called on EFI_SUCCESS).
     """
@@ -1417,6 +1622,77 @@ def _build_and_run_efi(tmp_path: Path, efi_src: Path, expected_stdout_substr: st
         if expected_stdout_substr is not None:
             assert expected_stdout_substr in stdout, (
                 f"[arm64 EFI] Expected {expected_stdout_substr!r} in stdout\nstdout: {stdout[:2000]}"
+            )
+        return stdout
+
+    if arch == "arm32":
+        clang, use_wsl_clang = _find_clang_arm32_wsl()
+        assert clang is not None, "clang with armv7-w64-mingw32 target not found; install clang+lld"
+        qemu, ovmf_code, ovmf_vars = _find_qemu_ovmf("arm32")
+        assert qemu is not None, "qemu-system-arm not found; install qemu-system-arm"
+        assert ovmf_code is not None, "AAVMF32 firmware not found; install qemu-efi-arm"
+
+        prebuilt_pe = _EFI_PREBUILT_ARM32 / (efi_src.parent.name + ".efi")
+        if prebuilt_pe.exists():
+            efi_pe = prebuilt_pe
+        else:
+            efi_pe = tmp_path / (efi_src.stem + ".efi")
+            cc = _compile_efi_pe_arm32(efi_src, efi_pe, None, "efi_main")
+            assert cc.returncode == 0, (
+                f"ARM32 EFI PE compile failed:\n{cc.stderr.decode(errors='replace')}"
+            )
+
+        sc = tmp_path / (efi_src.stem + ".bin")
+        _shellcodify(efi_pe, sc)
+
+        sc_bytes = sc.read_bytes()
+        hex_bytes = ", ".join(f"0x{b:02x}" for b in sc_bytes)
+        header = (
+            f"static const unsigned char SHELLCODE_BYTES[] = {{{hex_bytes}}};\n"
+            f"static const unsigned long long SHELLCODE_SIZE = {len(sc_bytes)}ULL;\n"
+        )
+        (tmp_path / "shellcode_data.h").write_text(header, encoding="ascii")
+
+        loader_efi = tmp_path / "efi_loader.efi"
+        cc = _compile_efi_pe_arm32(_EFI_LOADER_SRC, loader_efi, tmp_path, "efi_loader_main")
+        assert cc.returncode == 0, (
+            f"ARM32 EFI loader compile failed:\n{cc.stderr.decode(errors='replace')}"
+        )
+
+        boot_dir = tmp_path / "efi_boot"
+        _make_efi_boot_dir(loader_efi, boot_dir, "arm32")
+        # ARM32 EDK2 in QEMU may not auto-run BOOTARM.EFI from the EFI boot manager.
+        # The EFI Shell auto-executes startup.nsh from each FS, so place one at FS root.
+        # write_bytes to avoid Windows write_text converting \n→\r\n, giving double-CR.
+        (boot_dir / "startup.nsh").write_bytes(b"FS0:\\EFI\\BOOT\\BOOTARM.EFI\r\n")
+
+        qemu_cmd = [
+            qemu, "-nographic", "-machine", "virt", "-cpu", "cortex-a15",
+            "-drive", f"if=pflash,format=raw,readonly=on,file={ovmf_code}",
+        ]
+        if ovmf_vars:
+            aavmf32_vars_rw = tmp_path / "AAVMF32_VARS.fd"
+            shutil.copy2(ovmf_vars, aavmf32_vars_rw)
+            qemu_cmd += ["-drive", f"if=pflash,format=raw,file={aavmf32_vars_rw}"]
+        qemu_cmd += [
+            "-drive", f"id=boot,if=none,format=vvfat,file=fat:rw:{boot_dir},fat-type=16",
+            "-device", "qemu-xhci",
+            "-device", "usb-storage,drive=boot",
+            "-m", "256M", "-no-reboot",
+        ]
+        try:
+            result = subprocess.run(qemu_cmd, capture_output=True, stdin=subprocess.DEVNULL, timeout=300)
+        except subprocess.TimeoutExpired:
+            pytest.fail("QEMU ARM32 timed out")
+
+        stdout = result.stdout.decode(errors="replace")
+        assert result.returncode == 0, (
+            f"[arm32 EFI] QEMU exited {result.returncode} (expected 0 = clean shutdown)\n"
+            f"stdout: {stdout[:2000]}\nstderr: {result.stderr.decode(errors='replace')[:500]}"
+        )
+        if expected_stdout_substr is not None:
+            assert expected_stdout_substr in stdout, (
+                f"[arm32 EFI] Expected {expected_stdout_substr!r} in stdout\nstdout: {stdout[:2000]}"
             )
         return stdout
 
@@ -1503,7 +1779,7 @@ _EFI_PRINT_SRC       = TESTS_DIR / "EFI" / "02_efi_print"       / "main.c"
 _EFI_SIMPLE_CALC_SRC = TESTS_DIR / "EFI" / "03_efi_simple_calc" / "main.c"
 
 
-@pytest.mark.parametrize("arch", ["x64", "x86", "arm64"])
+@pytest.mark.parametrize("arch", ["x64", "x86", "arm64", "arm32"])
 def test_02_efi_print(arch, tmp_path):
     """EFI shellcode uses ConOut->OutputString to print PEOR_EFI_HELLO.
 
@@ -1514,7 +1790,7 @@ def test_02_efi_print(arch, tmp_path):
                         arch=arch)
 
 
-@pytest.mark.parametrize("arch", ["x64", "x86", "arm64"])
+@pytest.mark.parametrize("arch", ["x64", "x86", "arm64", "arm32"])
 def test_03_efi_simple_calc(arch, tmp_path):
     """EFI shellcode computes sum(0..99)=4950 and prints PEOR_4950 via ConOut.
 
@@ -1528,13 +1804,80 @@ def test_03_efi_simple_calc(arch, tmp_path):
 _EFI_CPP_EXCEPTIONS_SRC = TESTS_DIR / "EFI" / "04_cpp_exceptions" / "main.cpp"
 
 
-@pytest.mark.parametrize("arch", ["x64", "x86"])
+@pytest.mark.parametrize("arch", ["x64", "x86", "arm32"])
 def test_04_efi_cpp_exceptions(arch, tmp_path):
     """EFI C++ shellcode: throws and catches a custom type; prints PEOR_CPP_EH_OK on success.
 
-    Requires g++-posix (DWARF-2 or SJLJ exceptions) and peor's ctors runner to initialise
-    the GCC EH runtime before efi_main runs.  Tested for x64 and x86.
+    x64/x86: requires g++-posix (DWARF-2 or SJLJ exceptions).
+    arm32:   uses clang with armv7-w64-mingw32 + -fno-unwind-tables (SJLJ, self-contained).
+    peor's ctors runner initialises the EH runtime before efi_main runs.
     """
+    if arch == "arm32":
+        clang, _ = _find_clang_arm32_wsl()
+        assert clang is not None, "clang with armv7-w64-mingw32 target not found; install clang+lld"
+        qemu, ovmf_code, ovmf_vars = _find_qemu_ovmf("arm32")
+        assert qemu is not None, "qemu-system-arm not found; install qemu-system-arm"
+        assert ovmf_code is not None, "AAVMF32 firmware not found; install qemu-efi-arm"
+
+        sjlj_src = _CPP_EH_SUPPORT_DIR / "sjlj_arm32.c"
+        efi_pe = tmp_path / "04_efi_cpp_arm32.efi"
+        cc = _compile_efi_pe_arm32(_EFI_CPP_EXCEPTIONS_SRC, efi_pe, None, "efi_main",
+                                    extra_srcs=[sjlj_src])
+        assert cc.returncode == 0, (
+            f"ARM32 EFI C++ PE compile failed:\n{cc.stderr.decode(errors='replace')}"
+        )
+
+        sc = tmp_path / "04_efi_cpp_arm32.bin"
+        _shellcodify(efi_pe, sc)
+
+        sc_bytes = sc.read_bytes()
+        hex_bytes = ", ".join(f"0x{b:02x}" for b in sc_bytes)
+        header = (
+            f"static const unsigned char SHELLCODE_BYTES[] = {{{hex_bytes}}};\n"
+            f"static const unsigned long long SHELLCODE_SIZE = {len(sc_bytes)}ULL;\n"
+        )
+        (tmp_path / "shellcode_data.h").write_text(header, encoding="ascii")
+
+        loader_efi = tmp_path / "efi_loader.efi"
+        cc = _compile_efi_pe_arm32(_EFI_LOADER_SRC, loader_efi, tmp_path, "efi_loader_main")
+        assert cc.returncode == 0, (
+            f"ARM32 EFI loader compile failed:\n{cc.stderr.decode(errors='replace')}"
+        )
+
+        boot_dir = tmp_path / "efi_boot"
+        _make_efi_boot_dir(loader_efi, boot_dir, "arm32")
+        (boot_dir / "startup.nsh").write_bytes(b"FS0:\\EFI\\BOOT\\BOOTARM.EFI\r\n")
+
+        qemu_cmd = [
+            qemu, "-nographic", "-machine", "virt", "-cpu", "cortex-a15",
+            "-drive", f"if=pflash,format=raw,readonly=on,file={ovmf_code}",
+        ]
+        if ovmf_vars:
+            aavmf32_vars_rw = tmp_path / "AAVMF32_VARS.fd"
+            shutil.copy2(ovmf_vars, aavmf32_vars_rw)
+            qemu_cmd += ["-drive", f"if=pflash,format=raw,file={aavmf32_vars_rw}"]
+        qemu_cmd += [
+            "-drive", f"id=boot,if=none,format=vvfat,file=fat:rw:{boot_dir},fat-type=16",
+            "-device", "qemu-xhci",
+            "-device", "usb-storage,drive=boot",
+            "-m", "256M", "-no-reboot",
+        ]
+        try:
+            result = subprocess.run(qemu_cmd, capture_output=True, stdin=subprocess.DEVNULL, timeout=300)
+        except subprocess.TimeoutExpired:
+            pytest.fail("QEMU ARM32 timed out for EFI C++ exceptions test")
+
+        stdout = result.stdout.decode(errors="replace")
+        assert result.returncode == 0, (
+            f"[efi_cpp arm32] QEMU exited {result.returncode} (expected 0 = clean shutdown)\n"
+            f"stdout: {stdout[:2000]}\nstderr: {result.stderr.decode(errors='replace')[:500]}"
+        )
+        assert "PEOR_CPP_EH_OK" in stdout, (
+            f"[efi_cpp arm32] PEOR_CPP_EH_OK not in QEMU stdout — exception not caught\n"
+            f"stdout: {stdout[:2000]}"
+        )
+        return
+
     if arch == "x64":
         gpp_cmd, use_wsl = _find_mingw_gpp_posix()
         gpp_skip = "x86_64-w64-mingw32-g++-posix not found (install g++-mingw-w64-x86-64)"
@@ -2360,7 +2703,7 @@ def test_05_linux_global_ctor(arch, tmp_path):
 _EFI_MEMORY_SERVICES_SRC = TESTS_DIR / "EFI" / "05_efi_memory_services" / "main.c"
 
 
-@pytest.mark.parametrize("arch", ["x64", "x86", "arm64"])
+@pytest.mark.parametrize("arch", ["x64", "x86", "arm64", "arm32"])
 def test_05_efi_memory_services(arch, tmp_path):
     """EFI shellcode calls AllocatePool from EFI_BOOT_SERVICES, writes magic byte 66,
     reads it back; returns EFI_SUCCESS on match so QEMU shuts down cleanly.

@@ -10,7 +10,7 @@ typedef unsigned int EFI_STATUS;
 #define EFI_SIMPLE_TEXT_OUTPUT_OUTPUT_STRING_OFF 0x04
 #endif
 
-typedef unsigned short CHAR16;
+typedef char16_t CHAR16;
 #define EFI_SUCCESS    ((EFI_STATUS)0)
 #define EFI_LOAD_ERROR ((EFI_STATUS)1)
 
@@ -21,8 +21,8 @@ struct PeorEfiException
     int code;
 };
 
-static const CHAR16 MSG_OK[] = L"PEOR_CPP_EH_OK\r\n";
-static const CHAR16 MSG_FAIL[] = L"PEOR_CPP_EH_FAIL\r\n";
+static const CHAR16 MSG_OK[] = u"PEOR_CPP_EH_OK\r\n";
+static const CHAR16 MSG_FAIL[] = u"PEOR_CPP_EH_FAIL\r\n";
 
 extern "C" EFI_STATUS efi_main(void* _, void* system_table)
 {

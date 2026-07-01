@@ -26,7 +26,7 @@ EFI_STATUS efi_main(void* _, void* system_table)
     ALLOCATE_POOL_FN allocate_pool = *(ALLOCATE_POOL_FN*)(((unsigned char*)boot_services) + EFI_BOOT_SERVICES_ALLOCATE_POOL_OFFSET);
 
     unsigned char* buff = 0;
-    if (allocate_pool(EFI_LOADER_DATA, ALLOC_SIZE, (void**)&buff) != EFI_SUCCESS || (buff == NULL))
+    if (allocate_pool(EFI_LOADER_DATA, ALLOC_SIZE, (void**)&buff) != EFI_SUCCESS || !buff)
     {
         return EFI_LOAD_ERROR;
     }

@@ -407,6 +407,24 @@ jumps directly to the entry point.
 
 ---
 
+## Module Structure
+
+```
+peor/
+  __main__.py       ← CLI only: argparse, --info / -o dispatch
+  _pe_features.py   ← PE header reads: PeFeatures dataclass, _detect_pe_features(),
+                       _validate_pe_features(), all IMAGE_DIRECTORY_ENTRY_* constants
+  _chain_builder.py ← Stub selection and byte patching: _SHELLCODES table, _build_shellcode_chain(),
+                       dump_memory_layout(), _select_chain()
+  _shellcodes.py    ← Auto-generated shellcode byte arrays (assembled by setup.py)
+```
+
+`_pe_features.py` has no dependency on `_shellcodes` or `_chain_builder`.
+`_chain_builder.py` reads all PE feature decisions from `PeFeatures`; it only uses the raw PE
+object for memory-layout reads (`pe.get_data()`, `pe.sections`).
+
+---
+
 ## Test Suite
 
 All tests live in `tests/` and are driven by `pytest`.  Each test:
@@ -550,4 +568,41 @@ and the native `test_loader.exe` for execution.
 | EFI application (subsystems 10–13) | ✅ | ✅ |
 | Windows kernel driver | ❌ | ❌ |
 
-Attempting to convert unsupported combinations raises `ValueError` with a descriptive message.
+Attempting to convert unsupported combinations raises `ValueError` or `PeorUnsupportedError` with a descriptive message.
+
+---
+
+## PE Feature Detection (`--info`)
+
+`peor --info -i input.exe` prints a feature summary and a stub-size breakdown without writing output:
+
+```
+PE features:
+  arch              x64
+  subsystem         2
+  has_relocs        yes
+  has_imports       yes
+  has_delay_imports no
+  has_tls           no
+  has_seh           yes
+  has_cxx_eh        yes
+  has_ctors         no
+  packed            no
+  bss_sections      none
+  ordinal_imports   none
+  api_set_imports   none
+  forwarded_exports no
+  required_stubs    imports -> relocs -> cxx_eh_fixer -> seh -> entrypoint
+  issues            none
+
+  imports      1234 B
+  relocs        567 B
+  cxx_eh        89 B
+  seh           45 B
+  entrypoint    33 B
+  PE image   65536 B
+  ──────────────────────
+  total      67504 B  (input.exe)
+```
+
+**Packed PE rejection**: peor detects common packer section names (`.upx0`, `.upx1`, `UPX0`, `UPX1`, `.aspack`, `ASPack`, `.packed`, `pebundle`) and raises `PeorUnsupportedError` before conversion.  Both `--info` and `-o` paths reject packed PEs.

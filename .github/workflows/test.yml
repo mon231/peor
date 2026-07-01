@@ -313,7 +313,7 @@ jobs:
             g++-mingw-w64-x86-64 g++-mingw-w64-i686 \
             qemu-system-x86 ovmf \
             clang lld \
-            qemu-system-arm qemu-efi-aarch64
+            qemu-system-arm qemu-efi-aarch64 qemu-efi-arm
 
       - name: Install Python dependencies
         run: |

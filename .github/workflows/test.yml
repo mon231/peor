@@ -160,10 +160,13 @@ jobs:
       - name: Expose mingw32 gcc/g++-posix aliases on PATH
         shell: msys2 {0}
         run: |
-          cp /mingw64/bin/gcc.exe /mingw64/bin/x86_64-w64-mingw32-gcc.exe
-          cp /mingw32/bin/gcc.exe /mingw32/bin/i686-w64-mingw32-gcc.exe
-          cp /mingw64/bin/g++.exe /mingw64/bin/x86_64-w64-mingw32-g++-posix.exe
-          cp /mingw32/bin/g++.exe /mingw32/bin/i686-w64-mingw32-g++-posix.exe
+          # mingw-w64-{x86_64,i686}-gcc already ship gcc.exe as the same file as the
+          # triple-prefixed name, so only alias what's actually missing (the "-posix"
+          # suffixed g++ name Debian's alternatives system uses, which MSYS2 doesn't).
+          [ -e /mingw64/bin/x86_64-w64-mingw32-gcc.exe ] || cp /mingw64/bin/gcc.exe /mingw64/bin/x86_64-w64-mingw32-gcc.exe
+          [ -e /mingw32/bin/i686-w64-mingw32-gcc.exe ]   || cp /mingw32/bin/gcc.exe /mingw32/bin/i686-w64-mingw32-gcc.exe
+          [ -e /mingw64/bin/x86_64-w64-mingw32-g++-posix.exe ] || cp /mingw64/bin/g++.exe /mingw64/bin/x86_64-w64-mingw32-g++-posix.exe
+          [ -e /mingw32/bin/i686-w64-mingw32-g++-posix.exe ]   || cp /mingw32/bin/g++.exe /mingw32/bin/i686-w64-mingw32-g++-posix.exe
           echo "$(cygpath -w /mingw64/bin)" >> "$GITHUB_PATH"
           echo "$(cygpath -w /mingw32/bin)" >> "$GITHUB_PATH"
 
@@ -210,10 +213,13 @@ jobs:
       - name: Expose mingw32 gcc/g++-posix aliases on PATH
         shell: msys2 {0}
         run: |
-          cp /mingw64/bin/gcc.exe /mingw64/bin/x86_64-w64-mingw32-gcc.exe
-          cp /mingw32/bin/gcc.exe /mingw32/bin/i686-w64-mingw32-gcc.exe
-          cp /mingw64/bin/g++.exe /mingw64/bin/x86_64-w64-mingw32-g++-posix.exe
-          cp /mingw32/bin/g++.exe /mingw32/bin/i686-w64-mingw32-g++-posix.exe
+          # mingw-w64-{x86_64,i686}-gcc already ship gcc.exe as the same file as the
+          # triple-prefixed name, so only alias what's actually missing (the "-posix"
+          # suffixed g++ name Debian's alternatives system uses, which MSYS2 doesn't).
+          [ -e /mingw64/bin/x86_64-w64-mingw32-gcc.exe ] || cp /mingw64/bin/gcc.exe /mingw64/bin/x86_64-w64-mingw32-gcc.exe
+          [ -e /mingw32/bin/i686-w64-mingw32-gcc.exe ]   || cp /mingw32/bin/gcc.exe /mingw32/bin/i686-w64-mingw32-gcc.exe
+          [ -e /mingw64/bin/x86_64-w64-mingw32-g++-posix.exe ] || cp /mingw64/bin/g++.exe /mingw64/bin/x86_64-w64-mingw32-g++-posix.exe
+          [ -e /mingw32/bin/i686-w64-mingw32-g++-posix.exe ]   || cp /mingw32/bin/g++.exe /mingw32/bin/i686-w64-mingw32-g++-posix.exe
           echo "$(cygpath -w /mingw64/bin)" >> "$GITHUB_PATH"
           echo "$(cygpath -w /mingw32/bin)" >> "$GITHUB_PATH"
 

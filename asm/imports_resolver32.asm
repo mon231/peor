@@ -91,6 +91,8 @@ _scan_mz:
     cmp word [esi], 0x5A4D              ; "MZ" ?
     jnz _scan_mz
     mov eax, [esi + 0x3C]              ; e_lfanew
+    cmp eax, 0x400                      ; reject false positives with huge e_lfanew
+    ja _scan_mz
     lea edx, [esi + eax]               ; NT headers VA
     cmp dword [edx], 0x4550            ; "PE\0\0" ?
     jnz _scan_mz

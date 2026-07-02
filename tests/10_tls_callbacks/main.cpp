@@ -1,12 +1,14 @@
-// Tests that peor invokes TLS callbacks before the entry point.
-// Returns 88 if the TLS callback ran (set g_result=88 on DLL_PROCESS_ATTACH).
+// Test shellcode invokes TLS-callbacks before the entry point
 #include <windows.h>
 
+#define PROGRAM_EXIT_CODE (88)
 static volatile int g_result = 0;
 
 static void NTAPI tls_callback(PVOID, DWORD reason, PVOID) {
     if (reason == DLL_PROCESS_ATTACH)
-        g_result = 88;
+    {
+        g_result = PROGRAM_EXIT_CODE;
+    }
 }
 
 #pragma section(".CRT$XLB", read)
@@ -44,5 +46,6 @@ int main() {
     foo();
     foo();
     foo();
+
     return foo().get_num();
 }

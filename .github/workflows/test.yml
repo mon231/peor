@@ -149,6 +149,27 @@ jobs:
             echo "clang-cl not found in VS install; test_clangcl will skip"
           }
 
+      # test_17_mingw_cpp_exceptions needs a native mingw-w64 g++ (both archs) on this
+      # Windows runner: the exe it builds must run here, and windows-latest has no WSL.
+      - name: Set up MSYS2 MinGW-w64 (x86_64 + i686) for test_17
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc mingw-w64-i686-gcc
+
+      - name: Expose mingw32 gcc/g++-posix aliases on PATH
+        shell: msys2 {0}
+        run: |
+          cp /mingw64/bin/gcc.exe /mingw64/bin/x86_64-w64-mingw32-gcc.exe
+          cp /mingw32/bin/gcc.exe /mingw32/bin/i686-w64-mingw32-gcc.exe
+          cp /mingw64/bin/g++.exe /mingw64/bin/x86_64-w64-mingw32-g++-posix.exe
+          cp /mingw32/bin/g++.exe /mingw32/bin/i686-w64-mingw32-g++-posix.exe
+          echo "$(cygpath -w /mingw64/bin)" >> "$GITHUB_PATH"
+          echo "$(cygpath -w /mingw32/bin)" >> "$GITHUB_PATH"
+
+      - name: Build prebuilt test artifacts (build_tests.py)
+        run: python tests/build_tests.py --target windows
+
       - name: Run pytest (Windows Release)
         run: pytest tests/pytest/ -v --cov=peor --cov-report=xml --cov-report=term-missing --timeout=60 -k "not linux and not efi"
 
@@ -179,6 +200,25 @@ jobs:
         with:
           name: test-bins-windows-debug
           path: tests
+
+      - name: Set up MSYS2 MinGW-w64 (x86_64 + i686) for test_17
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc mingw-w64-i686-gcc
+
+      - name: Expose mingw32 gcc/g++-posix aliases on PATH
+        shell: msys2 {0}
+        run: |
+          cp /mingw64/bin/gcc.exe /mingw64/bin/x86_64-w64-mingw32-gcc.exe
+          cp /mingw32/bin/gcc.exe /mingw32/bin/i686-w64-mingw32-gcc.exe
+          cp /mingw64/bin/g++.exe /mingw64/bin/x86_64-w64-mingw32-g++-posix.exe
+          cp /mingw32/bin/g++.exe /mingw32/bin/i686-w64-mingw32-g++-posix.exe
+          echo "$(cygpath -w /mingw64/bin)" >> "$GITHUB_PATH"
+          echo "$(cygpath -w /mingw32/bin)" >> "$GITHUB_PATH"
+
+      - name: Build prebuilt test artifacts (build_tests.py)
+        run: python tests/build_tests.py --target windows
 
       - name: Run pytest (Windows Debug)
         run: pytest tests/pytest/ -v --timeout=60 -k "not linux and not efi"
@@ -214,31 +254,16 @@ jobs:
             g++-mingw-w64-x86-64 g++-mingw-w64-i686 \
             gcc gcc-multilib
 
-      - name: Build Linux test loaders (x64 and x86)
-        # x64: -ffixed-{rbx,r12-r15} prevents the shellcode's callee-save clobbers (EBX=PE_base etc.)
-        # from corrupting the loader's return value.  -ldl for dlopen/dlsym.
-        # x86: -no-pie -fno-pic: default PIE uses EBX for GOT; PLT stubs are "jmp [ebx+N]".
-        # The relocs-resolver sets EBX=PE_base, so any PLT call after the shellcode crashes.
-        # -ffixed-{ebx,esi,edi}: prevents GCC from allocating the three clobbered callee-saved
-        # regs for local variables (e.g. storing the "return 0" value then "mov eax,<reg>").
-        run: |
-          gcc -O2 \
-            -ffixed-rbx -ffixed-r12 -ffixed-r13 -ffixed-r14 -ffixed-r15 \
-            -o tests/test_loader_linux/test_loader_linux.pe \
-            tests/test_loader_linux/main.c -ldl
-          gcc -m32 -O2 \
-            -D_FILE_OFFSET_BITS=64 \
-            -fno-pie -no-pie -fno-pic -ffixed-ebx -ffixed-esi -ffixed-edi \
-            -o tests/test_loader_linux/test_loader_linux_32.pe \
-            tests/test_loader_linux/main.c -ldl
-
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -e .
           pip install pytest pytest-timeout
 
-      - name: Cross-compile all Linux PE tests (x64 + x86)
+      - name: Build Linux test loaders + prebuilt Linux test PEs (build_tests.py)
+        run: python3 tests/build_tests.py --target linux
+
+      - name: Cross-compile remaining Linux PE tests (x64 + x86)
         run: pytest tests/pytest -v --timeout=120 -k "linux"
 
       - name: Upload Linux build artifacts
@@ -311,7 +336,7 @@ jobs:
             gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 \
             gcc-mingw-w64-i686   binutils-mingw-w64-i686 \
             g++-mingw-w64-x86-64 g++-mingw-w64-i686 \
-            qemu-system-x86 ovmf \
+            qemu-system-x86 ovmf ovmf-ia32 \
             clang lld \
             qemu-system-arm qemu-efi-aarch64 qemu-efi-arm
 
@@ -321,5 +346,40 @@ jobs:
           pip install -e .
           pip install pytest pytest-timeout
 
+      - name: Build prebuilt EFI test-source PEs (build_tests.py)
+        run: python3 tests/build_tests.py --target efi
+
       - name: Run EFI shellcode tests (x64 + x86 + ARM64 QEMU)
         run: pytest tests/pytest -v --timeout=360 -k "efi"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# test-summary: single required gate — fails unless every job above PASSED.
+# No test in this workflow is allowed to silently skip (missing binaries/toolchains
+# are hard failures, see PLAN.md), so "success" is the only acceptable result here.
+# ─────────────────────────────────────────────────────────────────────────────
+  test-summary:
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - build-windows
+      - build-windows-debug
+      - test-windows
+      - test-windows-debug
+      - build-linux-mingw
+      - test-linux-mingw
+      - test-efi-qemu
+    steps:
+      - name: Verify every job passed
+        run: |
+          echo '${{ toJSON(needs) }}' > needs.json
+          python3 - <<'EOF'
+          import json
+          needs = json.load(open("needs.json"))
+          failed = [name for name, info in needs.items() if info["result"] != "success"]
+          for name, info in needs.items():
+              print(f"{name}: {info['result']}")
+          if failed:
+              print(f"\nFAILED jobs (must all be 'success'): {', '.join(failed)}")
+              raise SystemExit(1)
+          print("\nAll jobs passed.")
+          EOF

@@ -24,7 +24,6 @@ from peor._shellcodes import (
     CXX_EH_FIXER_64,
     CTORS_RUNNER_64, CTORS_RUNNER_32,
     RELOCS_ARM64, CTORS_RUNNER_ARM64, ENTRYPOINT_EFI_ARM64,
-    ARM64_EFI_PREFIX,
     RELOCS_ARM32, CTORS_RUNNER_ARM32, ENTRYPOINT_EFI_ARM32,
     ARM32_EFI_PREFIX,
 )
@@ -149,7 +148,6 @@ _SHELLCODES = {
         'ep_rva_magic':      _EP_RVA_MAGIC,
     },
     _PLATFORM_EFI_ARM64: {
-        'prefix':            ARM64_EFI_PREFIX,
         'relocs':            RELOCS_ARM64,
         'imports':           b'',
         'delay_imports':     b'',

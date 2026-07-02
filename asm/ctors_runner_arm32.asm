@@ -1,8 +1,8 @@
 ; ARM32 (Thumb-2) .init_array runner.
 ; Assembled by keystone (KS_ARCH_ARM / KS_MODE_THUMB).
 ;
-; On entry: r4 = PE base (from relocations_resolver_arm32), r9/r10 = EFI args.
-; On exit:  r4/r9/r10 unchanged; falls through to next shellcode.
+; On entry: r4 = PE base (from relocations_resolver_arm32).
+; On exit:  r4 unchanged; falls through to next shellcode.
 ;
 ; Pool-loading technique: BL to _load_pools sets LR = pool1 address (plus Thumb bit).
 ; BIC removes the Thumb bit to get a clean pointer; then two LDR from [r0] and [r0,#4].

@@ -1,7 +1,47 @@
 // EFI loader - runs an embedded shellcode buffer, prints result, then shuts down
-
+//
+// x64/x86: the shellcode payload is NOT a per-test compile-time constant (that would
+// force a compiler invocation inside test.py for every test). Instead this loader is
+// compiled ONCE per architecture (by build_tests.py) with a fixed-size placeholder blob;
+// the test harness locates MAGIC in the compiled loader.efi and byte-patches SIZE + BYTES
+// in a copy of it before boot — no compiler runs at test time. See build_tests.py.
+//
+// ARM64/ARM32: this QEMU+EDK2 ARM firmware fails to boot a loader built with the blob
+// above (silent hang partway through BdsDxe, root cause not identified — reproduces
+// across native-Windows and WSL/Debian qemu-system-arm builds, independent of blob size
+// down to ~52 KiB image size; a loader built the exact-size way below at ~40 KiB boots
+// fine). So ARM keeps the original per-test compile: build_tests.py passes
+// -DPEOR_ARM_LEGACY_SHELLCODE, and the test harness generates shellcode_data.h and
+// recompiles this file per test (same as before this file supported x64/x86's blob
+// patching) — the only place in the ARM EFI test path that still invokes a compiler.
 #include <stddef.h>
+
+#ifdef PEOR_ARM_LEGACY_SHELLCODE
 #include "shellcode_data.h"
+#else
+
+#define SHELLCODE_MAX_SIZE 262144u  /* 256 KiB ceiling; C++ EH test embeds ~224 KiB observed */
+
+/* magic[16] is a multiple of 8 bytes, so natural C struct layout already puts `size`
+ * and `bytes` at fixed, gap-free offsets (16 and 24) without needing any #pragma pack —
+ * deliberately not packed, since packing would drop the object's own alignment to 1 and
+ * risk an unaligned 8-byte load of `size` (traps on strict-alignment ABIs). */
+typedef struct {
+    unsigned char magic[16];
+    unsigned long long size;
+    unsigned char bytes[SHELLCODE_MAX_SIZE];
+} PeorShellcodeBlob;
+
+static const PeorShellcodeBlob g_shellcode_blob = {
+    { 'P','E','O','R','_','S','H','E','L','L','C','O','D','E','!','!' },
+    0,
+    { 0 }
+};
+
+#define SHELLCODE_SIZE  (g_shellcode_blob.size)
+#define SHELLCODE_BYTES (g_shellcode_blob.bytes)
+
+#endif  /* PEOR_ARM_LEGACY_SHELLCODE */
 
 typedef unsigned char  UINT8;
 typedef unsigned short UINT16;
@@ -71,10 +111,10 @@ EFI_STATUS efi_loader_main(void* image_handle, void* system_table)
         exec_buf[i] = src[i];
     }
 
-    /* ARM64 EFI shellcode expects (image_handle, system_table) in x0/x1.
-     * The prefix stub (mov x24, x1) saves system_table to x24 before the relocs
-     * resolver clobbers x1 (and x20-x23); the entrypoint resolver reads x24. */
-    result = ((EFI_STATUS (*)(void *, void *))exec_buf)(image_handle, system_table);
+    /* peor shellcodes are parameter-less: called as EFI_STATUS(void). The ARM64 EFI
+     * entrypoint resolver locates EFI_SYSTEM_TABLE itself via a memory scan, so no
+     * arguments are passed here (mirrors the x86/x64 EFI call below). */
+    result = ((EFI_STATUS (*)(void))exec_buf)();
     free_pages(exec_phys, pages);
 #elif defined(__arm__)
     /* ARM32: EDK2 enforces XN on rodata.  Use AllocatePages for page-aligned executable
@@ -101,11 +141,12 @@ EFI_STATUS efi_loader_main(void* image_handle, void* system_table)
         exec_buf32[i] = src32[i];
     }
 
-    /* ARM32 EFI shellcode expects (image_handle, system_table) in r0/r1.
-     * The prefix stub saves them to r9/r10 before the relocs resolver runs.
-     * Thumb-2 functions must be called with bit 0 of address set; the allocated
-     * page is naturally aligned (bit 0 = 0), so OR 1 to enter Thumb mode. */
-    result = ((EFI_STATUS (*)(void *, void *))(((UINTN)exec_buf32) | 1))(image_handle, system_table);
+    /* peor shellcodes are parameter-less: called as EFI_STATUS(void). The ARM32 EFI
+     * entrypoint resolver locates EFI_SYSTEM_TABLE itself via a memory scan, so no
+     * arguments are passed here. Thumb-2 functions must be called with bit 0 of the
+     * address set; the allocated page is naturally aligned (bit 0 = 0), so OR 1 to
+     * enter Thumb mode. */
+    result = ((EFI_STATUS (*)(void))(((UINTN)exec_buf32) | 1))();
     free_pages32(exec_phys32, pages32);
 #else
     /* x86 / x64: OVMF does not enforce XN on pre-boot memory. */

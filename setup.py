@@ -123,8 +123,10 @@ def _assemble_shellcodes():
     r_arm32     = assemble_arm32(ASM_DIR / 'relocations_resolver_arm32.asm', patch_pe_offset_pool=True)
     ctors_arm32 = assemble_arm32(ASM_DIR / 'ctors_runner_arm32.asm')
     e_efi_arm32_raw = assemble_arm32(ASM_DIR / 'entrypoint_resolver_efi_arm32.asm')
+    # AAPCS callee-save only: the shellcode is called as EFI_STATUS(void), so r0/r1 are
+    # never the firmware's ImageHandle/SystemTable (see entrypoint_resolver_efi_arm32.asm).
     arm32_efi_prefix_raw = assemble_arm32(
-        "push {r4, r5, r6, r7, r8, r9, r10, r11, lr}\nmov r9, r0\nmov r10, r1",
+        "push {r4, r5, r6, r7, r8, r9, r10, r11, lr}",
         src_is_string=True,
     )
 
@@ -228,7 +230,6 @@ def _assemble_shellcodes():
         f"RELOCS_ARM64           = bytes.fromhex('{r_arm64.hex()}')\n"
         f"CTORS_RUNNER_ARM64     = bytes.fromhex('{ctors_arm64.hex()}')\n"
         f"ENTRYPOINT_EFI_ARM64   = bytes.fromhex('{e_efi_arm64.hex()}')\n"
-        "ARM64_EFI_PREFIX       = bytes.fromhex('f80301aa')\n"
         f"RELOCS_ARM32           = bytes.fromhex('{r_arm32.hex()}')\n"
         f"CTORS_RUNNER_ARM32     = bytes.fromhex('{ctors_arm32.hex()}')\n"
         f"ENTRYPOINT_EFI_ARM32   = bytes.fromhex('{e_efi_arm32.hex()}')\n"

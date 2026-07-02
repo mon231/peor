@@ -1,19 +1,7 @@
 // Test EFI_BOOT_SERVICES in shellcode
 
-#ifdef _WIN64
-typedef unsigned long long EFI_STATUS;
-typedef unsigned long long UINTN;
-#define EFI_SYSTEM_TABLE_BOOT_SERVICES_OFFSET  0x60
-#define EFI_BOOT_SERVICES_ALLOCATE_POOL_OFFSET 0x40
-#else
-typedef unsigned int EFI_STATUS;
-typedef unsigned int UINTN;
-#define EFI_SYSTEM_TABLE_BOOT_SERVICES_OFFSET  0x3C
-#define EFI_BOOT_SERVICES_ALLOCATE_POOL_OFFSET 0x2C
-#endif
+#include "../efi_common.h"
 
-#define EFI_SUCCESS      ((EFI_STATUS)0)
-#define EFI_LOAD_ERROR   ((EFI_STATUS)1)
 #define EFI_LOADER_DATA  2
 #define ALLOC_SIZE       64
 #define ALLOC_MAGIC      66

@@ -198,11 +198,13 @@ When the PE subsystem is an EFI application (10–13), an EFI entry dispatcher i
 used instead of the standard Windows entry dispatcher.  No import resolver is
 inserted (EFI applications are expected to be importless).
 
-Three dispatcher variants exist, selected by architecture:
+Four dispatcher variants exist, one per architecture — **all fully
+self-contained**: the shellcode is called as `EFI_STATUS(void)`, with no
+arguments from the loader (not even `ImageHandle`/`SystemTable`, which the
+firmware itself passed to the *loader*, not the shellcode).  Every dispatcher
+locates `EFI_SYSTEM_TABLE` itself and calls `efi_main(NULL, SystemTable)`:
 
-**x86 / x64** (`entrypoint_resolver_efi32/64.asm`): the shellcode is
-**fully self-contained** — no runtime parameters are expected from the caller.
-At runtime the dispatcher:
+**x86 / x64** (`entrypoint_resolver_efi32/64.asm`):
 1. Attempts a fast path: reads the `EFI_SYSTEM_TABLE` pointer from the loader's
    stack frame at a fixed RSP offset (calibrated to the reference EFI loader
    compiled with GCC at `-O0`).
@@ -211,15 +213,35 @@ At runtime the dispatcher:
    `Revision >= 2.0`, `HeaderSize >= 0x78`, and valid `BootServices`/`ConOut` pointers.
    Scan range: `0x10000–0x20000000` for x64, `0x10000–0x10000000` for x86.
 3. Calls `efi_main(NULL, SystemTable)` with the appropriate ABI.
-4. Returns the `EFI_STATUS` to the caller.
 
-**ARM64** (`asm/entrypoint_resolver_efi_arm64.asm` + `ARM64_EFI_PREFIX`): uses
-a different approach to avoid scanning unmapped memory (which would cause Data
-Abort exceptions on ARM64).  A 4-byte prefix stub (`mov x24, x1`) is prepended
-to the resolver chain to save the `EFI_SYSTEM_TABLE` pointer (passed in `x1` by
-the EFI firmware) into the callee-saved register `x24` before the relocations
-resolver clobbers `x1`.  The dispatcher then reads `x24` directly to obtain
-`SystemTable` and calls `efi_main(NULL, SystemTable)`.
+**ARM64** (`entrypoint_resolver_efi_arm64.asm`):
+1. Fast path: reads `EFI_SYSTEM_TABLE` from `efi_loader_main`'s own stack frame at a
+   fixed SP offset (calibrated the same way as x86/x64's fast path, but confirmed by
+   disassembling the actual compiled loader rather than by inspecting source — clang
+   `-O0` for `aarch64-w64-mingw32` saves the `system_table` argument at `[sp+0x70]`
+   right after `sub sp, sp, #0x90`; the resolver's own prologue shifts that by 0x10),
+   then validates it with the same signature/BootServices/ConOut checks as the scan.
+2. Falls back to the memory scan below only if the fast-path candidate fails
+   validation.
+
+**Why ARM64 needs the fast path (and x64/x86 treat it as optional):** ARM64's 256 MiB
+QEMU-virt scan range also contains EDK2's own live structures (unlike x64/x86's mostly
+empty scan range), so a pure scan can find a false-positive match that still passes
+every check — the resolved `ConOut->OutputString` then points into unrelated EDK2 code,
+and calling it crashes with a QEMU `Synchronous Exception` deep inside the firmware.
+Reading the real pointer directly off the stack sidesteps this; the scan stays only as
+a last-resort fallback (as it does for x64/x86 too, mainly so the resolver still works
+if `tests/EFI/efi_loader/main.c`'s ARM64 branch or its compile flags ever change enough
+to move that stack slot).
+
+**ARM32** (`entrypoint_resolver_efi_arm32.asm`): always does the memory scan (no stack
+fast path — not needed, arm32 has no false-positive problem in practice). Same
+signature/`BootServices`/`ConOut` validation, using the 32-bit `EFI_TABLE_HEADER`
+layout. `ARM32_EFI_PREFIX` runs first, but only to push `r4-r11`/`lr` for AAPCS
+callee-save — it no longer captures any firmware-supplied register.
+
+Scan range for both ARM64 and ARM32 is `0x40000000–0x50000000` — the RAM window QEMU's
+`virt` machine maps at `-m 256M`, matching how the ARM64/ARM32 EFI tests boot.
 
 **ARM64 ADRP alignment requirement**: ARM64 code uses `ADRP` (page-granular
 PC-relative addressing) to access `.rodata` symbols.  `ADRP` is correct only
@@ -469,11 +491,11 @@ pytest tests/pytest -v
 | — | `03_linux_with_crt` | x64, x86 | Linux PE using `strlen`/`malloc`/`free`/`memcpy` from `libc.so.6`; tests multi-symbol dlopen/dlsym resolver | 73 |
 | — | `04_linux_signal` | x64, x86 | Linux PE installing SIGUSR1 handler via `signal()`, raising it via `raise()`, returns 77; tests signal-handling imports | 77 |
 | — | `05_linux_global_ctor` | x64, x86 | Linux C++ PE with a global constructor that increments a counter; `main` asserts `counter == 99`; tests `.init_array` runner | 99 |
-| — | `01_efi_hello` | x64, x86, arm64 | Minimal EFI application PE; peor converts it; EFI loader with embedded shellcode boots under QEMU+OVMF/AAVMF; shellcode calls ResetSystem(Shutdown) | QEMU exit 0 |
-| — | `02_efi_print` | x64, x86, arm64 | EFI shellcode uses ConOut->OutputString to print "PEOR\_EFI\_HELLO"; checks QEMU stdout | PEOR\_EFI\_HELLO in stdout |
-| — | `03_efi_simple_calc` | x64, x86, arm64 | EFI shellcode computes sum(0..99)=4950, prints "PEOR\_4950" via ConOut; checks QEMU stdout | PEOR\_4950 in stdout |
-| — | `04_efi_cpp_exceptions` | x64, x86 | EFI C++ shellcode: `throw`/`catch` a custom type; x64 uses freestanding Windows-SEH emulator (static heap); x86 uses DWARF/SJLJ; asserts "PEOR\_CPP\_EH\_OK" in QEMU stdout | PEOR\_CPP\_EH\_OK in stdout |
-| — | `05_efi_memory_services` | x64, x86, arm64 | EFI shellcode calls AllocatePool/FreePool to exercise BootServices memory management; asserts "PEOR\_MEM\_OK" in QEMU stdout | PEOR\_MEM\_OK in stdout |
+| — | `01_efi_hello` | x64, x86, arm64, arm32 | Minimal EFI application PE; peor converts it; EFI loader with embedded shellcode boots under QEMU+OVMF/AAVMF; shellcode calls ResetSystem(Shutdown) | QEMU exit 0 |
+| — | `02_efi_print` | x64, x86, arm64, arm32 | EFI shellcode uses ConOut->OutputString to print "PEOR\_EFI\_HELLO"; checks QEMU stdout | PEOR\_EFI\_HELLO in stdout |
+| — | `03_efi_simple_calc` | x64, x86, arm64, arm32 | EFI shellcode computes sum(0..99)=4950, prints "PEOR\_4950" via ConOut; checks QEMU stdout | PEOR\_4950 in stdout |
+| — | `04_efi_cpp_exceptions` | x64, x86, arm32 | EFI C++ shellcode: `throw`/`catch` a custom type; x64 uses freestanding Windows-SEH emulator (static heap); x86/arm32 use DWARF/SJLJ; asserts "PEOR\_CPP\_EH\_OK" in QEMU stdout | PEOR\_CPP\_EH\_OK in stdout |
+| — | `05_efi_memory_services` | x64, x86, arm64, arm32 | EFI shellcode calls AllocatePool/FreePool to exercise BootServices memory management; asserts "PEOR\_MEM\_OK" in QEMU stdout | PEOR\_MEM\_OK in stdout |
 | — | `test_efi_x86_shellcode_conversion` | x86 | PE32 EFI application compiled with i686-w64-mingw32-gcc; verifies peor produces non-empty shellcode using x86 EFI chain | non-empty bin |
 
 Test 03 requires an interactive desktop and is automatically skipped when the
@@ -490,6 +512,29 @@ and the native Windows loader for execution.
 ---
 
 ## Building
+
+`tests/pytest/test_shellcode.py` contains **no build logic**: every test reads a
+prebuilt fixture and fails loudly (never skips) if it's missing. `tests/build_tests.py`
+builds every fixture the current host's toolchains support — Linux test loaders and
+PEs, and EFI test-source PEs (all 4 archs); the MSVC test suite is a separate MSBuild
+step (`tests/tests.sln`). Use `--target {linux,efi,windows}` to build only one group
+(`windows` = the mingw/clang-cl fixtures under `tests/Win_*_MinGW/`), or no `--target`
+for everything the host supports. CI calls it the same way per job (see
+`.github/workflows/test.yml`).
+
+The EFI loader (which embeds each test's peor-generated shellcode) is the one fixture
+that can't be a plain prebuilt file for every arch:
+- **x64/x86**: `build_tests.py` compiles it once per arch with a fixed-size placeholder
+  blob (`tests/EFI/efi_loader/main.c`); at test time `_embed_shellcode_in_loader()` just
+  byte-patches a copy — no compiler runs there either.
+- **ARM64/ARM32**: still compiled per-test (`_compile_arm_efi_loader`, the one remaining
+  compiler call in the whole test file). The blob+patch scheme above reproducibly hangs
+  this QEMU/EDK2 ARM firmware at boot for reasons not yet root-caused — unrelated to the
+  scan/false-positive issue described above; see `PEOR_ARM_LEGACY_SHELLCODE` in
+  `tests/EFI/efi_loader/main.c` and `PLAN.md` — so ARM keeps the known-working per-test
+  compile (`-DPEOR_ARM_LEGACY_SHELLCODE`, `#include "shellcode_data.h"`) instead.
+
+Manual/IDE builds still work the same way:
 
 Requirements: Visual Studio 2022 with the C++ workload.
 
@@ -512,26 +557,16 @@ sudo apt-get install -y \
     g++-mingw-w64-x86-64 g++-mingw-w64-i686 \
     gcc gcc-multilib
 
-# x64 Linux test loader (-ffixed-* prevents GCC clobbering shellcode regs)
-gcc -O2 -ffixed-rbx -ffixed-r12 -ffixed-r13 -ffixed-r14 -ffixed-r15 \
-    -o tests/test_loader_linux/test_loader_linux.pe \
-    tests/test_loader_linux/main.c -ldl
-
-# x86 Linux test loader (-ffixed-ebx: resolver sets EBX=PE_base; volatile guards ESI/EDI)
-gcc -m32 -O2 -D_FILE_OFFSET_BITS=64 -ffixed-ebx \
-    -o tests/test_loader_linux/test_loader_linux_32.pe \
-    tests/test_loader_linux/main.c -ldl
-
+python tests/build_tests.py --target linux
 pytest tests/pytest -v -k "linux"
 ```
 
-Linux test PEs (compiled by `pytest` on first run or by `build-linux-mingw` CI) are
-cached in `tests/Linux_x64/` and `tests/Linux_x86/`.  Subsequent runs use the
-pre-built PEs directly — MinGW is not required if these directories are populated.
-The Linux NMakefile vcxproj files (`tests/Linux/0[1-5]_*.vcxproj`) can be opened in
-Visual Studio and built individually; they are listed in `tests.sln` for IDE
-visibility but excluded from the default MSBuild target (no `Build.0` entry) to keep
-the Windows build independent of MinGW availability.
+Linux test PEs land in `tests/Linux_x64/` and `tests/Linux_x86/`; `build_tests.py`
+skips anything already built there, so re-runs are fast. The Linux NMakefile vcxproj
+files (`tests/Linux/0[1-5]_*.vcxproj`) can be opened in Visual Studio and built
+individually; they are listed in `tests.sln` for IDE visibility but excluded from the
+default MSBuild target (no `Build.0` entry) to keep the Windows build independent of
+MinGW availability.
 
 For the EFI QEMU tests (Linux/Ubuntu):
 
@@ -540,10 +575,12 @@ sudo apt-get install -y \
     gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 \
     gcc-mingw-w64-i686   binutils-mingw-w64-i686 \
     g++-mingw-w64-x86-64 g++-mingw-w64-i686 \
-    qemu-system-x86 ovmf
+    clang lld \
+    qemu-system-x86 ovmf ovmf-ia32 \
+    qemu-system-arm qemu-efi-aarch64 qemu-efi-arm
 
-pytest tests/pytest -v -k \
-    "test_01_efi_hello or test_02_efi_print or test_03_efi_simple_calc or test_04_efi_cpp_exceptions or test_efi_x86_shellcode_conversion"
+python tests/build_tests.py --target efi
+pytest tests/pytest -v -k "efi"
 ```
 
 EFI tests build a UEFI application PE, convert it with peor, embed the shellcode

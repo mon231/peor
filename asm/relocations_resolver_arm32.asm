@@ -1,8 +1,8 @@
 ; ARM32 (Thumb-2) relocation resolver - applies base relocations to the embedded PE.
 ; Assembled by keystone (KS_ARCH_ARM / KS_MODE_THUMB).
 ;
-; On entry: r9 = image_handle, r10 = system_table (saved by ARM32_EFI_PREFIX before this runs).
-; On exit:  r4 = PE base; r9/r10 unchanged; falls through to next shellcode.
+; On entry: r4-r11/LR already pushed to stack by ARM32_EFI_PREFIX.
+; On exit:  r4 = PE base; falls through to next shellcode.
 ;
 ; Literal-pool layout (pool at offset 8, 4-byte aligned):
 ;   offset  0: mov r0, pc    r0 = _base + 4  (Thumb PC = instr_addr + 4)
@@ -14,7 +14,7 @@
 ; r4 = (_base+4) + (len(relocs_blob)-4 + extra) = _base + len(relocs_blob) + extra = PE base.
 ; setup.py patches offset 8; _build_shellcode_chain() adds extra (ctors+ep+align_pad) to it.
 ;
-; Registers (must NOT clobber r9/r10 — set by EFI prefix before this runs):
+; Registers:
 ;   r4  = PE base (output, preserved for the chain)
 ;   r5  = relocation delta (actual_base - ImageBase)
 ;   r6  = current IMAGE_BASE_RELOCATION block pointer
@@ -173,4 +173,4 @@ _mov32:
     b _next_entry
 
 _done:
-    ; r4 = PE base; r9 = image_handle; r10 = system_table (all preserved)
+    ; r4 = PE base (preserved)

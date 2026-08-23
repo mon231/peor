@@ -2606,11 +2606,9 @@ def test_cmdexe(arch, cmd_path, loader_subdir, tmp_path):
     if platform.system() != "Windows":
         pytest.skip("cmd.exe test is Windows-only")
     cmd_pe = Path(cmd_path)
-    if not cmd_pe.exists():
-        pytest.skip(f"cmd.exe not found at {cmd_path}")
+    assert cmd_pe.exists(), f"cmd.exe not found at {cmd_path}"
     loader = TESTS_DIR / loader_subdir / "test_loader.exe"
-    if not loader.exists():
-        pytest.skip(f"test_loader not found: {loader}")
+    assert loader.exists(), f"test_loader not found: {loader} — build tests/tests.sln first"
 
     sc = tmp_path / f"cmd_{arch}.bin"
     _shellcodify(cmd_pe, sc)

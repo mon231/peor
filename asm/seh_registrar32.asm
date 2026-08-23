@@ -36,8 +36,10 @@
 ; Clobbers: EAX, ECX, EDX, ESI, EDI
 
 ; Named constants
-%define CPP_EXCEPTION_CODE  0xe06d7363  ; MSVC C++ exception magic (throw)
-%define EXCEPTION_CHAIN_END 0xffffffff  ; FS:[0] end-of-chain sentinel
+%define CPP_EXCEPTION_CODE           0xe06d7363  ; MSVC C++ exception magic (throw)
+%define EXCEPTION_CHAIN_END          0xffffffff  ; FS:[0] end-of-chain sentinel
+%define EXCEPTION_CPP_THROWINFO_OFF  0x1c        ; ExceptionInformation[2]: ThrowInfo* in EXCEPTION_RECORD (x86)
+%define EXCEPTION_RECORD_DWORDS      0x14        ; sizeof(EXCEPTION_RECORD) / 4 = 80 / 4 on x86 (Keystone treats unadorned literals as hex)
 
     push ebx                          ; save PE_base
 
@@ -115,15 +117,49 @@ _veh_handler:
     push ebx
 
     mov esi, [ebp + 8]               ; EXCEPTION_POINTERS*
-    mov edi, [esi]                    ; EXCEPTION_RECORD*
+    mov edi, [esi]                   ; EXCEPTION_RECORD* (on throw-site stack -- may be stale post-ZwContinue)
 
-    ; Only intercept C++ exceptions
+    ; Only intercept C++ exceptions (quick check on original pointer -- always valid here)
     cmp dword [edi], CPP_EXCEPTION_CODE
     jne _veh_search
 
-    ; Walk SEH chain (FS:[0] = top of EXCEPTION_REGISTRATION_RECORD chain)
+    ; CALL/POP trick: jump over 80 bytes of inline static storage and obtain its address.
+    ; The storage holds a copy of the most recent fresh C++ exception record so that
+    ; __pCurrentException remains valid after ZwContinue unwinds the throw-site stack.
+    call _exc_copy_ref
+    ; ---- 80-byte static storage (EXCEPTION_RECORD_DWORDS * 4 = 80) ----
+    dd 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+_exc_copy_ref:
+    pop ebx                          ; EBX = &static_copy[0]
+
+    ; For rethrows (throw;), ExceptionInformation[2] (ThrowInfo*) is NULL.
+    ; The static copy already holds the original EXCEPTION_RECORD from the
+    ; preceding fresh throw (including the real ThrowInfo).  Skip the copy so
+    ; we don't overwrite the static copy with a NULL-ThrowInfo record, and jump
+    ; straight to the SEH walk passing &static_copy -- _CxxFrameHandler3 will
+    ; see the original ThrowInfo and can locate the correct outer catch clause.
+    cmp dword [edi + EXCEPTION_CPP_THROWINFO_OFF], 0
+    je _veh_use_static               ; rethrow: skip copy, use existing static_copy
+
+    ; Fresh C++ throw: copy EXCEPTION_RECORD into the static buffer.
+    ; Avoid rep movsd: Keystone confuses movsd (dword string) with SSE2 movsd.
+    push ecx
+    xor ecx, ecx
+_copy_exc_loop:
+    mov eax, [edi + ecx * 4]
+    mov [ebx + ecx * 4], eax
+    inc ecx
+    cmp ecx, EXCEPTION_RECORD_DWORDS
+    jnz _copy_exc_loop
+    pop ecx
+
+_veh_use_static:
+    mov edi, ebx                     ; EDI = &static_copy (valid even after ZwContinue)
+
+    ; Walk SEH chain (FS:[0] = top of EXCEPTION_REGISTRATION_RECORD chain).
+    ; EBX is repurposed for the chain traversal; EDI holds the static-copy address.
     db 0x64
-    mov ebx, [0]                      ; FS:[0] = chain head
+    mov ebx, [0]                     ; EBX = chain head
 
 _veh_walk:
     cmp ebx, EXCEPTION_CHAIN_END
@@ -135,25 +171,30 @@ _veh_walk:
 
     ; Call frame->Handler(exc_rec, frame, ctx, NULL) directly -- bypass
     ; RtlIsValidHandler.  Calling convention: __cdecl (4 args, caller cleans up).
-    push 0                             ; DispatcherContext = NULL
+    ;
+    ; Set FS:[0] = this frame so that RtlUnwind (called internally by
+    ; _CxxFrameHandler3 when it finds a matching catch) sees the target
+    ; frame as the chain head and skips any stale/cleanup frames that
+    ; _CxxFrameHandler3 pushed during the first ZwContinue and left in
+    ; the chain on the abandoned stack.
+    db 0x64
+    mov [0], ebx                     ; FS:[0] = EstablisherFrame
+    push 0                           ; DispatcherContext = NULL
     push dword [esi + 4]             ; CONTEXT* (EXCEPTION_POINTERS->ContextRecord)
-    push ebx                           ; EstablisherFrame = EXCEPTION_REGISTRATION_RECORD*
-    push edi                           ; EXCEPTION_RECORD*
+    push ebx                         ; EstablisherFrame = EXCEPTION_REGISTRATION_RECORD*
+    push edi                         ; EXCEPTION_RECORD* (&static_copy -- valid post-ZwContinue)
     call ecx
-    add esp, 0x10                     ; __cdecl: caller pops 4 args * 4 bytes
+    add esp, 0x10                    ; __cdecl: caller pops 4 args * 4 bytes
 
     ; ExceptionContinueSearch (1): this frame cannot handle, try next
     cmp eax, 1
     je _veh_next_frame
-    ; Any other return:
-    ;   ExceptionContinueExecution (0): handler "fixed" the fault; let Windows
-    ;   resume via normal re-dispatch (return CONTINUE_SEARCH so Windows re-raises
-    ;   and uses the fixed context, avoiding a re-entry loop here).
-    ;   If __CxxFrameHandler3 handled via longjmp it never reaches here.
+    ; Any other return (ExceptionContinueExecution or handler never returned):
+    ; fall through to CONTINUE_SEARCH so Windows re-dispatches with fixed context.
     jmp _veh_search
 
 _veh_next_frame:
-    mov ebx, [ebx]                    ; frame->Next
+    mov ebx, [ebx]                   ; frame->Next
     jmp _veh_walk
 
 _veh_search:
@@ -161,8 +202,8 @@ _veh_search:
     pop edi
     pop esi
     pop ebp
-    xor eax, eax                      ; EXCEPTION_CONTINUE_SEARCH (0)
-    ret 0x04                          ; __stdcall: callee pops the one PVOID arg
+    xor eax, eax                     ; EXCEPTION_CONTINUE_SEARCH (0)
+    ret 0x04                         ; __stdcall: callee pops the one PVOID arg
 ; =====================================================================
 ; END VEH HANDLER
 ; =====================================================================

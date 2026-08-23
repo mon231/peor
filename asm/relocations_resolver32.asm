@@ -13,6 +13,7 @@ _base:
     pop ebx                              ; EBX = runtime address of _base
     lea edi, [ebx + PE_OFFSET_PLACEHOLDER]  ; EDI = PE image base (offset patched at install)
     mov ebx, edi                         ; EBX = PE base
+    push ebp                             ; preserve caller's EBP (used as scratch below)
 
     cmp word [ebx], 0x5A4D               ; DOS "MZ" magic
     jz _valid_mz
@@ -66,4 +67,5 @@ _next_entry:
     jmp _block
 
 _done:
+    pop ebp                              ; restore caller's EBP
     ; EBX = PE base; fall through to next shellcode.

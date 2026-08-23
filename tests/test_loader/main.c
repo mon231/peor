@@ -1,5 +1,9 @@
 #include <windows.h>
 #include <stdio.h>
+#include <stdlib.h>
+
+#define NOP_SLED_MAX_OFFSET 1024
+#define NOP_BYTE            ((BYTE)0x90)
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
@@ -21,16 +25,25 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    void* mem = VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE,
-                             PAGE_EXECUTE_READWRITE);
+    srand(GetTickCount());
+    /* Keep nop_offset 16-byte aligned so the PE image (which starts at
+       mem + nop_offset + prefix_len, where prefix_len is 16-aligned) is
+       always 16-byte aligned for MOVDQA/MOVAPS instructions. */
+    DWORD nop_offset = (1 + (DWORD)(rand() % (NOP_SLED_MAX_OFFSET / 16))) * 16;
+
+    void* mem = VirtualAlloc(NULL, size + NOP_SLED_MAX_OFFSET,
+                             MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!mem) {
         fprintf(stderr, "VirtualAlloc failed (err %lu)\n", GetLastError());
         CloseHandle(hFile);
         return 1;
     }
 
+    memset(mem, NOP_BYTE, nop_offset);
+    BYTE* shellcode_start = (BYTE*)mem + nop_offset;
+
     DWORD nread = 0;
-    if (!ReadFile(hFile, mem, size, &nread, NULL) || nread != size) {
+    if (!ReadFile(hFile, shellcode_start, size, &nread, NULL) || nread != size) {
         fprintf(stderr, "read failed (err %lu)\n", GetLastError());
         VirtualFree(mem, 0, MEM_RELEASE);
         CloseHandle(hFile);

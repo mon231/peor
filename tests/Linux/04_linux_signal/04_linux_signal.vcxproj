@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- NMakefile project: compiles via MinGW (i686/x86_64-w64-mingw32-gcc) with POSIX subsystem.
+     Requires MinGW cross-compiler and dlltool in PATH. -->
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|Win32">
+      <Configuration>Debug</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|Win32">
+      <Configuration>Release</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <ProjectGuid>{BBBB0004-0004-0004-0004-000000000004}</ProjectGuid>
+    <Keyword>MakeFileProj</Keyword>
+    <RootNamespace>linux_signal</RootNamespace>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
+    <ConfigurationType>Makefile</ConfigurationType>
+    <OutDir>$(SolutionDir)Linux_x86\</OutDir>
+    <NMakeBuildCommandLine>i686-w64-mingw32-dlltool -D libc.so.6 -d libc_signal.def -l liblibc_signal32.a &amp;&amp; i686-w64-mingw32-gcc -nostdlib -nodefaultlibs -nostartfiles -fno-unwind-tables -fno-asynchronous-unwind-tables main.c liblibc_signal32.a -Wl,-e,_main -Wl,--subsystem,posix -o $(OutDir)04_linux_signal_x86.pe</NMakeBuildCommandLine>
+    <NMakeOutput>$(OutDir)04_linux_signal_x86.pe</NMakeOutput>
+    <NMakeCleanCommandLine>del /f $(OutDir)04_linux_signal_x86.pe liblibc_signal32.a libc_signal.def 2&gt;nul</NMakeCleanCommandLine>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration">
+    <ConfigurationType>Makefile</ConfigurationType>
+    <OutDir>$(SolutionDir)Linux_x86\</OutDir>
+    <NMakeBuildCommandLine>i686-w64-mingw32-dlltool -D libc.so.6 -d libc_signal.def -l liblibc_signal32.a &amp;&amp; i686-w64-mingw32-gcc -O2 -nostdlib -nodefaultlibs -nostartfiles -fno-unwind-tables -fno-asynchronous-unwind-tables main.c liblibc_signal32.a -Wl,-e,_main -Wl,--subsystem,posix -o $(OutDir)04_linux_signal_x86.pe</NMakeBuildCommandLine>
+    <NMakeOutput>$(OutDir)04_linux_signal_x86.pe</NMakeOutput>
+    <NMakeCleanCommandLine>del /f $(OutDir)04_linux_signal_x86.pe liblibc_signal32.a libc_signal.def 2&gt;nul</NMakeCleanCommandLine>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>Makefile</ConfigurationType>
+    <OutDir>$(SolutionDir)Linux_x64\</OutDir>
+    <NMakeBuildCommandLine>x86_64-w64-mingw32-dlltool -D libc.so.6 -d libc_signal.def -l liblibc_signal64.a &amp;&amp; x86_64-w64-mingw32-gcc -nostdlib -nodefaultlibs -nostartfiles -fno-unwind-tables -fno-asynchronous-unwind-tables main.c liblibc_signal64.a -Wl,-e,main -Wl,--subsystem,posix -o $(OutDir)04_linux_signal_x64.pe</NMakeBuildCommandLine>
+    <NMakeOutput>$(OutDir)04_linux_signal_x64.pe</NMakeOutput>
+    <NMakeCleanCommandLine>del /f $(OutDir)04_linux_signal_x64.pe liblibc_signal64.a libc_signal.def 2&gt;nul</NMakeCleanCommandLine>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Makefile</ConfigurationType>
+    <OutDir>$(SolutionDir)Linux_x64\</OutDir>
+    <NMakeBuildCommandLine>x86_64-w64-mingw32-dlltool -D libc.so.6 -d libc_signal.def -l liblibc_signal64.a &amp;&amp; x86_64-w64-mingw32-gcc -O2 -nostdlib -nodefaultlibs -nostartfiles -fno-unwind-tables -fno-asynchronous-unwind-tables main.c liblibc_signal64.a -Wl,-e,main -Wl,--subsystem,posix -o $(OutDir)04_linux_signal_x64.pe</NMakeBuildCommandLine>
+    <NMakeOutput>$(OutDir)04_linux_signal_x64.pe</NMakeOutput>
+    <NMakeCleanCommandLine>del /f $(OutDir)04_linux_signal_x64.pe liblibc_signal64.a libc_signal.def 2&gt;nul</NMakeCleanCommandLine>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+  </ImportGroup>
+  <ImportGroup Label="Shared">
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <ItemGroup>
+    <ClCompile Include="main.c" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+  </ImportGroup>
+</Project>

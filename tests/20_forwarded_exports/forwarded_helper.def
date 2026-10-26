@@ -1,0 +1,3 @@
+LIBRARY forwarded_helper
+EXPORTS
+    GetCurrentProcessId_via_forward = KERNEL32.GetCurrentProcessId

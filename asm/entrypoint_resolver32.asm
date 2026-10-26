@@ -8,10 +8,11 @@
 ; Named constants
 %define DLL_PROCESS_ATTACH 0x01
 %define IMAGE_FILE_DLL     0x2000
+%define EP_RVA_MAGIC       0xcececece    ; patched by peor: actual AddressOfEntryPoint RVA (or --entry override)
 
     mov esi, [ebx + 0x3C]
     add esi, ebx                         ; ESI = NT headers
-    mov eax, [esi + 0x28]                ; AddressOfEntryPoint RVA
+    mov eax, EP_RVA_MAGIC                ; AddressOfEntryPoint RVA (patched by peor at conversion time)
     add eax, ebx                         ; EAX = OEP VA
 
     test word [esi + 0x16], IMAGE_FILE_DLL

@@ -9,10 +9,11 @@
 ; Named constants
 %define DLL_PROCESS_ATTACH 0x01
 %define IMAGE_FILE_DLL     0x2000
+%define EP_RVA_MAGIC       0xcececece    ; patched by peor: actual AddressOfEntryPoint RVA (or --entry override)
 
     mov esi, [rbx + 0x3C]
     add rsi, rbx                         ; RSI = NT headers
-    mov eax, [rsi + 0x28]                ; AddressOfEntryPoint RVA
+    mov eax, EP_RVA_MAGIC                ; AddressOfEntryPoint RVA (patched by peor at conversion time)
     add rax, rbx                         ; RAX = OEP VA
     push rax                             ; save OEP; RSP = 0 (mod 16)
 

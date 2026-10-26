@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- NMakefile project: cross-compiles 03_linux_with_crt/main.c via MinGW with libc.so.6 imports
+     (strlen, strncmp, memcpy, free, malloc).
+     Requires i686-w64-mingw32-gcc / x86_64-w64-mingw32-gcc in PATH. -->
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|Win32">
+      <Configuration>Debug</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|Win32">
+      <Configuration>Release</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <ProjectGuid>{BBBB0003-0003-0003-0003-000000000003}</ProjectGuid>
+    <Keyword>MakeFileProj</Keyword>
+    <RootNamespace>linux_with_crt</RootNamespace>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
+    <ConfigurationType>Makefile</ConfigurationType>
+    <OutDir>$(SolutionDir)Linux_x86\</OutDir>
+    <NMakeBuildCommandLine>
+      (echo EXPORTS &gt; libc_crt_x86.def &amp;&amp; echo strlen &gt;&gt; libc_crt_x86.def &amp;&amp; echo strncmp &gt;&gt; libc_crt_x86.def &amp;&amp; echo memcpy &gt;&gt; libc_crt_x86.def &amp;&amp; echo free &gt;&gt; libc_crt_x86.def &amp;&amp; echo malloc &gt;&gt; libc_crt_x86.def) &amp;&amp;
+      i686-w64-mingw32-dlltool -D libc.so.6 -d libc_crt_x86.def -l liblibc_crt32.a &amp;&amp;
+      (echo void __main(void) {}) &gt; __main_stub.c &amp;&amp;
+      i686-w64-mingw32-gcc -nostdlib -nodefaultlibs -nostartfiles -fno-unwind-tables -fno-asynchronous-unwind-tables __main_stub.c main.c liblibc_crt32.a -Wl,-e,_main -Wl,--subsystem,posix -o $(OutDir)03_linux_with_crt_x86.pe &amp;&amp;
+      del libc_crt_x86.def liblibc_crt32.a __main_stub.c 2&gt;nul
+    </NMakeBuildCommandLine>
+    <NMakeOutput>$(OutDir)03_linux_with_crt_x86.pe</NMakeOutput>
+    <NMakeCleanCommandLine>del /f $(OutDir)03_linux_with_crt_x86.pe 2&gt;nul</NMakeCleanCommandLine>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration">
+    <ConfigurationType>Makefile</ConfigurationType>
+    <OutDir>$(SolutionDir)Linux_x86\</OutDir>
+    <NMakeBuildCommandLine>
+      (echo EXPORTS &gt; libc_crt_x86.def &amp;&amp; echo strlen &gt;&gt; libc_crt_x86.def &amp;&amp; echo strncmp &gt;&gt; libc_crt_x86.def &amp;&amp; echo memcpy &gt;&gt; libc_crt_x86.def &amp;&amp; echo free &gt;&gt; libc_crt_x86.def &amp;&amp; echo malloc &gt;&gt; libc_crt_x86.def) &amp;&amp;
+      i686-w64-mingw32-dlltool -D libc.so.6 -d libc_crt_x86.def -l liblibc_crt32.a &amp;&amp;
+      (echo void __main(void) {}) &gt; __main_stub.c &amp;&amp;
+      i686-w64-mingw32-gcc -O2 -nostdlib -nodefaultlibs -nostartfiles -fno-unwind-tables -fno-asynchronous-unwind-tables __main_stub.c main.c liblibc_crt32.a -Wl,-e,_main -Wl,--subsystem,posix -o $(OutDir)03_linux_with_crt_x86.pe &amp;&amp;
+      del libc_crt_x86.def liblibc_crt32.a __main_stub.c 2&gt;nul
+    </NMakeBuildCommandLine>
+    <NMakeOutput>$(OutDir)03_linux_with_crt_x86.pe</NMakeOutput>
+    <NMakeCleanCommandLine>del /f $(OutDir)03_linux_with_crt_x86.pe 2&gt;nul</NMakeCleanCommandLine>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>Makefile</ConfigurationType>
+    <OutDir>$(SolutionDir)Linux_x64\</OutDir>
+    <NMakeBuildCommandLine>
+      (echo EXPORTS &gt; libc_crt_x64.def &amp;&amp; echo strlen &gt;&gt; libc_crt_x64.def &amp;&amp; echo strncmp &gt;&gt; libc_crt_x64.def &amp;&amp; echo memcpy &gt;&gt; libc_crt_x64.def &amp;&amp; echo free &gt;&gt; libc_crt_x64.def &amp;&amp; echo malloc &gt;&gt; libc_crt_x64.def) &amp;&amp;
+      x86_64-w64-mingw32-dlltool -D libc.so.6 -d libc_crt_x64.def -l liblibc_crt64.a &amp;&amp;
+      (echo void __main(void) {}) &gt; __main_stub.c &amp;&amp;
+      x86_64-w64-mingw32-gcc -nostdlib -nodefaultlibs -nostartfiles -fno-unwind-tables -fno-asynchronous-unwind-tables __main_stub.c main.c liblibc_crt64.a -Wl,-e,main -Wl,--subsystem,posix -o $(OutDir)03_linux_with_crt_x64.pe &amp;&amp;
+      del libc_crt_x64.def liblibc_crt64.a __main_stub.c 2&gt;nul
+    </NMakeBuildCommandLine>
+    <NMakeOutput>$(OutDir)03_linux_with_crt_x64.pe</NMakeOutput>
+    <NMakeCleanCommandLine>del /f $(OutDir)03_linux_with_crt_x64.pe 2&gt;nul</NMakeCleanCommandLine>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Makefile</ConfigurationType>
+    <OutDir>$(SolutionDir)Linux_x64\</OutDir>
+    <NMakeBuildCommandLine>
+      (echo EXPORTS &gt; libc_crt_x64.def &amp;&amp; echo strlen &gt;&gt; libc_crt_x64.def &amp;&amp; echo strncmp &gt;&gt; libc_crt_x64.def &amp;&amp; echo memcpy &gt;&gt; libc_crt_x64.def &amp;&amp; echo free &gt;&gt; libc_crt_x64.def &amp;&amp; echo malloc &gt;&gt; libc_crt_x64.def) &amp;&amp;
+      x86_64-w64-mingw32-dlltool -D libc.so.6 -d libc_crt_x64.def -l liblibc_crt64.a &amp;&amp;
+      (echo void __main(void) {}) &gt; __main_stub.c &amp;&amp;
+      x86_64-w64-mingw32-gcc -O2 -nostdlib -nodefaultlibs -nostartfiles -fno-unwind-tables -fno-asynchronous-unwind-tables __main_stub.c main.c liblibc_crt64.a -Wl,-e,main -Wl,--subsystem,posix -o $(OutDir)03_linux_with_crt_x64.pe &amp;&amp;
+      del libc_crt_x64.def liblibc_crt64.a __main_stub.c 2&gt;nul
+    </NMakeBuildCommandLine>
+    <NMakeOutput>$(OutDir)03_linux_with_crt_x64.pe</NMakeOutput>
+    <NMakeCleanCommandLine>del /f $(OutDir)03_linux_with_crt_x64.pe 2&gt;nul</NMakeCleanCommandLine>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+  </ImportGroup>
+  <ImportGroup Label="Shared">
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <ItemGroup>
+    <ClCompile Include="main.c" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+  </ImportGroup>
+</Project>

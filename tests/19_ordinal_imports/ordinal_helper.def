@@ -1,0 +1,4 @@
+LIBRARY ordinal_helper
+EXPORTS
+    ByNameFunc @1
+    OrdinalOnlyFunc @7 NONAME

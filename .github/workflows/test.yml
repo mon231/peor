@@ -399,7 +399,18 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
+      # keystone-engine (peor's build+runtime dependency, assembles the resolver
+      # ASM stubs) ships no prebuilt win_arm64 wheel on PyPI, so pip must build it
+      # from source here. That needs an MSVC dev environment on PATH (nmake/cl) and
+      # a workaround for keystone's bundled CMakeLists.txt predating CMake's removal
+      # of pre-3.5 compatibility.
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: arm64
+
       - name: Install Python dependencies
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
         run: |
           python -m pip install --upgrade pip
           pip install -e .

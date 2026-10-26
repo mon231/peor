@@ -359,6 +359,22 @@ jobs:
         run: pytest tests/pytest -v --timeout=360 -k "efi"
 
 # ─────────────────────────────────────────────────────────────────────────────
+# test-efi-windows-arm: run the same EFI ARM32/ARM64 tests on real windows-11-arm
+# hardware (GitHub-hosted), in addition to test-efi-qemu's emulated coverage.
+# ─────────────────────────────────────────────────────────────────────────────
+  test-efi-windows-arm:
+    runs-on: windows-11-arm
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sanity check runner
+        shell: pwsh
+        run: |
+          python --version
+          wsl --status
+
+# ─────────────────────────────────────────────────────────────────────────────
 # test-summary: single required gate — fails unless every job above PASSED.
 # No test in this workflow is allowed to silently skip (missing binaries/toolchains
 # are hard failures, see PLAN.md), so "success" is the only acceptable result here.

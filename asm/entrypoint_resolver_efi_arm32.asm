@@ -3,8 +3,10 @@
 ;
 ; The shellcode is FULLY SELF-CONTAINED: efi_loader_main calls it as `EFI_STATUS (*)(void)`,
 ; so r0/r1 hold no meaningful values at entry (never the firmware's ImageHandle/SystemTable).
-; ImageHandle is passed as NULL to efi_main (no caller guarantees a valid handle); SystemTable
-; is located by scanning memory for its signature, then validated via BootServices/ConOut.
+; SystemTable is located by scanning memory for its signature, then validated via
+; BootServices/ConOut.  Once found, a real EFI_HANDLE is resolved via
+; BootServices->LocateHandleBuffer(AllHandles) and passed to efi_main; falls back to
+; NULL for ImageHandle if SystemTable or the handle lookup can't be resolved.
 ;
 ; On entry: r4 = PE base (from relocations_resolver_arm32).
 ;   (r4-r11/LR were pushed to stack by ARM32_EFI_PREFIX; SP is balanced.)
@@ -60,6 +62,10 @@
 %define EFI_SIMPLE_TEXT_OUTPUT_OUTPUT_STRING_OFF 0x04
 %define EFI_FIRMWARE_ADDR_MIN_H16                0x0010
 %define EFI_FIRMWARE_ADDR_MIN_L16                0x0000
+
+; EFI_BOOT_SERVICES.LocateHandleBuffer is the 37th function pointer after the
+; EFI_TABLE_HEADER (24 bytes): 0x18 + 36*4 = 0xA8 (32-bit function table).
+%define EFI_BS_LOCATE_HANDLE_BUFFER_OFFSET_32    0xA8
 
     ldr  r7, _ep_rva_pool       ; r7 = AddressOfEntryPoint RVA (T1, 2 bytes)
     b.n  _after_ep_rva_pool     ; skip pool (2 bytes)
@@ -138,8 +144,52 @@ _scan_next32:
     b    _scan_loop32
 
 _scan_done32:
-    ; Call efi_main(r0=NULL, r1=SystemTable) via blx.
-    movs r0, #0
-    mov  r1, r8
+    ; Resolve an always-available EFI_HANDLE via BootServices->LocateHandleBuffer
+    ; (AllHandles search) so efi_main gets a real, registered handle instead of
+    ; NULL - needed by boot-service calls that validate their handle argument.
+    ; r8 (SystemTable) and r9 (OEP) are stashed on the stack rather than trusted
+    ; to survive the call in-register: r7/r11 are used as a frame pointer by some
+    ; ARM compilers, so no register is assumed safe across a real firmware call.
+    push {r8, r9}
+    movs r4, #0                  ; r4 = resolved EFI_HANDLE, default NULL
+    cmp  r8, #0
+    beq  _call_efi_main32        ; no SystemTable -> no handle lookup possible
+
+    ldr  r5, [r8, #EFI_SYSTEM_TABLE_BOOT_SERVICES_OFFSET]
+    cmp  r5, #0
+    beq  _call_efi_main32
+
+    ldr  r6, [r5, #EFI_BS_LOCATE_HANDLE_BUFFER_OFFSET_32]
+    cmp  r6, #0
+    beq  _call_efi_main32
+
+    sub  sp, sp, #16             ; [sp+0]=5th arg slot, [sp+4]=pad, [sp+8]=NoHandles, [sp+12]=Buffer
+    movs r12, #0
+    str  r12, [sp, #8]           ; NoHandles local = 0
+    str  r12, [sp, #12]          ; Buffer local = 0
+    add  r12, sp, #12            ; r12 = &Buffer local
+    str  r12, [sp, #0]           ; arg5 (stack): &Buffer
+    movs r0, #0                  ; arg1: SearchType = AllHandles (0)
+    movs r1, #0                  ; arg2: Protocol = NULL
+    movs r2, #0                  ; arg3: SearchKey = NULL
+    add  r3, sp, #8              ; arg4: &NoHandles local
+    blx  r6
+    ldr  r1, [sp, #8]            ; NoHandles result
+    ldr  r2, [sp, #12]           ; Buffer result (EFI_HANDLE*)
+    cmp  r0, #0
+    bne  _lhb_done32             ; EFI_STATUS != EFI_SUCCESS -> keep NULL
+    cmp  r1, #0
+    beq  _lhb_done32
+    cmp  r2, #0
+    beq  _lhb_done32
+    ldr  r4, [r2]                ; r4 = Buffer[0] = first EFI_HANDLE
+_lhb_done32:
+    add  sp, sp, #16
+
+_call_efi_main32:
+    ; Call efi_main(ResolvedHandle, SystemTable) via blx.
+    pop  {r8, r9}                 ; restore SystemTable (r8), OEP (r9)
+    mov  r0, r4                   ; arg1: ImageHandle = resolved handle (NULL if unresolved)
+    mov  r1, r8                   ; arg2: SystemTable
     blx  r9
     pop  {r4, r5, r6, r7, r8, r9, r10, r11, pc}

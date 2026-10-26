@@ -10,8 +10,11 @@
 ;   RSP = 8 (mod 16) - caller's return address on the stack
 ;
 ; The resolver scans page-aligned addresses for the EFI_TABLE_HEADER signature,
-; then calls efi_main(NULL, SystemTable) with the Windows x64 ABI (UEFI MSABI).
-; NULL is passed for ImageHandle because no caller guarantees it is valid.
+; then resolves a real EFI_HANDLE via BootServices->LocateHandleBuffer(AllHandles)
+; (firmware always has at least one handle registered) and calls
+; efi_main(ResolvedHandle, SystemTable) with the Windows x64 ABI (UEFI MSABI).
+; Falls back to NULL for ImageHandle if SystemTable or the handle lookup can't be
+; resolved - efi_main must tolerate that, same as before this feature existed.
 
 %define EP_RVA_MAGIC                        0xcececece
 
@@ -61,9 +64,25 @@
 ; Windows x64 ABI shadow space (32 bytes) + 8-byte alignment slot = 40 bytes.
 %define MSABI_SHADOW_ALLOC                      0x28
 
+; EFI_BOOT_SERVICES.LocateHandleBuffer is the 37th function pointer after the
+; EFI_TABLE_HEADER (24 bytes): 0x18 + 36*8 = 0x138 (64-bit function table).
+%define EFI_BS_LOCATE_HANDLE_BUFFER_OFFSET      0x138
+; EFI_LOCATE_SEARCH_TYPE.AllHandles = 0 (enumerate every registered handle).
+%define EFI_LOCATE_SEARCH_ALL_HANDLES           0
+; LocateHandleBuffer MSABI frame: shadow space (0x20) + arg5 stack slot (8) +
+; two 8-byte locals (NoHandles, Buffer) = 0x38; 0x38 (mod 16) == 8, matching the
+; (mod-16)==8 RSP this block starts at, so after `sub rsp, LHB_FRAME_SIZE` RSP
+; lands 16-aligned for the call, exactly like MSABI_SHADOW_ALLOC does below.
+%define LHB_FRAME_SIZE                          0x38
+%define LHB_ARG5_SLOT_OFF                       0x20   ; &BufferPtr local (arg5, on stack)
+%define LHB_NOHANDLES_LOCAL_OFF                 0x28   ; UINTN NoHandles local
+%define LHB_BUFFERPTR_LOCAL_OFF                 0x30   ; EFI_HANDLE *Buffer local
+
     ; Compute entry point VA (EBX = PE base from relocs)
     mov eax, EP_RVA_MAGIC
     add rax, rbx                ; RAX = efi_main VA
+    mov rsi, rax                ; stash VA (RSI is MSABI callee-saved - survives the
+                                 ; LocateHandleBuffer call below)
 
     ; Fast path: the EFI loader (efi_loader_main) compiled with GCC MS-ABI saves the
     ; system table pointer it received from firmware at [rbp+0x18].  The RELOCS_64
@@ -134,11 +153,54 @@ _scan_next:
     jmp _scan_loop
 
 _scan_done:
-    ; Call efi_main(NULL, SystemTable) with MSABI (Windows x64 / UEFI convention).
-    ; NULL for ImageHandle: self-contained shellcode has no guaranteed handle source.
-    sub rsp, MSABI_SHADOW_ALLOC ; shadow space + alignment; RSP = 0 (mod 16)
-    xor ecx, ecx                ; arg1: ImageHandle = NULL
-    mov rdx, r13                ; arg2: SystemTable (0 if not found)
+    ; Resolve an always-available EFI_HANDLE via BootServices->LocateHandleBuffer
+    ; (AllHandles search) so efi_main gets a real, registered handle instead of
+    ; NULL - needed by boot-service calls that validate their handle argument.
+    ; Falls back to NULL (R15 stays 0) on any failure along the way.
+    xor r15d, r15d               ; R15 = resolved EFI_HANDLE, default NULL
+    test r13, r13
+    jz _call_efi_main            ; no SystemTable -> no handle lookup possible
+
+    ; NOTE: BootServices is NOT bounds-checked against SCAN_START/SCAN_END - that
+    ; range only bounds the SystemTable *memory scan* heuristic; BootServices
+    ; itself can legitimately live anywhere (same as 05_efi_memory_services's C
+    ; code, which dereferences it unconditionally once SystemTable is trusted).
+    mov r12, [r13 + EFI_SYSTEM_TABLE_BOOT_SERVICES_OFFSET]
+    test r12, r12
+    jz _call_efi_main
+
+    mov r11, [r12 + EFI_BS_LOCATE_HANDLE_BUFFER_OFFSET]
+    test r11, r11
+    jz _call_efi_main
+
+    sub rsp, LHB_FRAME_SIZE       ; shadow+arg5+locals; RSP = 0 (mod 16) for the call
+    lea rax, [rsp + LHB_BUFFERPTR_LOCAL_OFF]
+    mov [rsp + LHB_ARG5_SLOT_OFF], rax            ; arg5 (stack): &Buffer local
+    mov qword [rsp + LHB_NOHANDLES_LOCAL_OFF], 0
+    mov qword [rsp + LHB_BUFFERPTR_LOCAL_OFF], 0
+    mov ecx, EFI_LOCATE_SEARCH_ALL_HANDLES        ; arg1: SearchType = AllHandles
+    xor edx, edx                                  ; arg2: Protocol = NULL
+    xor r8d, r8d                                  ; arg3: SearchKey = NULL
+    lea r9, [rsp + LHB_NOHANDLES_LOCAL_OFF]       ; arg4: &NoHandles local
+    call r11
+    mov r10, [rsp + LHB_NOHANDLES_LOCAL_OFF]      ; NoHandles
+    mov r9,  [rsp + LHB_BUFFERPTR_LOCAL_OFF]      ; Buffer (EFI_HANDLE*)
+    test rax, rax
+    jnz _lhb_done                                 ; EFI_STATUS != EFI_SUCCESS -> keep NULL
+    test r10, r10
+    jz _lhb_done
+    test r9, r9
+    jz _lhb_done
+    mov r15, [r9]                                 ; R15 = Buffer[0] = first EFI_HANDLE
+_lhb_done:
+    add rsp, LHB_FRAME_SIZE
+
+_call_efi_main:
+    ; Call efi_main(ResolvedHandle, SystemTable) with MSABI (Windows x64 / UEFI convention).
+    mov rax, rsi                 ; RAX = efi_main VA (stashed earlier)
+    sub rsp, MSABI_SHADOW_ALLOC  ; shadow space + alignment; RSP = 0 (mod 16)
+    mov rcx, r15                 ; arg1: ImageHandle = resolved handle (NULL if unresolved)
+    mov rdx, r13                 ; arg2: SystemTable (0 if not found)
     call rax
     add rsp, MSABI_SHADOW_ALLOC
     ret

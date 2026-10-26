@@ -202,7 +202,13 @@ Four dispatcher variants exist, one per architecture — **all fully
 self-contained**: the shellcode is called as `EFI_STATUS(void)`, with no
 arguments from the loader (not even `ImageHandle`/`SystemTable`, which the
 firmware itself passed to the *loader*, not the shellcode).  Every dispatcher
-locates `EFI_SYSTEM_TABLE` itself and calls `efi_main(NULL, SystemTable)`:
+locates `EFI_SYSTEM_TABLE` itself, resolves a real `EFI_HANDLE` via
+`BootServices->LocateHandleBuffer(AllHandles)` (the handle database always has
+at least one registered handle), and calls `efi_main(ResolvedHandle,
+SystemTable)` — falling back to `NULL` for `ImageHandle` only if `SystemTable`
+or the handle lookup can't be resolved. A real handle matters because some
+boot services (e.g. `ProtocolsPerHandle`, `OpenProtocol`'s `AgentHandle`)
+reject a `NULL`/bogus handle outright; see `tests/EFI/06_efi_handle`.
 
 **x86 / x64** (`entrypoint_resolver_efi32/64.asm`):
 1. Attempts a fast path: reads the `EFI_SYSTEM_TABLE` pointer from the loader's
@@ -212,7 +218,12 @@ locates `EFI_SYSTEM_TABLE` itself and calls `efi_main(NULL, SystemTable)`:
    16-byte aligned address for `EFI_SYSTEM_TABLE_SIGNATURE` (`0x5453595320494249`),
    `Revision >= 2.0`, `HeaderSize >= 0x78`, and valid `BootServices`/`ConOut` pointers.
    Scan range: `0x10000–0x20000000` for x64, `0x10000–0x10000000` for x86.
-3. Calls `efi_main(NULL, SystemTable)` with the appropriate ABI.
+3. Resolves `ImageHandle` via `LocateHandleBuffer` and calls `efi_main` with the
+   appropriate ABI. Any value that must survive the `LocateHandleBuffer` call is
+   stashed on the stack rather than trusted to survive in a register — x86's `EBP`
+   (and, defensively, ARM's frame-pointer-like registers) can be walked by a
+   debug build's own frame-chain code, which crashed when tried as a scratch
+   register across a real firmware call.
 
 **ARM64** (`entrypoint_resolver_efi_arm64.asm`):
 1. Fast path: reads `EFI_SYSTEM_TABLE` from `efi_loader_main`'s own stack frame at a
@@ -496,13 +507,14 @@ pytest tests/pytest -v
 | — | `03_efi_simple_calc` | x64, x86, arm64, arm32 | EFI shellcode computes sum(0..99)=4950, prints "PEOR\_4950" via ConOut; checks QEMU stdout | PEOR\_4950 in stdout |
 | — | `04_efi_cpp_exceptions` | x64, x86, arm32 | EFI C++ shellcode: `throw`/`catch` a custom type; x64 uses freestanding Windows-SEH emulator (static heap); x86/arm32 use DWARF/SJLJ; asserts "PEOR\_CPP\_EH\_OK" in QEMU stdout | PEOR\_CPP\_EH\_OK in stdout |
 | — | `05_efi_memory_services` | x64, x86, arm64, arm32 | EFI shellcode calls AllocatePool/FreePool to exercise BootServices memory management; asserts "PEOR\_MEM\_OK" in QEMU stdout | PEOR\_MEM\_OK in stdout |
+| — | `06_efi_handle` | x64, x86, arm64, arm32 | EFI shellcode checks BootServices->ProtocolsPerHandle rejects a NULL handle, then calls it again with the EFI\_HANDLE peor's entrypoint resolver resolved via LocateHandleBuffer(AllHandles) and passed as ImageHandle; proves peor supplies a real, registered handle instead of NULL | QEMU exit 0 |
 | — | `test_efi_x86_shellcode_conversion` | x86 | PE32 EFI application compiled with i686-w64-mingw32-gcc; verifies peor produces non-empty shellcode using x86 EFI chain | non-empty bin |
 
 Test 03 requires an interactive desktop and is automatically skipped when the
 `CI` environment variable is set.
 
 Linux tests (`01_linux_write` through `05_linux_global_ctor`, both x64 and x86 variants)
-and EFI QEMU tests (`01_efi_hello` through `05_efi_memory_services`) require a Linux
+and EFI QEMU tests (`01_efi_hello` through `06_efi_handle`) require a Linux
 runner.  Building the Linux PE test binaries requires `gcc-mingw-w64-x86-64`,
 `gcc-mingw-w64-i686`, `binutils-mingw-w64-*`, `g++-mingw-w64-x86-64`,
 `g++-mingw-w64-i686`, `gcc`, and `gcc-multilib`.  EFI QEMU tests additionally

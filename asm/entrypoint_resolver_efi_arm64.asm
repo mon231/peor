@@ -3,7 +3,9 @@
 //
 // The shellcode is FULLY SELF-CONTAINED: efi_loader_main calls it as `EFI_STATUS (*)(void)`,
 // so x0/x1 hold no meaningful values at entry (never the firmware's ImageHandle/SystemTable).
-// ImageHandle is passed as NULL to efi_main (no caller guarantees a valid handle).
+// Once SystemTable is found, a real EFI_HANDLE is resolved via
+// BootServices->LocateHandleBuffer(AllHandles) and passed to efi_main; falls back to
+// NULL if SystemTable or the handle lookup can't be resolved.
 //
 // SystemTable discovery, in order:
 //   1. Fast path: read it from efi_loader_main's own stack frame at a fixed SP offset
@@ -63,6 +65,10 @@
 %define EFI_SIMPLE_TEXT_OUTPUT_OUTPUT_STRING_OFF 0x08
 %define EFI_FIRMWARE_ADDR_MIN_H16                0x0010
 
+; EFI_BOOT_SERVICES.LocateHandleBuffer is the 37th function pointer after the
+; EFI_TABLE_HEADER (24 bytes): 0x18 + 36*8 = 0x138 (64-bit function table).
+%define EFI_BS_LOCATE_HANDLE_BUFFER_OFFSET       0x138
+
     ldr w0, _ep_rva_pool
     add x25, x19, x0
     b _after_ep_rva_pool
@@ -92,9 +98,43 @@ _scan_loop:
     b    _scan_loop
 
 _scan_done:
-    ; Call efi_main(NULL, SystemTable) - AArch64 UEFI calling convention (x0, x1).
-    mov  x0, xzr                 ; arg1: ImageHandle = NULL
-    mov  x1, x13                 ; arg2: SystemTable (0 if not found)
+    ; Resolve an always-available EFI_HANDLE via BootServices->LocateHandleBuffer
+    ; (AllHandles search) so efi_main gets a real, registered handle instead of
+    ; NULL - needed by boot-service calls that validate their handle argument.
+    ; x13 is caller-saved (volatile) under AAPCS64 and would not survive the
+    ; LocateHandleBuffer call below, so copy it to x21 (callee-saved) first.
+    mov  x21, x13                 ; x21 = SystemTable (callee-saved copy)
+    mov  x20, xzr                 ; x20 = resolved EFI_HANDLE, default NULL (callee-saved)
+    cbz  x21, _call_efi_main      ; no SystemTable -> no handle lookup possible
+
+    ldr  x9, [x21, EFI_SYSTEM_TABLE_BOOT_SERVICES_OFFSET]
+    cbz  x9, _call_efi_main
+
+    ldr  x10, [x9, EFI_BS_LOCATE_HANDLE_BUFFER_OFFSET]
+    cbz  x10, _call_efi_main
+
+    sub  sp, sp, #16               ; locals: [sp]=NoHandles, [sp+8]=Buffer
+    str  xzr, [sp]
+    str  xzr, [sp, 8]
+    mov  x0, xzr                   ; arg1: SearchType = AllHandles (0)
+    mov  x1, xzr                   ; arg2: Protocol = NULL
+    mov  x2, xzr                   ; arg3: SearchKey = NULL
+    add  x3, sp, 0                 ; arg4: &NoHandles local
+    add  x4, sp, 8                 ; arg5: &Buffer local
+    blr  x10
+    ldr  x11, [sp]                 ; NoHandles
+    ldr  x12, [sp, 8]               ; Buffer (EFI_HANDLE*)
+    cbnz x0, _lhb_done              ; EFI_STATUS != EFI_SUCCESS -> keep NULL
+    cbz  x11, _lhb_done
+    cbz  x12, _lhb_done
+    ldr  x20, [x12]                 ; x20 = Buffer[0] = first EFI_HANDLE
+_lhb_done:
+    add  sp, sp, #16
+
+_call_efi_main:
+    ; Call efi_main(ResolvedHandle, SystemTable) - AArch64 UEFI calling convention (x0, x1).
+    mov  x0, x20                  ; arg1: ImageHandle = resolved handle (NULL if unresolved)
+    mov  x1, x21                  ; arg2: SystemTable (0 if not found)
     blr  x25
     ldr  x30, [sp], #16
     ret

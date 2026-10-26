@@ -57,6 +57,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "03_efi_simple_calc", "EFI\0
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "05_efi_memory_services", "EFI\05_efi_memory_services\05_efi_memory_services.vcxproj", "{AAAA0005-0005-0005-0005-000000000005}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "06_efi_handle", "EFI\06_efi_handle\06_efi_handle.vcxproj", "{AAAA0006-0006-0006-0006-000000000006}"
+EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "01_linux_write", "Linux\01_linux_write\01_linux_write.vcxproj", "{BBBB0001-0001-0001-0001-000000000001}"
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "02_linux_cpp_exceptions", "Linux\02_linux_cpp_exceptions\02_linux_cpp_exceptions.vcxproj", "{BBBB0002-0002-0002-0002-000000000002}"
@@ -275,6 +277,10 @@ Global
 		{AAAA0005-0005-0005-0005-000000000005}.Debug|x64.ActiveCfg = Debug|x64
 		{AAAA0005-0005-0005-0005-000000000005}.Release|Win32.ActiveCfg = Release|Win32
 		{AAAA0005-0005-0005-0005-000000000005}.Release|x64.ActiveCfg = Release|x64
+		{AAAA0006-0006-0006-0006-000000000006}.Debug|Win32.ActiveCfg = Debug|Win32
+		{AAAA0006-0006-0006-0006-000000000006}.Debug|x64.ActiveCfg = Debug|x64
+		{AAAA0006-0006-0006-0006-000000000006}.Release|Win32.ActiveCfg = Release|Win32
+		{AAAA0006-0006-0006-0006-000000000006}.Release|x64.ActiveCfg = Release|x64
 		{BBBB0001-0001-0001-0001-000000000001}.Debug|Win32.ActiveCfg = Debug|Win32
 		{BBBB0001-0001-0001-0001-000000000001}.Debug|x64.ActiveCfg = Debug|x64
 		{BBBB0001-0001-0001-0001-000000000001}.Release|Win32.ActiveCfg = Release|Win32

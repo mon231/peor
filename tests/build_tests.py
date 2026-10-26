@@ -43,7 +43,8 @@ ts = importlib.util.module_from_spec(_spec)
 sys.modules["peor_test_shellcode"] = ts
 _spec.loader.exec_module(ts)
 
-_SIMPLE_EFI_TESTS = ["01_efi_hello", "02_efi_print", "03_efi_simple_calc", "05_efi_memory_services"]
+_SIMPLE_EFI_TESTS = ["01_efi_hello", "02_efi_print", "03_efi_simple_calc", "05_efi_memory_services",
+                     "06_efi_handle"]
 
 _FAILURES = []
 

@@ -19,13 +19,17 @@ from peor._pe_features import (
     _detect_pe_features,
     _PLATFORM_LINUX,
     _PLATFORM_EFI,
+    IMAGE_DIRECTORY_ENTRY_IMPORT,
     IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR,
     IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT,
+    _PACKER_SECTION_NAMES,
     _find_export_rva,
 )
 from peor._chain_builder import (
     dump_memory_layout,
     _build_shellcode_chain,
+    _compute_required_stubs,
+    _select_chain,
     _SHELLCODES,
     _validate_pe,
 )
@@ -502,7 +506,7 @@ def test_stdout_output(arch, tmp_path):
         f"[{arch}] stdout bytes differ from file bytes"
 
 
-@pytest.mark.parametrize("arch", ["x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64"])
 def test_info_mode(arch, tmp_path):
     """`peor --info` must print feature flags and stub sizes without writing a file."""
     pe_path = ARCH_DIRS[arch] / "11_cpp_exceptions.exe"
@@ -521,7 +525,7 @@ def test_info_mode(arch, tmp_path):
     # Feature flags section
     assert "PE features"    in result.stdout, f"'PE features' not in --info output:\n{result.stdout}"
     assert "arch"           in result.stdout, f"'arch' not in --info output:\n{result.stdout}"
-    assert "x64"            in result.stdout, f"'x64' not in --info output:\n{result.stdout}"
+    assert arch             in result.stdout, f"'{arch}' not in --info output:\n{result.stdout}"
     assert "has_imports"    in result.stdout, f"'has_imports' not in --info output:\n{result.stdout}"
     assert "required_stubs" in result.stdout, f"'required_stubs' not in --info output:\n{result.stdout}"
     assert "issues"         in result.stdout, f"'issues' not in --info output:\n{result.stdout}"
@@ -747,7 +751,7 @@ def test_16_delay_load(arch, tmp_path):
 # ── P3-17 ─────────────────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("arch", ["x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64"])
 def test_custom_entry(arch, tmp_path):
     """--entry selects a named export (DllMain) instead of OEP; must return 42."""
     win_dir     = ARCH_DIRS[arch]
@@ -756,7 +760,8 @@ def test_custom_entry(arch, tmp_path):
     _skip_if_missing(loader_path, pe_path)
 
     pe = PE(str(pe_path))
-    override_ep_rva = _find_export_rva(pe, "DllMain")
+    export_name = "DllMain" if arch == "x64" else "_DllMain@12"
+    override_ep_rva = _find_export_rva(pe, export_name)
 
     shellcode_path = tmp_path / f"custom_entry_{arch}.bin"
     _shellcodify(pe_path, shellcode_path, override_ep_rva=override_ep_rva)
@@ -766,7 +771,7 @@ def test_custom_entry(arch, tmp_path):
         capture_output=True, timeout=10,
     )
     assert result.returncode == 42, (
-        f"[{arch}] --entry DllMain: expected exit code 42, got {result.returncode}\n"
+        f"[{arch}] --entry {export_name}: expected exit code 42, got {result.returncode}\n"
         f"stdout: {result.stdout.decode(errors='replace')}\n"
         f"stderr: {result.stderr.decode(errors='replace')}"
     )
@@ -2557,6 +2562,7 @@ def test_05_linux_global_ctor(arch, tmp_path):
 
 
 _EFI_MEMORY_SERVICES_SRC = TESTS_DIR / "EFI" / "05_efi_memory_services" / "main.c"
+_EFI_HANDLE_SRC          = TESTS_DIR / "EFI" / "06_efi_handle"          / "main.c"
 
 
 @pytest.mark.parametrize("arch", ["x64", "x86", "arm64", "arm32"])
@@ -2566,6 +2572,20 @@ def test_05_efi_memory_services(arch, tmp_path):
     Tested for both x64 and x86.
     """
     _build_and_run_efi(tmp_path, _EFI_MEMORY_SERVICES_SRC, arch=arch)
+
+
+@pytest.mark.parametrize("arch", ["x64", "x86", "arm64", "arm32"])
+def test_06_efi_handle(arch, tmp_path):
+    """EFI shellcode receives a real, registered EFI_HANDLE as ImageHandle - not NULL.
+
+    Calls BootServices->ProtocolsPerHandle(NULL, ...) first (must fail - proves the
+    call genuinely validates its handle argument), then calls it again with the
+    handle peor resolved and passed to efi_main (must succeed with a non-zero
+    protocol count) - showing peor's EFI entrypoint resolver supplies a handle
+    usable where firmware requires a real one, instead of the old hardcoded NULL.
+    Tested for x64, x86, arm64 and arm32.
+    """
+    _build_and_run_efi(tmp_path, _EFI_HANDLE_SRC, arch=arch)
 
 
 @pytest.mark.parametrize("arch", ["x64", "x86"])
@@ -2715,3 +2735,311 @@ def test_21_api_sets(arch, tmp_path):
         f"stdout: {result.stdout.decode(errors='replace')}\n"
         f"stderr: {result.stderr.decode(errors='replace')}"
     )
+
+
+# ── Feature detection unit tests ─────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_detect_features_imports(arch):
+    """_detect_pe_features must detect has_imports=True for a PE with import directory."""
+    pe_path = ARCH_DIRS[arch] / "04_crt_printf_rand.exe"
+    assert pe_path.exists(), f"{pe_path.name} not found — build tests/tests.sln first"
+    features = _detect_pe_features(PE(str(pe_path)))
+    assert features.has_imports, f"[{arch}] expected has_imports=True for PE with CRT imports"
+    assert features.arch == arch
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_detect_features_no_imports(arch):
+    """_detect_pe_features must detect has_imports=False for an importless PE."""
+    pe_path = ARCH_DIRS[arch] / "01_simple_calc.exe"
+    assert pe_path.exists(), f"{pe_path.name} not found — build tests/tests.sln first"
+    features = _detect_pe_features(PE(str(pe_path)))
+    assert not features.has_imports, f"[{arch}] expected has_imports=False for importless PE"
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_detect_features_tls(arch):
+    """_detect_pe_features must detect has_tls=True for a PE with TLS callbacks."""
+    pe_path = ARCH_DIRS[arch] / "10_tls_callbacks.exe"
+    assert pe_path.exists(), f"{pe_path.name} not found — build tests/tests.sln first"
+    features = _detect_pe_features(PE(str(pe_path)))
+    assert features.has_tls, f"[{arch}] expected has_tls=True for PE with TLS callbacks"
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_detect_features_relocs(arch):
+    """_detect_pe_features must detect has_relocs=False for a PE built with /FIXED."""
+    pe_path = ARCH_DIRS[arch] / "06_stripped_relocs.exe"
+    assert pe_path.exists(), f"{pe_path.name} not found — build tests/tests.sln first"
+    features = _detect_pe_features(PE(str(pe_path)))
+    assert not features.has_relocs, f"[{arch}] expected has_relocs=False for /FIXED PE"
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_detect_features_delay_imports(arch):
+    """_detect_pe_features must detect has_delay_imports=True for a PE with delay-loaded DLLs."""
+    pe_path = ARCH_DIRS[arch] / "16_delay_load.exe"
+    assert pe_path.exists(), f"{pe_path.name} not found — build tests/tests.sln first"
+    features = _detect_pe_features(PE(str(pe_path)))
+    assert features.has_delay_imports, f"[{arch}] expected has_delay_imports=True for delay-loaded PE"
+
+
+def test_detect_features_ctors():
+    """_detect_pe_features must detect has_ctors=True for a PE with .init_array/.ctors section.
+
+    MSVC PEs don't use .init_array/.ctors (CRT handles global constructors internally).
+    MinGW x86 C++ PE has .ctors section because i686-w64-mingw32-g++ uses GCC's DWARF
+    EH runtime which registers frame info via .init_array-style constructors.
+    """
+    pe_path = _MINGW_WIN_PREBUILT["x86"] / "17_mingw_cpp_exceptions.exe"
+    assert pe_path.exists(), f"{pe_path.name} not found — run tests/build_tests.sh first"
+    features = _detect_pe_features(PE(str(pe_path)))
+    assert features.has_ctors, "expected has_ctors=True for MinGW x86 C++ PE"
+    assert features.ctors_rva is not None, "ctors_rva should not be None"
+    assert features.ctors_size is not None and features.ctors_size > 0, "ctors_size should be > 0"
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_detect_features_bss(arch):
+    """_detect_pe_features must detect BSS sections (SizeOfRawData=0, VirtualSize>0)."""
+    pe_path = ARCH_DIRS[arch] / "18_bss_gap.exe"
+    assert pe_path.exists(), f"{pe_path.name} not found — build tests/tests.sln first"
+    features = _detect_pe_features(PE(str(pe_path)))
+    assert features.bss_sections, f"[{arch}] expected bss_sections to be non-empty for BSS test PE"
+
+
+# ── CLI flag tests ───────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_ignore_imports_flag(arch, tmp_path):
+    """--ignore-imports (-m) zeros the import directory but shellcode still runs (imports resolver
+    resolves nothing).  PE with imports: 04_crt_printf_rand.exe imports msvcrt printf/rand.
+    The shellcode must still execute (imports resolver handles a zeroed directory gracefully)."""
+    win_dir     = ARCH_DIRS[arch]
+    pe_path     = win_dir / "04_crt_printf_rand.exe"
+    loader_path = win_dir / "test_loader.exe"
+    _skip_if_missing(loader_path, pe_path)
+
+    sc_normal = tmp_path / f"04_normal_{arch}.bin"
+    sc_zeroed = tmp_path / f"04_ignore_imports_{arch}.bin"
+    _shellcodify(pe_path, sc_normal)
+    _shellcodify(pe_path, sc_zeroed, ignore_imports=True)
+
+    normal_bytes = sc_normal.read_bytes()
+    zeroed_bytes = sc_zeroed.read_bytes()
+    assert normal_bytes != zeroed_bytes, (
+        f"[{arch}] --ignore-imports should produce different shellcode"
+    )
+
+    pe = PE(str(pe_path))
+    features = _detect_pe_features(pe)
+    e_lfanew = features.e_lfanew
+    pe_magic = struct.unpack_from('<H', zeroed_bytes, len(zeroed_bytes) - features.size_of_image + e_lfanew + 24)[0]
+    dir_array_off = e_lfanew + 24 + (96 if pe_magic == 0x10B else 112)
+    import_dir_off = dir_array_off + IMAGE_DIRECTORY_ENTRY_IMPORT * 8
+    ram_start = len(zeroed_bytes) - features.size_of_image
+    import_dir_bytes = zeroed_bytes[ram_start + import_dir_off:ram_start + import_dir_off + 8]
+    assert import_dir_bytes == b'\x00' * 8, (
+        f"[{arch}] import directory should be zeroed with --ignore-imports"
+    )
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_no_imports_flag(arch, tmp_path):
+    """--no-imports omits import resolver stubs from shellcode chain.
+    Shellcode is shorter because import resolver blob is excluded."""
+    pe_path = ARCH_DIRS[arch] / "04_crt_printf_rand.exe"
+    assert pe_path.exists(), f"{pe_path.name} not found — build tests/tests.sln first"
+
+    sc_normal = tmp_path / f"04_normal_{arch}.bin"
+    sc_no_imp = tmp_path / f"04_no_imports_{arch}.bin"
+    _shellcodify(pe_path, sc_normal)
+    _shellcodify(pe_path, sc_no_imp, no_imports=True)
+
+    pe = PE(str(pe_path))
+    features = _detect_pe_features(pe)
+    normal_prefix_len = len(sc_normal.read_bytes()) - features.size_of_image
+    no_imp_prefix_len = len(sc_no_imp.read_bytes()) - features.size_of_image
+    assert no_imp_prefix_len < normal_prefix_len, (
+        f"[{arch}] --no-imports should produce shorter prefix: "
+        f"normal={normal_prefix_len}, no_imports={no_imp_prefix_len}"
+    )
+
+
+# ── Rejection tests ──────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_kernel_mode_rejected(arch, tmp_path):
+    """peor must reject kernel-mode PEs (subsystem 1) with an error message."""
+    pe_path = ARCH_DIRS[arch] / "01_simple_calc.exe"
+    assert pe_path.exists(), f"{pe_path.name} not found — build tests/tests.sln first"
+
+    pe_bytes = bytearray(pe_path.read_bytes())
+    e_lfanew = struct.unpack_from('<I', pe_bytes, 0x3C)[0]
+    subsystem_off = e_lfanew + 24 + 0x44
+    struct.pack_into('<H', pe_bytes, subsystem_off, 1)
+    km_path = tmp_path / f"kernel_{arch}.exe"
+    km_path.write_bytes(bytes(pe_bytes))
+
+    result = subprocess.run(
+        [sys.executable, "-m", "peor", "-i", str(km_path), "-o", str(tmp_path / "out.bin")],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode != 0, "peor should reject kernel-mode PE but returned 0"
+    assert "kernel" in result.stderr.lower() or "subsystem" in result.stderr.lower(), (
+        f"Expected 'kernel' or 'subsystem' in stderr:\n{result.stderr}"
+    )
+
+
+def test_find_export_rva_not_found(tmp_path):
+    """_find_export_rva must raise ValueError when export name is not found."""
+    pe_path = ARCH_DIRS["x64"] / "05_dll_entry.dll"
+    assert pe_path.exists(), f"{pe_path.name} not found — build tests/tests.sln first"
+    pe = PE(str(pe_path))
+    with pytest.raises(ValueError, match="not found"):
+        _find_export_rva(pe, "NonExistentExport")
+
+
+def test_find_export_rva_no_exports(tmp_path):
+    """_find_export_rva must raise ValueError when PE has no export directory."""
+    pe_path = ARCH_DIRS["x64"] / "01_simple_calc.exe"
+    assert pe_path.exists(), f"{pe_path.name} not found — build tests/tests.sln first"
+    pe = PE(str(pe_path))
+    with pytest.raises(ValueError, match="no export directory"):
+        _find_export_rva(pe, "anything")
+
+
+# ── CLI mutual exclusion tests ───────────────────────────────────────────────
+
+
+def test_cli_ignore_and_no_imports_exclusive(tmp_path):
+    """peor must reject --ignore-imports and --no-imports together."""
+    pe_path = ARCH_DIRS["x64"] / "04_crt_printf_rand.exe"
+    assert pe_path.exists(), f"{pe_path.name} not found — build tests/tests.sln first"
+
+    result = subprocess.run(
+        [sys.executable, "-m", "peor", "-i", str(pe_path),
+         "--ignore-imports", "--no-imports",
+         "-o", str(tmp_path / "out.bin")],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode != 0 or "exclusive" in result.stdout.lower(), (
+        "peor should reject --ignore-imports + --no-imports"
+    )
+
+
+def test_cli_info_and_output_exclusive(tmp_path):
+    """peor must reject --info and -o together."""
+    pe_path = ARCH_DIRS["x64"] / "01_simple_calc.exe"
+    assert pe_path.exists(), f"{pe_path.name} not found — build tests/tests.sln first"
+
+    result = subprocess.run(
+        [sys.executable, "-m", "peor", "-i", str(pe_path),
+         "--info", "-o", str(tmp_path / "out.bin")],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode != 0 or "exclusive" in result.stdout.lower(), (
+        "peor should reject --info + -o together"
+    )
+
+
+# ── Packer detection completeness ───────────────────────────────────────────
+
+
+def test_all_packer_section_names_detected():
+    """Every name in _PACKER_SECTION_NAMES must cause packed=True in _detect_pe_features."""
+    pe_path = ARCH_DIRS["x64"] / "01_simple_calc.exe"
+    assert pe_path.exists(), f"{pe_path.name} not found — build tests/tests.sln first"
+
+    for name in sorted(_PACKER_SECTION_NAMES):
+        pe = PE(str(pe_path))
+        pe.sections[0].Name = name.ljust(8, b'\x00')
+        features = _detect_pe_features(pe)
+        assert features.packed, f"packer section name {name!r} not detected as packed"
+        assert features.issues, f"no issues reported for packer section {name!r}"
+
+
+# ── C++ EH feature detection (x64 only) ─────────────────────────────────────
+
+
+def test_detect_features_cxx_eh():
+    """_detect_pe_features on x64 C++ EH PE must detect has_cxx_eh and iat_rva_rtlpctofileheader."""
+    pe_path = ARCH_DIRS["x64"] / "11_cpp_exceptions.exe"
+    assert pe_path.exists(), f"{pe_path.name} not found — build tests/tests.sln first"
+    features = _detect_pe_features(PE(str(pe_path)))
+    assert features.has_cxx_eh, "expected has_cxx_eh=True for MSVC C++ exception PE"
+    assert features.iat_rva_rtlpctofileheader is not None, (
+        "expected iat_rva_rtlpctofileheader to be set for PE importing RtlPcToFileHeader"
+    )
+    assert features.has_seh, "x64 C++ exception PE should have SEH unwind tables"
+
+
+# ── Stub computation tests ───────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_compute_stubs_importless_pe(arch):
+    """Importless PE must not include 'imports' or 'delay_imports' in required stubs."""
+    pe_path = ARCH_DIRS[arch] / "01_simple_calc.exe"
+    assert pe_path.exists(), f"{pe_path.name} not found — build tests/tests.sln first"
+    pe = PE(str(pe_path))
+    features = _detect_pe_features(pe)
+    entry = _select_chain(features)
+    stubs = _compute_required_stubs(features, entry)
+    assert 'imports' not in stubs, f"[{arch}] importless PE should not require imports stub"
+    assert 'delay_imports' not in stubs, f"[{arch}] importless PE should not require delay_imports stub"
+    assert 'relocs' in stubs, f"[{arch}] relocs stub must always be present"
+    assert 'entrypoint' in stubs, f"[{arch}] entrypoint stub must always be present"
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_compute_stubs_tls_pe(arch):
+    """PE with TLS callbacks must include 'tls' in required stubs."""
+    pe_path = ARCH_DIRS[arch] / "10_tls_callbacks.exe"
+    assert pe_path.exists(), f"{pe_path.name} not found — build tests/tests.sln first"
+    pe = PE(str(pe_path))
+    features = _detect_pe_features(pe)
+    entry = _select_chain(features)
+    stubs = _compute_required_stubs(features, entry)
+    assert 'tls' in stubs, f"[{arch}] TLS PE should require tls stub"
+
+
+def test_compute_stubs_cxx_eh_pe():
+    """x64 PE with C++ EH must include 'cxx_eh_fixer' in required stubs."""
+    pe_path = ARCH_DIRS["x64"] / "11_cpp_exceptions.exe"
+    assert pe_path.exists(), f"{pe_path.name} not found — build tests/tests.sln first"
+    pe = PE(str(pe_path))
+    features = _detect_pe_features(pe)
+    entry = _select_chain(features)
+    stubs = _compute_required_stubs(features, entry)
+    assert 'cxx_eh_fixer' in stubs, "x64 C++ EH PE should require cxx_eh_fixer stub"
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_compute_stubs_delay_imports_pe(arch):
+    """PE with delay-loaded DLLs must include 'delay_imports' in required stubs."""
+    pe_path = ARCH_DIRS[arch] / "16_delay_load.exe"
+    assert pe_path.exists(), f"{pe_path.name} not found — build tests/tests.sln first"
+    pe = PE(str(pe_path))
+    features = _detect_pe_features(pe)
+    entry = _select_chain(features)
+    stubs = _compute_required_stubs(features, entry)
+    assert 'delay_imports' in stubs, f"[{arch}] delay-loaded PE should require delay_imports stub"
+
+
+def test_compute_stubs_ctors_pe():
+    """PE with global constructors (.ctors section) must include 'ctors' in required stubs.
+
+    Uses MinGW x86 C++ EH PE which has a .ctors section (MSVC PEs don't use .ctors).
+    """
+    pe_path = _MINGW_WIN_PREBUILT["x86"] / "17_mingw_cpp_exceptions.exe"
+    assert pe_path.exists(), f"{pe_path.name} not found — run tests/build_tests.sh first"
+    pe = PE(str(pe_path))
+    features = _detect_pe_features(pe)
+    entry = _select_chain(features)
+    stubs = _compute_required_stubs(features, entry)
+    assert 'ctors' in stubs, "MinGW x86 C++ PE with .ctors should require ctors stub"

@@ -10,9 +10,11 @@
 ;   EBX = PE base (set by relocations_resolver32)
 ;   [ESP] = return address to firmware/loader
 ;
-; The resolver scans page-aligned addresses for EFI_TABLE_HEADER signature,
-; then calls efi_main(NULL, SystemTable) in IA-32 cdecl.
-; NULL is passed for ImageHandle because no caller guarantees it is valid.
+; The resolver scans page-aligned addresses for EFI_TABLE_HEADER signature, then
+; resolves a real EFI_HANDLE via BootServices->LocateHandleBuffer(AllHandles)
+; (firmware always has at least one handle registered) and calls
+; efi_main(ResolvedHandle, SystemTable) in IA-32 cdecl.  Falls back to NULL for
+; ImageHandle if SystemTable or the handle lookup can't be resolved.
 
 %define EP_RVA_MAGIC                    0xcececece
 
@@ -41,8 +43,13 @@
 %define EFI_SIMPLE_TEXT_OUTPUT_OUTPUT_STRING_OFF 0x04
 ; Minimum address for valid EFI firmware code pointers (below 1 MB = low/BIOS memory)
 %define EFI_FIRMWARE_ADDR_MIN                   0x100000
-; NULL ImageHandle to pass when invoking efi_main from self-contained shellcode
-%define EFI_NULL_IMAGE_HANDLE                   0
+; EFI_BOOT_SERVICES.LocateHandleBuffer is the 37th function pointer after the
+; EFI_TABLE_HEADER (24 bytes): 0x18 + 36*4 = 0xA8 (32-bit function table).
+%define EFI_BS_LOCATE_HANDLE_BUFFER_OFFSET_32   0xA8
+; EFI_LOCATE_SEARCH_TYPE.AllHandles = 0 (enumerate every registered handle).
+%define EFI_LOCATE_SEARCH_ALL_HANDLES           0
+; LocateHandleBuffer cdecl cleanup: 5 pushed dword args * 4 bytes = 0x14.
+%define LHB_CDECL_ARGS_SIZE_32                  0x14
 
     ; Scan top-down at 16-byte granularity; EDK2 places system table near top of RAM.
     ; Validate BootServices pointer to reject false positives.
@@ -99,10 +106,55 @@ _have_st32:
     ; Compute entry point
     mov eax, EP_RVA_MAGIC
     add eax, ebx                ; EAX = efi_main VA
+    push eax                    ; stash VA on the stack (avoids relying on any
+                                 ; register surviving the LocateHandleBuffer call
+                                 ; below - popped back out at _call_efi_main32)
 
-    ; Call efi_main(NULL, SystemTable) - IA-32 cdecl: right-to-left push
-    push esi                    ; arg2: SystemTable
-    push EFI_NULL_IMAGE_HANDLE  ; arg1: ImageHandle = NULL
+    ; Resolve an always-available EFI_HANDLE via BootServices->LocateHandleBuffer
+    ; (AllHandles search) so efi_main gets a real, registered handle instead of
+    ; NULL - needed by boot-service calls that validate their handle argument.
+    ; Falls back to NULL (EDI stays 0) on any failure along the way.
+    xor edi, edi                 ; EDI = resolved EFI_HANDLE, default NULL
+    test esi, esi
+    jz _call_efi_main32          ; no SystemTable -> no handle lookup possible
+
+    mov ecx, [esi + EFI_SYSTEM_TABLE_BOOT_SERVICES_OFFSET]
+    test ecx, ecx
+    jz _call_efi_main32
+
+    mov edx, [ecx + EFI_BS_LOCATE_HANDLE_BUFFER_OFFSET_32]
+    test edx, edx
+    jz _call_efi_main32
+
+    sub esp, 8                   ; locals: [esp+0]=NoHandles, [esp+4]=BufferPtr
+    mov dword [esp], 0
+    mov dword [esp+4], 0
+    lea eax, [esp+4]             ; &BufferPtr
+    lea ecx, [esp]               ; &NoHandles (BootServices ptr no longer needed)
+    push eax                     ; arg5: &Buffer
+    push ecx                     ; arg4: &NoHandles
+    push 0                       ; arg3: SearchKey = NULL
+    push 0                       ; arg2: Protocol = NULL
+    push EFI_LOCATE_SEARCH_ALL_HANDLES  ; arg1: SearchType = AllHandles
+    call edx
+    add esp, LHB_CDECL_ARGS_SIZE_32  ; cdecl caller cleanup of 5 pushed args
+    mov ecx, [esp]               ; NoHandles
+    mov edx, [esp + 4]           ; Buffer (EFI_HANDLE*)
+    test eax, eax                ; EFI_STATUS return value (cdecl: in EAX)
+    jnz _lhb_done32              ; != EFI_SUCCESS -> keep NULL
+    test ecx, ecx
+    jz _lhb_done32
+    test edx, edx
+    jz _lhb_done32
+    mov edi, [edx]                ; EDI = Buffer[0] = first EFI_HANDLE
+_lhb_done32:
+    add esp, 8                    ; free the 2 locals
+
+_call_efi_main32:
+    ; Call efi_main(ResolvedHandle, SystemTable) - IA-32 cdecl: right-to-left push.
+    pop eax                      ; EAX = efi_main VA (popped back off the stack)
+    push esi                     ; arg2: SystemTable
+    push edi                     ; arg1: ImageHandle = resolved handle (NULL if unresolved)
     call eax
-    add esp, 8                  ; cdecl caller cleanup
+    add esp, 8                   ; cdecl caller cleanup
     ret

@@ -21,22 +21,6 @@ Standing rules — apply to every item:
 
 ---
 
-## Work Queue (execute in order)
-
-### CI/CD — MSYS2 fix pushed, needs re-verification
-
-First real-CI run (https://github.com/mon231/peor/actions/runs/28576369139) confirmed the
-big wins: `test-efi-qemu` (all 4 archs, including the arm64 fix) and both Linux jobs all
-**passed**. Only `test-windows`/`test-windows-debug` failed, both at the same step:
-`cp: '/mingw64/bin/gcc.exe' and '/mingw64/bin/x86_64-w64-mingw32-gcc.exe' are the same
-file` — MSYS2's `mingw-w64-x86_64-gcc` package already ships the triple-prefixed name as
-the same file as `gcc.exe`, so the unconditional `cp` failed. Fixed by guarding each `cp`
-with an existence check (only alias what's actually missing — the `-posix`-suffixed g++
-names, which MSYS2 doesn't provide). Needs another push to confirm this specific fix
-works; still can't verify the EH-model concern (SEH/DWARF/SJLJ) without a real run.
-
----
-
 ## Future TODOs — Deferred (explicitly blocked)
 
 ### Windows kernel mode (x86 + x64)

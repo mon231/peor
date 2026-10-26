@@ -381,16 +381,29 @@ jobs:
           python --version
           wsl --status 2>&1 | Out-String | Write-Host
           Write-Host "--- choco ---"
-          choco --version 2>&1 | Out-String | Write-Host
-          Write-Host "--- winget ---"
-          winget --version 2>&1 | Out-String | Write-Host
-          Write-Host "--- clang (if any) ---"
-          Get-Command clang -ErrorAction SilentlyContinue
-          Write-Host "--- llvm dirs ---"
-          Get-ChildItem "C:\Program Files\LLVM" -ErrorAction SilentlyContinue
-          Write-Host "--- qemu dirs ---"
-          Get-ChildItem "C:\Program Files\qemu" -ErrorAction SilentlyContinue
-          exit 0
+          choco --version
+
+      # windows-11-arm GitHub-hosted runners have no WSL2 (confirmed via the sanity
+      # check above), so we use the native-Windows fallback: _find_clang_arm64/32
+      # and _find_qemu_ovmf already probe PATH / "C:\Program Files\..." natively
+      # first, so installing real native toolchains here needs zero test_shellcode.py
+      # changes.
+      - name: Install native clang/lld (LLVM) and QEMU via chocolatey
+        shell: pwsh
+        run: |
+          choco install llvm qemu -y --no-progress
+          echo "C:\Program Files\LLVM\bin" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
+          echo "C:\Program Files\qemu" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
+
+      - name: Verify clang ARM64/ARM32 mingw target support and QEMU firmware layout
+        shell: pwsh
+        run: |
+          clang --version
+          clang --target=aarch64-w64-mingw32 -print-effective-triple
+          clang --target=armv7-w64-mingw32 -print-effective-triple
+          ld.lld --version
+          Get-ChildItem "C:\Program Files\qemu" | Where-Object { $_.Name -like "qemu-system-a*" }
+          Get-ChildItem "C:\Program Files\qemu\share" -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "edk2-a*" }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # test-summary: single required gate — fails unless every job above PASSED.

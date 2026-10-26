@@ -401,20 +401,36 @@ jobs:
 
       # keystone-engine (peor's build+runtime dependency, assembles the resolver
       # ASM stubs) ships no prebuilt win_arm64 wheel on PyPI, so pip must build it
-      # from source here. That needs an MSVC dev environment on PATH (nmake/cl) and
-      # a workaround for keystone's bundled CMakeLists.txt predating CMake's removal
-      # of pre-3.5 compatibility.
+      # from source here. That needs an MSVC dev environment on PATH (nmake/cl)...
       - uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: arm64
 
+      # ...and a CMake old enough to still support CMP0051's OLD behavior, which
+      # keystone-engine's bundled (ancient, LLVM-derived) CMakeLists.txt sets
+      # explicitly. CMake 4.x removed OLD support for that policy outright (not
+      # just deprecated it), so the VS-bundled CMake 4.4 hard-fails; install an
+      # older 3.x CMake here and put it ahead of VS's on PATH.
+      - name: Install CMake 3.31 (keystone-engine's CMakeLists.txt needs CMP0051 OLD, removed in CMake 4.x)
+        shell: pwsh
+        run: |
+          choco install cmake --version=3.31.6 --installargs 'ADD_CMAKE_TO_PATH=System' -y --no-progress --force
+          echo "C:\Program Files\CMake\bin" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
+
       - name: Install Python dependencies
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+        shell: pwsh
         run: |
+          # pwsh does not stop a multi-line script just because a native command
+          # (pip) exits non-zero, so check explicitly after each one or a failed
+          # keystone-engine build would silently fall through to "success".
           python -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           pip install -e .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           pip install pytest pytest-timeout
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build prebuilt EFI test-source PEs (build_tests.py)
         run: python tests/build_tests.py --target efi

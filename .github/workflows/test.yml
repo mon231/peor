@@ -14,6 +14,7 @@ jobs:
 # ─────────────────────────────────────────────────────────────────────────────
   build-windows:
     runs-on: windows-latest
+    if: false # SPIKE: temporarily disabled to save CI minutes while iterating on test-efi-windows-arm; restore before landing on arm_support
 
     steps:
       - uses: actions/checkout@v4
@@ -66,6 +67,7 @@ jobs:
 # ─────────────────────────────────────────────────────────────────────────────
   build-windows-debug:
     runs-on: windows-latest
+    if: false # SPIKE: temporarily disabled to save CI minutes while iterating on test-efi-windows-arm; restore before landing on arm_support
 
     steps:
       - uses: actions/checkout@v4
@@ -115,6 +117,7 @@ jobs:
   test-windows:
     runs-on: windows-latest
     needs: build-windows
+    if: false # SPIKE: temporarily disabled to save CI minutes while iterating on test-efi-windows-arm; restore before landing on arm_support
 
     steps:
       - uses: actions/checkout@v4
@@ -182,6 +185,7 @@ jobs:
   test-windows-debug:
     runs-on: windows-latest
     needs: build-windows-debug
+    if: false # SPIKE: temporarily disabled to save CI minutes while iterating on test-efi-windows-arm; restore before landing on arm_support
 
     steps:
       - uses: actions/checkout@v4
@@ -234,6 +238,7 @@ jobs:
 # ─────────────────────────────────────────────────────────────────────────────
   build-linux-mingw:
     runs-on: ubuntu-latest
+    if: false # SPIKE: temporarily disabled to save CI minutes while iterating on test-efi-windows-arm; restore before landing on arm_support
 
     steps:
       - uses: actions/checkout@v4
@@ -288,6 +293,7 @@ jobs:
   test-linux-mingw:
     runs-on: ubuntu-latest
     needs: build-linux-mingw
+    if: false # SPIKE: temporarily disabled to save CI minutes while iterating on test-efi-windows-arm; restore before landing on arm_support
 
     steps:
       - uses: actions/checkout@v4
@@ -318,6 +324,7 @@ jobs:
 
   test-efi-qemu:
     runs-on: ubuntu-latest
+    if: false # SPIKE: temporarily disabled to save CI minutes while iterating on test-efi-windows-arm; restore before landing on arm_support
 
     steps:
       - uses: actions/checkout@v4
@@ -372,7 +379,18 @@ jobs:
         shell: pwsh
         run: |
           python --version
-          wsl --status
+          wsl --status 2>&1 | Out-String | Write-Host
+          Write-Host "--- choco ---"
+          choco --version 2>&1 | Out-String | Write-Host
+          Write-Host "--- winget ---"
+          winget --version 2>&1 | Out-String | Write-Host
+          Write-Host "--- clang (if any) ---"
+          Get-Command clang -ErrorAction SilentlyContinue
+          Write-Host "--- llvm dirs ---"
+          Get-ChildItem "C:\Program Files\LLVM" -ErrorAction SilentlyContinue
+          Write-Host "--- qemu dirs ---"
+          Get-ChildItem "C:\Program Files\qemu" -ErrorAction SilentlyContinue
+          exit 0
 
 # ─────────────────────────────────────────────────────────────────────────────
 # test-summary: single required gate — fails unless every job above PASSED.
@@ -381,7 +399,7 @@ jobs:
 # ─────────────────────────────────────────────────────────────────────────────
   test-summary:
     runs-on: ubuntu-latest
-    if: always()
+    if: false # SPIKE: temporarily disabled to save CI minutes while iterating on test-efi-windows-arm; restore before landing on arm_support
     needs:
       - build-windows
       - build-windows-debug

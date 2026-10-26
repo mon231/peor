@@ -380,12 +380,41 @@ jobs:
       # fallback: _find_clang_arm64/32 and _find_qemu_ovmf already probe PATH /
       # "C:\Program Files\..." natively first, so installing real native toolchains
       # here needs zero test_shellcode.py changes.
+      #
+      # Cache the installed toolchain directories themselves (not just choco's
+      # download cache) so a cache hit skips the slow choco installs entirely.
+      - name: Cache native toolchain (LLVM/clang+lld, QEMU, CMake 3.31)
+        id: cache-native-toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:\Program Files\LLVM
+            C:\Program Files\qemu
+            C:\Program Files\CMake
+          key: native-toolchain-windows-11-arm-llvm-qemu-cmake3316-v1
+
       - name: Install native clang/lld (LLVM) and QEMU via chocolatey
+        if: steps.cache-native-toolchain.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: choco install llvm qemu -y --no-progress
+
+      # keystone-engine's bundled (ancient, LLVM-derived) CMakeLists.txt sets
+      # cmake_policy(SET CMP0051 OLD); CMake 4.x removed OLD support for that
+      # policy outright (not just deprecated it), so the VS-bundled CMake 4.4
+      # hard-fails. Install an older 3.x CMake and put it ahead of VS's on PATH.
+      - name: Install CMake 3.31 (keystone-engine's CMakeLists.txt needs CMP0051 OLD, removed in CMake 4.x)
+        if: steps.cache-native-toolchain.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: choco install cmake --version=3.31.6 --installargs 'ADD_CMAKE_TO_PATH=System' -y --no-progress --force
+
+      # PATH additions must happen every run (cache restores files, not the
+      # job's PATH), regardless of whether the cache step above hit or missed.
+      - name: Add native toolchain to PATH
         shell: pwsh
         run: |
-          choco install llvm qemu -y --no-progress
           echo "C:\Program Files\LLVM\bin" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
           echo "C:\Program Files\qemu" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
+          echo "C:\Program Files\CMake\bin" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
 
       - name: Verify clang ARM64/ARM32 mingw target support
         shell: pwsh
@@ -395,27 +424,36 @@ jobs:
           clang --target=armv7-w64-mingw32 -print-effective-triple
           ld.lld --version
 
+      - name: Smoke-test QEMU binaries (full test run exits instantly with no stdout/stderr otherwise)
+        shell: pwsh
+        run: |
+          & "C:\Program Files\qemu\qemu-system-aarch64.exe" --version
+          Write-Host "exit: $LASTEXITCODE"
+          & "C:\Program Files\qemu\qemu-system-arm.exe" --version
+          Write-Host "exit: $LASTEXITCODE"
+          & "C:\Program Files\qemu\qemu-system-aarch64.exe" -machine help
+          Write-Host "exit: $LASTEXITCODE"
+
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
       # keystone-engine (peor's build+runtime dependency, assembles the resolver
       # ASM stubs) ships no prebuilt win_arm64 wheel on PyPI, so pip must build it
-      # from source here. That needs an MSVC dev environment on PATH (nmake/cl)...
+      # from source here (an LLVM-derived subset) — slow, so cache pip's wheel
+      # cache too: once built once, a pyproject.toml-keyed cache hit lets pip
+      # reuse the built keystone-engine wheel instead of recompiling it.
+      - name: Cache pip wheel cache (keystone-engine build-from-source is slow)
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\pip\Cache
+          key: pip-wheels-windows-11-arm-${{ hashFiles('pyproject.toml', 'setup.py') }}
+
+      # Needed for the keystone-engine source build above: an MSVC dev environment
+      # on PATH (nmake/cl).
       - uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: arm64
-
-      # ...and a CMake old enough to still support CMP0051's OLD behavior, which
-      # keystone-engine's bundled (ancient, LLVM-derived) CMakeLists.txt sets
-      # explicitly. CMake 4.x removed OLD support for that policy outright (not
-      # just deprecated it), so the VS-bundled CMake 4.4 hard-fails; install an
-      # older 3.x CMake here and put it ahead of VS's on PATH.
-      - name: Install CMake 3.31 (keystone-engine's CMakeLists.txt needs CMP0051 OLD, removed in CMake 4.x)
-        shell: pwsh
-        run: |
-          choco install cmake --version=3.31.6 --installargs 'ADD_CMAKE_TO_PATH=System' -y --no-progress --force
-          echo "C:\Program Files\CMake\bin" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
 
       - name: Install Python dependencies
         env:

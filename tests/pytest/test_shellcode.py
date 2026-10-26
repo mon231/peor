@@ -1949,10 +1949,11 @@ _MINGW_CPP_EH_FLAGS = ["-fexceptions", "-nostartfiles", "-nodefaultlibs"]
 # EFI / Linux: only toolchain libs (no OS runtime)
 _MINGW_CPP_STATIC_LIBS = ["-Wl,--start-group", "-lgcc_eh", "-lsupc++", "-lgcc", "-Wl,--end-group"]
 # Windows: toolchain libs + Windows DLL stubs all inside one group.
-# __mingw_vsprintf is stubbed in freestanding.c so libmingwex is NOT needed.
+# -lmingwex provides __stack_chk_fail / __stack_chk_guard that libsupc++.a
+# references on MSYS2 GCC 16+ (compiled with -fstack-protector).
 _MINGW_CPP_STATIC_LIBS_WINDOWS = [
     "-Wl,--start-group",
-    "-lgcc_eh", "-lsupc++", "-lgcc",
+    "-lgcc_eh", "-lsupc++", "-lgcc", "-lssp", "-lmingwex",
     "-lmsvcrt", "-lkernel32",
     "-Wl,--end-group",
 ]

@@ -1,5 +1,5 @@
 # PLAN
-
+<!-- claude --resume 2b0e4ad7-db01-4844-bb7f-938f746625b2 -->
 Standing rules — apply to every item:
 - **NEVER DO GIT COMMIT**
 - Always remove all unused files / comments / ...

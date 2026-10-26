@@ -63,6 +63,25 @@ int pthread_setspecific(_peor_key_t key, const void *value) {
     return 0;
 }
 
+/* ─── __cxa_eh_globals stubs ──────────────────────────────────────────────── */
+/* On x64 Windows, GCC 16+ libsupc++ (eh_globals.o) accesses per-thread
+ * exception state through native Windows TLS (_tls_index + gs:[0x58]).
+ * In peor shellcode the PE loader never runs, so _tls_index stays at its
+ * initial -1 value and the TLS dereference crashes.  Providing our own
+ * __cxa_get_globals / __cxa_get_globals_fast with a simple static buffer
+ * prevents eh_globals.o from being pulled out of libsupc++.a, avoiding the
+ * native-TLS dependency entirely.  Single-threaded shellcode is fine. */
+typedef struct { void *caughtExceptions; unsigned int uncaughtExceptions; } _peor_eh_globals;
+static _peor_eh_globals _peor_eh_globals_buf;
+void *__cxa_get_globals(void)      { return &_peor_eh_globals_buf; }
+void *__cxa_get_globals_fast(void) { return &_peor_eh_globals_buf; }
+
+/* ─── atexit stub ─────────────────────────────────────────────────────────── */
+/* libsupc++.a (eh_alloc.o) registers __gnu_cxx::__freeres via atexit() in a
+ * static constructor.  In freestanding shellcode there is no CRT to run
+ * atexit callbacks, so a no-op is correct. */
+int atexit(void (*fn)(void)) { (void)fn; return 0; }
+
 /* ─── _pei386_runtime_relocator stub ─────────────────────────────────────── */
 /* MinGW's linker auto-generates ertr stub objects that reference this symbol.
  * peor applies PE relocations via its own asm stub, so a no-op is correct. */
@@ -199,7 +218,6 @@ unsigned long strtoul(const char *s, char **end, int base) {
 
 /* ─── Environment / Process ───────────────────────────────────────────────── */
 char *getenv(const char *name) { (void)name; return (char *)0; }
-int atexit(void (*fn)(void)) { (void)fn; return 0; }
 void abort(void) { while (1) {} }
 
 /* ─── Minimal stdio stubs ─────────────────────────────────────────────────── */

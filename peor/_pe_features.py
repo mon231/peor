@@ -41,6 +41,7 @@ _PLATFORM_LINUX_32  = 'linux32'
 _PLATFORM_EFI_32    = 'efi32'
 _PLATFORM_EFI_ARM64 = 'efi_arm64'
 _PLATFORM_EFI_ARM32 = 'efi_arm32'
+_PLATFORM_LINUX_ARM64 = 'linux_arm64'
 
 
 class PeorUnsupportedError(ValueError):

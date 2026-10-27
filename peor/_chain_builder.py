@@ -10,6 +10,7 @@ from peor._pe_features import (
     IMAGE_DIRECTORY_ENTRY_IMPORT,
     _PLATFORM_LINUX, _PLATFORM_EFI,
     _PLATFORM_LINUX_32, _PLATFORM_EFI_32, _PLATFORM_EFI_ARM64, _PLATFORM_EFI_ARM32,
+    _PLATFORM_LINUX_ARM64,
     _POSIX_CUI_SUBSYSTEM, _EFI_SUBSYSTEMS, _MACHINE_ARM64, _MACHINE_ARMNT, _MACHINE_ARMTHUMB,
 )
 from peor._shellcodes import (
@@ -26,11 +27,13 @@ from peor._shellcodes import (
     RELOCS_ARM64, CTORS_RUNNER_ARM64, ENTRYPOINT_EFI_ARM64,
     RELOCS_ARM32, CTORS_RUNNER_ARM32, ENTRYPOINT_EFI_ARM32,
     ARM32_EFI_PREFIX,
+    IMPORTS_ARM64_LINUX, ENTRYPOINT_ARM64,
 )
 
 # Trailing bytes stripped from import resolvers so they fall through into the next stub.
 _IMPORTS_TAIL_32 = b'\xc3'        # RET
 _IMPORTS_TAIL_64 = b'\xff\xe0'    # JMP RAX
+_IMPORTS_TAIL_ARM64 = b'\xc0\x03\x5f\xd6'  # RET (AArch64 encoding of "ret")
 
 # Magic placeholders in cxx_eh_fixer64.asm patched at build time.
 _CXX_EH_PE_SIZE_MAGIC_64 = b'\x78\x56\x34\x12'   # 0x12345678 LE
@@ -115,6 +118,22 @@ _SHELLCODES = {
         'disp32_off':        8,
         'ep_rva_magic':      _EP_RVA_MAGIC,
     },
+    _PLATFORM_LINUX_ARM64: {
+        'relocs':            RELOCS_ARM64,
+        'imports':           IMPORTS_ARM64_LINUX,
+        'delay_imports':     b'',
+        'entrypoint':        ENTRYPOINT_ARM64,
+        'seh':               b'',
+        'seh_always':        False,
+        'tls':               b'',
+        'ctors':             CTORS_RUNNER_ARM64,
+        'ctors_rva_magic':   _CTORS_RVA_MAGIC,
+        'ctors_size_magic':  _CTORS_SIZE_MAGIC,
+        'tail':              _IMPORTS_TAIL_ARM64,
+        'dir_array_offset':  112,
+        'disp64_off':        8,
+        'ep_rva_magic':      _EP_RVA_MAGIC,
+    },
     _PLATFORM_EFI: {
         'relocs':            RELOCS_64,
         'imports':           b'',
@@ -194,6 +213,8 @@ def _strip_tail(shellcode: bytes, tail: bytes) -> bytes:
 def _select_chain(features: PeFeatures, platform: "str | None" = None) -> dict:
     """Return the _SHELLCODES entry for this PE, or raise ValueError."""
     if platform == _PLATFORM_LINUX:
+        if features.machine == _MACHINE_ARM64:
+            return _SHELLCODES[_PLATFORM_LINUX_ARM64]
         return _SHELLCODES[_PLATFORM_LINUX_32 if features.pe_type == OPTIONAL_HEADER_MAGIC_PE else _PLATFORM_LINUX]
     if platform == _PLATFORM_EFI:
         if features.machine == _MACHINE_ARM64:
@@ -208,6 +229,8 @@ def _select_chain(features: PeFeatures, platform: "str | None" = None) -> dict:
             return _SHELLCODES[_PLATFORM_EFI_ARM32]
         return _SHELLCODES[_PLATFORM_EFI_32 if features.pe_type == OPTIONAL_HEADER_MAGIC_PE else _PLATFORM_EFI]
     if features.subsystem == _POSIX_CUI_SUBSYSTEM:
+        if features.machine == _MACHINE_ARM64:
+            return _SHELLCODES[_PLATFORM_LINUX_ARM64]
         return _SHELLCODES[_PLATFORM_LINUX_32 if features.pe_type == OPTIONAL_HEADER_MAGIC_PE else _PLATFORM_LINUX]
     entry = _SHELLCODES.get(features.pe_type)
     if entry is None:

@@ -45,6 +45,7 @@ ARCH_DIRS = {
 # Tests check these dirs first; compilation only happens when the PE is absent.
 _LINUX_PREBUILD_X64 = TESTS_DIR / "Linux_x64"
 _LINUX_PREBUILD_X86 = TESTS_DIR / "Linux_x86"
+_LINUX_PREBUILD_ARM64 = TESTS_DIR / "Linux_arm64"
 
 MINGW_CPP_EH_RETURN_CODE = 42
 LINUX_CRT_RETURN_CODE = 73
@@ -1052,6 +1053,73 @@ def _build_linux_write_pe(tmp_path: Path, use_wsl: bool) -> "Path | None":
     return exe
 
 
+def _build_linux_write_pe_arm64(tmp_path: Path) -> "Path | None":
+    """Cross-compile tests/Linux/01_linux_write/main.c as an ARM64 PE with libc.so.6 imports.
+
+    NOT YET CALLED by any test - parked pending a remaining bug in
+    asm/imports_resolver_arm64_linux.asm (dlsym-resolved write() crashes with a NULL
+    deref partway through, after PE-base/OEP/dlopen/dlsym/IAT-write all verified
+    correct via register-level inspection). See
+    .superpowers/sdd/2026-10-27-linux-arm-pe-support/progress.md for the full
+    debugging trail and exact continuation point before wiring this back in.
+
+    Real mingw-w64 has no aarch64-w64-mingw32 target (same limitation documented for the
+    EFI ARM tests), so this uses clang+lld (aarch64-w64-mingw32 target) and llvm-dlltool
+    instead of GCC mingw + GNU dlltool - same algorithm _build_linux_write_pe uses for x64,
+    different toolchain. Output goes to the stable tests/Linux_arm64/ directory.
+    """
+    stable = _LINUX_PREBUILD_ARM64 / "01_linux_write_arm64.pe"
+    if stable.exists():
+        return stable
+    _LINUX_PREBUILD_ARM64.mkdir(parents=True, exist_ok=True)
+
+    src = TESTS_DIR / "Linux" / "01_linux_write" / "main.c"
+    if not src.exists():
+        return None
+
+    clang = _find_clang_arm64()
+    if not clang:
+        return None
+    llvm_dlltool = str(Path(clang).parent / "llvm-dlltool.exe")
+    if not Path(llvm_dlltool).exists():
+        llvm_dlltool = shutil.which("llvm-dlltool")
+    if not llvm_dlltool:
+        return None
+
+    def_file = tmp_path / "libc.so.6_arm64.def"
+    imp_lib  = tmp_path / "liblibc_import_arm64.a"
+    obj_file = tmp_path / "01_linux_write_arm64.o"
+    def_file.write_text(_LIBC_DEF_CONTENT, encoding="ascii")
+
+    dt = subprocess.run(
+        [llvm_dlltool, "-m", "arm64", "-D", _LIBC_DLL_NAME, "-d", str(def_file), "-l", str(imp_lib)],
+        capture_output=True, timeout=30,
+    )
+    if dt.returncode != 0:
+        return None
+
+    cc1 = subprocess.run(
+        [clang, "-target", "aarch64-w64-mingw32", "-nostdlib", "-nodefaultlibs", "-nostartfiles",
+         "-fno-unwind-tables", "-fno-asynchronous-unwind-tables",
+         "-c", str(src), "-o", str(obj_file)],
+        capture_output=True, timeout=30,
+    )
+    if cc1.returncode != 0:
+        return None
+
+    exe = stable
+    cc2 = subprocess.run(
+        [clang, "-target", "aarch64-w64-mingw32", "-nostdlib", "-nodefaultlibs", "-nostartfiles",
+         "-fno-unwind-tables", "-fno-asynchronous-unwind-tables", "-fuse-ld=lld",
+         "-Wl,-e,main", "-Wl,--subsystem,posix",
+         str(obj_file), str(imp_lib), "-o", str(exe)],
+        capture_output=True, timeout=30,
+    )
+    if cc2.returncode != 0 or not exe.exists():
+        return None
+    return exe
+
+
 @pytest.mark.parametrize("arch", ["x64", "x86"])
 def test_01_linux_write(arch, tmp_path):
     """Linux import resolver: PE imports write() from libc.so.6; shellcode writes PEOR to stdout.
@@ -1250,6 +1318,28 @@ def _find_clang_arm64() -> "str | None":
             if r.returncode == 0 and b"aarch64" in r.stdout:
                 return path
     return None
+
+
+def _find_qemu_user_arm64_wsl() -> "str | None":
+    """Return the WSL-side qemu-aarch64 user-mode-emulation binary name, or None.
+
+    qemu-user (not qemu-system-*) emulates a single ARM64 ELF binary directly on an
+    x86_64 host - no VM boot, no firmware, far simpler than the full-system QEMU path
+    the EFI-ARM tests use. Only usable via WSL since this binary doesn't exist on Windows.
+    """
+    if platform.system() != "Windows":
+        return None
+    try:
+        r = _wsl_bash_run(
+            "which qemu-aarch64-static 2>/dev/null || which qemu-aarch64 2>/dev/null",
+            capture_output=True, timeout=10,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    if r.returncode != 0:
+        return None
+    path = r.stdout.decode(errors="replace").strip()
+    return path or None
 
 
 def _find_clang_arm64_wsl() -> "tuple[str | None, bool]":

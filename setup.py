@@ -119,6 +119,8 @@ def _assemble_shellcodes():
     r_arm64     = assemble_arm64(ASM_DIR / 'relocations_resolver_arm64.asm', patch_pe_offset_pool=True)
     ctors_arm64 = assemble_arm64(ASM_DIR / 'ctors_runner_arm64.asm')
     e_efi_arm64_raw = assemble_arm64(ASM_DIR / 'entrypoint_resolver_efi_arm64.asm')
+    e_arm64_raw = assemble_arm64(ASM_DIR / 'entrypoint_resolver_arm64.asm')
+    i_arm64_linux = assemble_arm64(ASM_DIR / 'imports_resolver_arm64_linux.asm')
 
     r_arm32     = assemble_arm32(ASM_DIR / 'relocations_resolver_arm32.asm', patch_pe_offset_pool=True)
     ctors_arm32 = assemble_arm32(ASM_DIR / 'ctors_runner_arm32.asm')
@@ -151,6 +153,7 @@ def _assemble_shellcodes():
         ('entrypoint_resolver_efi32.asm',      e_efi32_raw),
         ('entrypoint_resolver_efi_arm64.asm',  e_efi_arm64_raw),
         ('entrypoint_resolver_efi_arm32.asm',  e_efi_arm32_raw),
+        ('entrypoint_resolver_arm64.asm',      e_arm64_raw),
     ]:
         if bytes(ep_raw).count(_EP_RVA_PLACEHOLDER) != 1:
             raise RuntimeError(f"Expected exactly one EP_RVA_MAGIC 0xCECECECE in {ep_name}")
@@ -160,6 +163,7 @@ def _assemble_shellcodes():
     e_efi32     = e_efi32_raw
     e_efi_arm64 = e_efi_arm64_raw
     e_efi_arm32 = e_efi_arm32_raw
+    e_arm64     = e_arm64_raw
 
     s64  = assemble(ASM_DIR / 'seh_registrar64.asm',         keystone.KS_ARCH_X86, keystone.KS_MODE_64)
     s32  = assemble(ASM_DIR / 'seh_registrar32.asm',         keystone.KS_ARCH_X86, keystone.KS_MODE_32)
@@ -230,6 +234,8 @@ def _assemble_shellcodes():
         f"RELOCS_ARM64           = bytes.fromhex('{r_arm64.hex()}')\n"
         f"CTORS_RUNNER_ARM64     = bytes.fromhex('{ctors_arm64.hex()}')\n"
         f"ENTRYPOINT_EFI_ARM64   = bytes.fromhex('{e_efi_arm64.hex()}')\n"
+        f"IMPORTS_ARM64_LINUX    = bytes.fromhex('{i_arm64_linux.hex()}')\n"
+        f"ENTRYPOINT_ARM64       = bytes.fromhex('{e_arm64.hex()}')\n"
         f"RELOCS_ARM32           = bytes.fromhex('{r_arm32.hex()}')\n"
         f"CTORS_RUNNER_ARM32     = bytes.fromhex('{ctors_arm32.hex()}')\n"
         f"ENTRYPOINT_EFI_ARM32   = bytes.fromhex('{e_efi_arm32.hex()}')\n"

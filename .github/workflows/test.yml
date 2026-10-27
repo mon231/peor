@@ -373,8 +373,6 @@ jobs:
     runs-on: windows-11-arm
 
     steps:
-      - uses: actions/checkout@v4
-
       # windows-11-arm GitHub-hosted runners have no WSL2 (confirmed by probing
       # `wsl --status` while iterating on this job), so we use the native-Windows
       # fallback: _find_clang_arm64/32 and _find_qemu_ovmf already probe PATH /
@@ -383,6 +381,11 @@ jobs:
       #
       # Cache the installed toolchain directories themselves (not just choco's
       # download cache) so a cache hit skips the slow choco installs entirely.
+      # This key is a static string (not hashFiles(...) on repo content), so it
+      # doesn't need the checkout to have happened yet — restore it first, before
+      # paying for checkout, to save time: a cache hit means the next few minutes
+      # of choco installs are skipped regardless of when checkout runs, and a cache
+      # miss costs nothing extra by going first either.
       - name: Cache native toolchain (LLVM/clang+lld, QEMU, CMake 3.31)
         id: cache-native-toolchain
         uses: actions/cache@v4
@@ -392,6 +395,8 @@ jobs:
             C:\Program Files\qemu
             C:\Program Files\CMake
           key: native-toolchain-windows-11-arm-llvm-qemu-cmake3316-v1
+
+      - uses: actions/checkout@v4
 
       - name: Install native clang/lld (LLVM) and QEMU via chocolatey
         if: steps.cache-native-toolchain.outputs.cache-hit != 'true'
@@ -448,7 +453,17 @@ jobs:
           $codeFd = "C:\Program Files\qemu\share\edk2-aarch64-code.fd"
           $varsSrc = "C:\Program Files\qemu\share\edk2-aarch64-vars.fd"
           $varsRw = Join-Path $tmp "AAVMF_VARS.fd"
-          Copy-Item $varsSrc $varsRw -Force
+          if (Test-Path $varsSrc) {
+            Copy-Item $varsSrc $varsRw -Force
+          } else {
+            # This choco qemu package ships no aarch64 vars file (only code.fd) -
+            # same fallback tests/pytest/test_shellcode.py uses: a zero-filled
+            # vars region sized to match the code firmware.
+            Write-Host "No $varsSrc - zero-filling vars file instead (matches test_shellcode.py's fallback)"
+            $codeSize = (Get-Item $codeFd).Length
+            [byte[]]$zeros = New-Object byte[] $codeSize
+            [System.IO.File]::WriteAllBytes($varsRw, $zeros)
+          }
           $bootDir = Join-Path $tmp "efi_boot"
           New-Item -ItemType Directory -Force -Path (Join-Path $bootDir "EFI\BOOT") | Out-Null
           Set-Content -Path (Join-Path $bootDir "EFI\BOOT\dummy.txt") -Value "x"

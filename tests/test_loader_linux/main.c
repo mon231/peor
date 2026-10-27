@@ -16,7 +16,22 @@
 #include <unistd.h>
 
 #define NOP_SLED_MAX_OFFSET 1024
-#define NOP_BYTE            ((uint8_t)0x90)
+#define NOP_BYTE            ((uint8_t)0x90)   /* x86/x64 single-byte NOP */
+
+/* ARM64 has no 1-byte NOP (fixed 4-byte instruction width) - fill the sled with
+ * the real 4-byte NOP encoding (nop_offset is always 16-byte aligned, so always
+ * a whole number of 4-byte instruction slots) instead of a repeating byte. */
+#if defined(__aarch64__)
+static const uint8_t NOP_WORD_ARM64[4] = {0x1F, 0x20, 0x03, 0xD5};
+static void fill_nop_sled(uint8_t *mem, size_t nop_offset) {
+    for (size_t i = 0; i < nop_offset; i += 4) {
+        mem[i + 0] = NOP_WORD_ARM64[0];
+        mem[i + 1] = NOP_WORD_ARM64[1];
+        mem[i + 2] = NOP_WORD_ARM64[2];
+        mem[i + 3] = NOP_WORD_ARM64[3];
+    }
+}
+#endif
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
@@ -57,7 +72,11 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+#if defined(__aarch64__)
+    fill_nop_sled(mem, nop_offset);
+#else
     memset(mem, NOP_BYTE, nop_offset);
+#endif
     uint8_t *shellcode_start = mem + nop_offset;
 
     ssize_t nread = read(fd, shellcode_start, size);

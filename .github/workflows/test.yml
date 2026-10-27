@@ -386,22 +386,28 @@ jobs:
       # paying for checkout, to save time: a cache hit means the next few minutes
       # of choco installs are skipped regardless of when checkout runs, and a cache
       # miss costs nothing extra by going first either.
-      - name: Cache native toolchain (LLVM/clang+lld, QEMU, CMake 3.31)
+      # QEMU is NOT installed via choco here (see the MSYS2 clangarm64 step below):
+      # choco's qemu package is an x64 Windows binary that runs under windows-11-arm's
+      # x64-emulation layer (Prism), and a real bisection run on this hardware (see
+      # progress.md, run 40459337924) proved that combination crashes QEMU's own
+      # CPU/TCG core bring-up instantly (0xC00000FF) before any guest code runs, with
+      # zero drives/firmware/devices attached - not a firmware or flag bug. We need a
+      # genuinely ARM64-native qemu-system-{aarch64,arm}.exe instead.
+      - name: Cache native toolchain (LLVM/clang+lld, CMake 3.31)
         id: cache-native-toolchain
         uses: actions/cache@v4
         with:
           path: |
             C:\Program Files\LLVM
-            C:\Program Files\qemu
             C:\Program Files\CMake
-          key: native-toolchain-windows-11-arm-llvm-qemu-cmake3316-v1
+          key: native-toolchain-windows-11-arm-llvm-cmake3316-v2
 
       - uses: actions/checkout@v4
 
-      - name: Install native clang/lld (LLVM) and QEMU via chocolatey
+      - name: Install native clang/lld (LLVM) via chocolatey
         if: steps.cache-native-toolchain.outputs.cache-hit != 'true'
         shell: pwsh
-        run: choco install llvm qemu -y --no-progress
+        run: choco install llvm -y --no-progress
 
       # keystone-engine's bundled (ancient, LLVM-derived) CMakeLists.txt sets
       # cmake_policy(SET CMP0051 OLD); CMake 4.x removed OLD support for that
@@ -418,7 +424,6 @@ jobs:
         shell: pwsh
         run: |
           echo "C:\Program Files\LLVM\bin" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
-          echo "C:\Program Files\qemu" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
           echo "C:\Program Files\CMake\bin" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
 
       - name: Verify clang ARM64/ARM32 mingw target support
@@ -429,97 +434,99 @@ jobs:
           clang --target=armv7-w64-mingw32 -print-effective-triple
           ld.lld --version
 
-      - name: Smoke-test QEMU binaries (full test run exits instantly with no stdout/stderr otherwise)
-        shell: pwsh
-        run: |
-          & "C:\Program Files\qemu\qemu-system-aarch64.exe" --version
-          Write-Host "exit: $LASTEXITCODE"
-          & "C:\Program Files\qemu\qemu-system-arm.exe" --version
-          Write-Host "exit: $LASTEXITCODE"
-          & "C:\Program Files\qemu\qemu-system-aarch64.exe" -machine help
-          Write-Host "exit: $LASTEXITCODE"
+      # choco's qemu package is an x64 Windows binary that runs under windows-11-arm's
+      # x64-emulation layer (Prism/xtajit). A real bisection on this exact hardware
+      # (progress.md, run 40459337924) proved that crashes QEMU's own CPU/TCG core
+      # bring-up instantly (0xC00000FF, ~756ms) with ZERO drives/firmware/devices
+      # attached — not a firmware, flag, or drive bug. The fix is a genuinely
+      # ARM64-native qemu-system-{aarch64,arm}.exe, not a different invocation of the
+      # x64 one. MSYS2's clangarm64 repo ships exactly that: mingw-w64-clang-aarch64-qemu
+      # is a real aarch64-target PE build (verified: packages.msys2.org shows a CI build
+      # of 11.1.2-1 with no architecture exclusion in its PKGBUILD — the gcc_struct/clang
+      # incompatibility that disabled this package upstream in 2024 has since been fixed
+      # upstream; weilnetz.de's qemu.weilnetz.de/aarch64/ "Windows on ARM" installer is
+      # an alternative native-ARM64 source if this one ever regresses).
+      - name: Set up MSYS2 CLANGARM64 (native ARM64-host QEMU)
+        id: msys2-arm64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANGARM64
+          install: mingw-w64-clang-aarch64-qemu
+          # release:true (the default) downloads MSYS2's own installer rather than
+          # reusing a preinstalled copy. windows-11-arm GitHub runner images ship no
+          # preinstalled MSYS2 at all, so release:false fails outright here (see
+          # msys2/setup-msys2#503 — closed as "no preinstalled MSYS2 on the ARM image").
 
-      # `--version`/`-machine help` above exit 0, but the real pytest invocation (full
-      # "-machine virt -cpu cortex-a57" + pflash drives + usb-storage device) dies
-      # instantly (returncode 3221225727 = 0xC00000FF) with empty stdout+stderr.
-      # Bisect which stage of that command triggers it: bare VM boot (TCG/accel core),
-      # pflash firmware (code-only, then +vars), the unattached vvfat boot drive, the
-      # xhci controller, then the full command with usb-storage attached.
-      - name: Bisect QEMU ARM64 invocation (isolate which flag/stage crashes)
+      - name: Arrange native ARM64 QEMU firmware layout + add to PATH
         shell: pwsh
         run: |
-          $qemu = "C:\Program Files\qemu\qemu-system-aarch64.exe"
-          $tmp = New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\qemu-bisect"
-          $codeFd = "C:\Program Files\qemu\share\edk2-aarch64-code.fd"
-          $varsSrc = "C:\Program Files\qemu\share\edk2-aarch64-vars.fd"
-          $varsRw = Join-Path $tmp "AAVMF_VARS.fd"
-          if (Test-Path $varsSrc) {
-            Copy-Item $varsSrc $varsRw -Force
-          } else {
-            # This choco qemu package ships no aarch64 vars file (only code.fd) -
-            # same fallback tests/pytest/test_shellcode.py uses: a zero-filled
-            # vars region sized to match the code firmware.
-            Write-Host "No $varsSrc - zero-filling vars file instead (matches test_shellcode.py's fallback)"
-            $codeSize = (Get-Item $codeFd).Length
-            [byte[]]$zeros = New-Object byte[] $codeSize
-            [System.IO.File]::WriteAllBytes($varsRw, $zeros)
+          $clangarm64 = Join-Path "${{ steps.msys2-arm64.outputs.msys2-location }}" "clangarm64"
+          $bin = Join-Path $clangarm64 "bin"
+          $shareQemu = Join-Path $clangarm64 "share\qemu"
+          $share = Join-Path $clangarm64 "share"
+          # _find_qemu_ovmf() (tests/pytest/test_shellcode.py) looks for firmware
+          # directly under "<qemu-exe-dir>\..\share\", but this MSYS2 package nests it
+          # one level deeper, under "share\qemu\" - copy up so no test code changes are
+          # needed. (edk2-aarch64-vars.fd doesn't exist in this package either, same gap
+          # as choco's; test_shellcode.py already zero-fills a vars file in that case,
+          # so that needs no CI-side workaround — only the *-code.fd files and ARM32's
+          # vars file, which this package does ship, need to be placed.)
+          Copy-Item (Join-Path $shareQemu "edk2-aarch64-code.fd") (Join-Path $share "edk2-aarch64-code.fd") -Force
+          Copy-Item (Join-Path $shareQemu "edk2-arm-code.fd") (Join-Path $share "edk2-arm-code.fd") -Force
+          Copy-Item (Join-Path $shareQemu "edk2-arm-vars.fd") (Join-Path $share "edk2-arm-vars.fd") -Force
+          echo $bin | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
+
+      - name: Verify QEMU binaries are genuinely ARM64-native (not x64-under-emulation)
+        shell: pwsh
+        run: |
+          function Get-PEMachine {
+            param([string]$Path)
+            $bytes = [System.IO.File]::ReadAllBytes($Path)
+            $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
+            # The 2-byte Machine field sits right after the 4-byte "PE\0\0" signature.
+            return [BitConverter]::ToUInt16($bytes, $peOffset + 4)
           }
-          $bootDir = Join-Path $tmp "efi_boot"
-          New-Item -ItemType Directory -Force -Path (Join-Path $bootDir "EFI\BOOT") | Out-Null
-          Set-Content -Path (Join-Path $bootDir "EFI\BOOT\dummy.txt") -Value "x"
-
-          function Test-QemuConfig {
-            param([string]$Label, [string[]]$ExtraArgs)
-            $baseArgs = @("-nographic", "-machine", "virt", "-cpu", "cortex-a57", "-m", "256M", "-no-reboot")
-            $allArgs = $baseArgs + $ExtraArgs
-            Write-Host "=== $Label ==="
-            Write-Host "$qemu $($allArgs -join ' ')"
-            $outFile = Join-Path $tmp "out.txt"; $errFile = Join-Path $tmp "err.txt"
-            Remove-Item $outFile, $errFile -ErrorAction SilentlyContinue
-            $sw = [System.Diagnostics.Stopwatch]::StartNew()
-            $proc = Start-Process -FilePath $qemu -ArgumentList $allArgs -PassThru -NoNewWindow `
-              -RedirectStandardOutput $outFile -RedirectStandardError $errFile
-            $exited = $proc.WaitForExit(8000)
-            $sw.Stop()
-            if ($exited) {
-              Write-Host "-> exited after $($sw.ElapsedMilliseconds) ms, code=$($proc.ExitCode)"
-            } else {
-              Write-Host "-> still running after 8000ms (no instant crash) - killing"
-              try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch {}
+          $clangarm64 = Join-Path "${{ steps.msys2-arm64.outputs.msys2-location }}" "clangarm64"
+          foreach ($exe in @("qemu-system-aarch64.exe", "qemu-system-arm.exe")) {
+            $path = Join-Path $clangarm64 "bin\$exe"
+            $m = Get-PEMachine $path
+            $mHex = "0x{0:X4}" -f $m
+            Write-Host "$exe -> PE header Machine = $mHex"
+            # IMAGE_FILE_MACHINE_ARM64 = 0xAA64; x64 (choco's crashing binary) = 0x8664.
+            if ($m -ne 0xAA64) {
+              throw "$exe is NOT an ARM64-native PE binary (Machine=$mHex) - would hit the same x64-under-emulation crash as choco's qemu"
             }
-            $o = Get-Content $outFile -Raw -ErrorAction SilentlyContinue
-            $e = Get-Content $errFile -Raw -ErrorAction SilentlyContinue
-            Write-Host "stdout: $o"
-            Write-Host "stderr: $e"
-            Write-Host ""
           }
 
-          Test-QemuConfig -Label "1-no-drives-no-devices" -ExtraArgs @()
-          Test-QemuConfig -Label "2-code-pflash-only" -ExtraArgs @(
-            "-drive", "if=pflash,format=raw,readonly=on,file=$codeFd"
-          )
-          Test-QemuConfig -Label "3-code+vars-pflash" -ExtraArgs @(
-            "-drive", "if=pflash,format=raw,readonly=on,file=$codeFd",
-            "-drive", "if=pflash,format=raw,file=$varsRw"
-          )
-          Test-QemuConfig -Label "4-+unattached-vvfat-boot-drive" -ExtraArgs @(
-            "-drive", "if=pflash,format=raw,readonly=on,file=$codeFd",
-            "-drive", "if=pflash,format=raw,file=$varsRw",
-            "-drive", "id=boot,if=none,format=vvfat,file=fat:rw:$bootDir,fat-type=16"
-          )
-          Test-QemuConfig -Label "5-+xhci-device" -ExtraArgs @(
-            "-drive", "if=pflash,format=raw,readonly=on,file=$codeFd",
-            "-drive", "if=pflash,format=raw,file=$varsRw",
-            "-drive", "id=boot,if=none,format=vvfat,file=fat:rw:$bootDir,fat-type=16",
-            "-device", "qemu-xhci"
-          )
-          Test-QemuConfig -Label "6-full-with-usb-storage" -ExtraArgs @(
-            "-drive", "if=pflash,format=raw,readonly=on,file=$codeFd",
-            "-drive", "if=pflash,format=raw,file=$varsRw",
-            "-drive", "id=boot,if=none,format=vvfat,file=fat:rw:$bootDir,fat-type=16",
-            "-device", "qemu-xhci",
-            "-device", "usb-storage,drive=boot"
-          )
+      - name: Smoke-test native ARM64 QEMU boot (minimal invocation, no drives/firmware)
+        shell: pwsh
+        run: |
+          # Same minimal shape that instantly crashed the x64 choco binary under
+          # emulation (-nographic -machine virt -cpu cortex-a57 -m 256M -no-reboot,
+          # zero drives/devices: 756ms, 0xC00000FF). If this native ARM64 binary has
+          # the same problem, fail fast here instead of burning time on the full
+          # pytest run.
+          $outFile = Join-Path $env:RUNNER_TEMP "smoke-out.txt"
+          $errFile = Join-Path $env:RUNNER_TEMP "smoke-err.txt"
+          $argList = @("-nographic", "-machine", "virt", "-cpu", "cortex-a57", "-m", "256M", "-no-reboot")
+          $sw = [System.Diagnostics.Stopwatch]::StartNew()
+          $proc = Start-Process -FilePath "qemu-system-aarch64.exe" -ArgumentList $argList -PassThru -NoNewWindow `
+            -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+          $exited = $proc.WaitForExit(8000)
+          $sw.Stop()
+          if ($exited) {
+            $stdout = Get-Content $outFile -Raw -ErrorAction SilentlyContinue
+            $stderr = Get-Content $errFile -Raw -ErrorAction SilentlyContinue
+            Write-Host "exited after $($sw.ElapsedMilliseconds) ms, code=$($proc.ExitCode)"
+            Write-Host "stdout: $stdout"
+            Write-Host "stderr: $stderr"
+            if ($sw.ElapsedMilliseconds -lt 3000) {
+              throw "QEMU exited almost instantly ($($sw.ElapsedMilliseconds) ms) - same instant-crash signature as the x64 binary under emulation"
+            }
+          } else {
+            Write-Host "still running after 8000ms (expected: no boot device attached, so it just spins) - no instant crash, killing"
+            try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch {}
+          }
 
       - uses: actions/setup-python@v5
         with:

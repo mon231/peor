@@ -434,6 +434,78 @@ jobs:
           & "C:\Program Files\qemu\qemu-system-aarch64.exe" -machine help
           Write-Host "exit: $LASTEXITCODE"
 
+      # `--version`/`-machine help` above exit 0, but the real pytest invocation (full
+      # "-machine virt -cpu cortex-a57" + pflash drives + usb-storage device) dies
+      # instantly (returncode 3221225727 = 0xC00000FF) with empty stdout+stderr.
+      # Bisect which stage of that command triggers it: bare VM boot (TCG/accel core),
+      # pflash firmware (code-only, then +vars), the unattached vvfat boot drive, the
+      # xhci controller, then the full command with usb-storage attached.
+      - name: Bisect QEMU ARM64 invocation (isolate which flag/stage crashes)
+        shell: pwsh
+        run: |
+          $qemu = "C:\Program Files\qemu\qemu-system-aarch64.exe"
+          $tmp = New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\qemu-bisect"
+          $codeFd = "C:\Program Files\qemu\share\edk2-aarch64-code.fd"
+          $varsSrc = "C:\Program Files\qemu\share\edk2-aarch64-vars.fd"
+          $varsRw = Join-Path $tmp "AAVMF_VARS.fd"
+          Copy-Item $varsSrc $varsRw -Force
+          $bootDir = Join-Path $tmp "efi_boot"
+          New-Item -ItemType Directory -Force -Path (Join-Path $bootDir "EFI\BOOT") | Out-Null
+          Set-Content -Path (Join-Path $bootDir "EFI\BOOT\dummy.txt") -Value "x"
+
+          function Test-QemuConfig {
+            param([string]$Label, [string[]]$ExtraArgs)
+            $baseArgs = @("-nographic", "-machine", "virt", "-cpu", "cortex-a57", "-m", "256M", "-no-reboot")
+            $allArgs = $baseArgs + $ExtraArgs
+            Write-Host "=== $Label ==="
+            Write-Host "$qemu $($allArgs -join ' ')"
+            $outFile = Join-Path $tmp "out.txt"; $errFile = Join-Path $tmp "err.txt"
+            Remove-Item $outFile, $errFile -ErrorAction SilentlyContinue
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            $proc = Start-Process -FilePath $qemu -ArgumentList $allArgs -PassThru -NoNewWindow `
+              -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+            $exited = $proc.WaitForExit(8000)
+            $sw.Stop()
+            if ($exited) {
+              Write-Host "-> exited after $($sw.ElapsedMilliseconds) ms, code=$($proc.ExitCode)"
+            } else {
+              Write-Host "-> still running after 8000ms (no instant crash) - killing"
+              try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch {}
+            }
+            $o = Get-Content $outFile -Raw -ErrorAction SilentlyContinue
+            $e = Get-Content $errFile -Raw -ErrorAction SilentlyContinue
+            Write-Host "stdout: $o"
+            Write-Host "stderr: $e"
+            Write-Host ""
+          }
+
+          Test-QemuConfig -Label "1-no-drives-no-devices" -ExtraArgs @()
+          Test-QemuConfig -Label "2-code-pflash-only" -ExtraArgs @(
+            "-drive", "if=pflash,format=raw,readonly=on,file=$codeFd"
+          )
+          Test-QemuConfig -Label "3-code+vars-pflash" -ExtraArgs @(
+            "-drive", "if=pflash,format=raw,readonly=on,file=$codeFd",
+            "-drive", "if=pflash,format=raw,file=$varsRw"
+          )
+          Test-QemuConfig -Label "4-+unattached-vvfat-boot-drive" -ExtraArgs @(
+            "-drive", "if=pflash,format=raw,readonly=on,file=$codeFd",
+            "-drive", "if=pflash,format=raw,file=$varsRw",
+            "-drive", "id=boot,if=none,format=vvfat,file=fat:rw:$bootDir,fat-type=16"
+          )
+          Test-QemuConfig -Label "5-+xhci-device" -ExtraArgs @(
+            "-drive", "if=pflash,format=raw,readonly=on,file=$codeFd",
+            "-drive", "if=pflash,format=raw,file=$varsRw",
+            "-drive", "id=boot,if=none,format=vvfat,file=fat:rw:$bootDir,fat-type=16",
+            "-device", "qemu-xhci"
+          )
+          Test-QemuConfig -Label "6-full-with-usb-storage" -ExtraArgs @(
+            "-drive", "if=pflash,format=raw,readonly=on,file=$codeFd",
+            "-drive", "if=pflash,format=raw,file=$varsRw",
+            "-drive", "id=boot,if=none,format=vvfat,file=fat:rw:$bootDir,fat-type=16",
+            "-device", "qemu-xhci",
+            "-device", "usb-storage,drive=boot"
+          )
+
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}

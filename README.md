@@ -438,6 +438,13 @@ header (or the RVA supplied by `--entry`).  If `IMAGE_FILE_DLL` is set in
 correct calling convention (x86 stdcall / x64 Microsoft ABI).  For EXEs it
 jumps directly to the entry point.
 
+`entrypoint_resolver_arm64.asm` / `entrypoint_resolver_arm32.asm` are the ARM64/
+ARM32 (Thumb-2) analogs for the generic (non-EFI) Windows chain, using AAPCS64/
+AAPCS32's calling convention instead (no shadow space, unlike x64's Microsoft
+ABI). Same `DllMain`-vs-OEP dispatch logic; `EP_RVA_MAGIC` is patched via a
+literal-pool slot rather than folded into a `mov`/`movz` immediate, since ARM's
+fixed-width instructions can't hold a raw, byte-searchable 32-bit value inline.
+
 ---
 
 ## Module Structure
@@ -609,13 +616,22 @@ and the native `test_loader.exe` for execution.
 
 ## Supported PE Types
 
-| Type | x86 | x64 |
-|---|---|---|
-| Windows GUI/console EXE | ✅ | ✅ |
-| Windows DLL | ✅ | ✅ |
-| Linux user-mode EXE (POSIX\_CUI, subsystem 7) | ✅ | ✅ |
-| EFI application (subsystems 10–13) | ✅ | ✅ |
-| Windows kernel driver | ❌ | ❌ |
+| Type | x86 | x64 | ARM64 | ARM32 |
+|---|---|---|---|---|
+| Windows GUI/console EXE | ✅ | ✅ | ⚠️¹ | ⚠️¹ |
+| Windows DLL | ✅ | ✅ | ⚠️¹ | ⚠️¹ |
+| Linux user-mode EXE (POSIX\_CUI, subsystem 7) | ✅ | ✅ | ✅ | ❌ |
+| EFI application (subsystems 10–13) | ✅ | ✅ | ✅ | ✅ |
+| Windows kernel driver | ❌ | ❌ | ❌ | ❌ |
+
+¹ ARM64/ARM32 Windows GUI/console EXE/DLL support is landing incrementally
+(see `docs/superpowers/plans/2026-10-26-windows-arm-pe-support.md`): relocations,
+the entry-point dispatcher (`DllMain`/OEP), and `.init_array` ctors are wired
+today; usermode imports, delay-load imports, TLS callbacks, SEH and C++ EH land
+in later tasks of that plan. `_select_chain` correctly dispatches a real ARM64/
+ARM32 Windows PE to its own chain instead of silently falling through to x64/x86
+(same `pe_type` — PE32+/PE32 — but a different `machine` field) regardless of
+how much of the chain is implemented so far.
 
 Attempting to convert unsupported combinations raises `ValueError` or `PeorUnsupportedError` with a descriptive message.
 

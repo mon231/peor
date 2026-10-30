@@ -53,10 +53,24 @@ int main(int argc, char *argv[]) {
     }
     size_t size = (size_t)st.st_size;
 
+#if defined(__aarch64__)
+    /* AArch64 PIC (adrp/ldr, which any non-trivial compiled PE's own code uses
+       throughout to reach its own .rdata/IAT) is page-granular: it only computes
+       correct addresses when the *embedded PE's* runtime base is congruent to its
+       link-time ImageBase modulo the page size - i.e. page-aligned. mmap() below
+       always returns a page-aligned address, so nop_offset must stay exactly 0
+       (peor's _PLATFORM_LINUX_ARM64 chain pads its stub prefix to a page-size
+       multiple - see peor/_chain_builder.py's 'pe_align': 4096 - so the embedded
+       PE itself lands on the next page boundary after this zero offset).
+       x86/x64 have no such requirement (RIP-relative LEA is byte-granular), which
+       is why only ARM64 pins this to 0 instead of randomizing within the sled. */
+    size_t nop_offset = 0;
+#else
     /* Keep nop_offset 16-byte aligned so the PE image is always 16-byte aligned
        for MOVDQA/MOVAPS instructions in the shellcode. */
     srand((unsigned)getpid());
     size_t nop_offset = (size_t)(1 + (rand() % (NOP_SLED_MAX_OFFSET / 16))) * 16;
+#endif
     size_t total      = size + NOP_SLED_MAX_OFFSET + 4096;
 
     /* Declare as volatile so GCC always reloads mem/total from the stack slot

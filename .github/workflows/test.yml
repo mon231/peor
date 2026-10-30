@@ -359,13 +359,289 @@ jobs:
         run: pytest tests/pytest -v --timeout=360 -k "efi"
 
 # ─────────────────────────────────────────────────────────────────────────────
+# test-efi-windows-arm: run the same EFI ARM32/ARM64 tests on real windows-11-arm
+# hardware (GitHub-hosted), in addition to test-efi-qemu's emulated coverage.
+# ─────────────────────────────────────────────────────────────────────────────
+  test-efi-windows-arm:
+    runs-on: windows-11-arm
+
+    steps:
+      # windows-11-arm GitHub-hosted runners have no WSL2 (confirmed by probing
+      # `wsl --status` while iterating on this job), so we use the native-Windows
+      # fallback: _find_clang_arm64/32 and _find_qemu_ovmf already probe PATH /
+      # "C:\Program Files\..." natively first, so installing real native toolchains
+      # here needs zero test_shellcode.py changes.
+      #
+      # Cache the installed toolchain directories themselves (not just choco's
+      # download cache) so a cache hit skips the slow choco installs entirely.
+      # This key is a static string (not hashFiles(...) on repo content), so it
+      # doesn't need the checkout to have happened yet — restore it first, before
+      # paying for checkout, to save time: a cache hit means the next few minutes
+      # of choco installs are skipped regardless of when checkout runs, and a cache
+      # miss costs nothing extra by going first either.
+      # QEMU is NOT installed via choco here (see the MSYS2 clangarm64 step below):
+      # choco's qemu package is an x64 Windows binary that runs under windows-11-arm's
+      # x64-emulation layer (Prism), and a real bisection run on this hardware (see
+      # progress.md, run 40459337924) proved that combination crashes QEMU's own
+      # CPU/TCG core bring-up instantly (0xC00000FF) before any guest code runs, with
+      # zero drives/firmware/devices attached - not a firmware or flag bug. We need a
+      # genuinely ARM64-native qemu-system-{aarch64,arm}.exe instead.
+      - name: Cache native toolchain (LLVM/clang+lld, CMake 3.31)
+        id: cache-native-toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:\Program Files\LLVM
+            C:\Program Files\CMake
+          key: native-toolchain-windows-11-arm-llvm-cmake3316-v2
+
+      - uses: actions/checkout@v4
+
+      - name: Install native clang/lld (LLVM) via chocolatey
+        if: steps.cache-native-toolchain.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: choco install llvm -y --no-progress
+
+      # keystone-engine's bundled (ancient, LLVM-derived) CMakeLists.txt sets
+      # cmake_policy(SET CMP0051 OLD); CMake 4.x removed OLD support for that
+      # policy outright (not just deprecated it), so the VS-bundled CMake 4.4
+      # hard-fails. Install an older 3.x CMake and put it ahead of VS's on PATH.
+      - name: Install CMake 3.31 (keystone-engine's CMakeLists.txt needs CMP0051 OLD, removed in CMake 4.x)
+        if: steps.cache-native-toolchain.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: choco install cmake --version=3.31.6 --installargs 'ADD_CMAKE_TO_PATH=System' -y --no-progress --force
+
+      # PATH additions must happen every run (cache restores files, not the
+      # job's PATH), regardless of whether the cache step above hit or missed.
+      - name: Add native toolchain to PATH
+        shell: pwsh
+        run: |
+          echo "C:\Program Files\LLVM\bin" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
+          echo "C:\Program Files\CMake\bin" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
+
+      - name: Verify clang ARM64/ARM32 mingw target support
+        shell: pwsh
+        run: |
+          clang --version
+          clang --target=aarch64-w64-mingw32 -print-effective-triple
+          clang --target=armv7-w64-mingw32 -print-effective-triple
+          ld.lld --version
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # keystone-engine (peor's build+runtime dependency, assembles the resolver
+      # ASM stubs) ships no prebuilt win_arm64 wheel on PyPI, so pip must build it
+      # from source here (an LLVM-derived subset) — slow, so cache pip's wheel
+      # cache too: once built once, a pyproject.toml-keyed cache hit lets pip
+      # reuse the built keystone-engine wheel instead of recompiling it.
+      - name: Cache pip wheel cache (keystone-engine build-from-source is slow)
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\pip\Cache
+          key: pip-wheels-windows-11-arm-${{ hashFiles('pyproject.toml', 'setup.py') }}
+
+      # Needed for the keystone-engine source build above: an MSVC dev environment
+      # on PATH (nmake/cl). NOTE: this action writes a "Path" var via $GITHUB_ENV
+      # (visible in its log as "Setting Path") rather than appending via
+      # $GITHUB_PATH, which replaces the PATH subsequent steps inherit instead of
+      # layering onto it. That silently dropped a PATH entry added in an earlier
+      # step in practice (see the MSYS2/QEMU steps below, which learned this the
+      # hard way and were moved to AFTER this step as a result) - do not add
+      # anything to PATH before this step and assume it survives to later ones.
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: arm64
+
+      - name: Install Python dependencies
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+        shell: pwsh
+        run: |
+          # pwsh does not stop a multi-line script just because a native command
+          # (pip) exits non-zero, so check explicitly after each one or a failed
+          # keystone-engine build would silently fall through to "success".
+          python -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pip install -e .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pip install pytest pytest-timeout
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build prebuilt EFI test-source PEs (build_tests.py)
+        run: python tests/build_tests.py --target efi
+
+      # choco's qemu package is an x64 Windows binary that runs under windows-11-arm's
+      # x64-emulation layer (Prism/xtajit). A real bisection on this exact hardware
+      # (progress.md, run 40459337924) proved that crashes QEMU's own CPU/TCG core
+      # bring-up instantly (0xC00000FF, ~756ms) with ZERO drives/firmware/devices
+      # attached — not a firmware, flag, or drive bug. The fix is a genuinely
+      # ARM64-native qemu-system-{aarch64,arm}.exe, not a different invocation of the
+      # x64 one. MSYS2's clangarm64 repo ships exactly that: mingw-w64-clang-aarch64-qemu
+      # is a real aarch64-target PE build (verified: packages.msys2.org shows a CI build
+      # of 11.1.2-1 with no architecture exclusion in its PKGBUILD — the gcc_struct/clang
+      # incompatibility that disabled this package upstream in 2024 has since been fixed
+      # upstream; weilnetz.de's qemu.weilnetz.de/aarch64/ "Windows on ARM" installer is
+      # an alternative native-ARM64 source if this one ever regresses).
+      #
+      # Placed here (after setup-python/msvc-dev-cmd/build_tests.py, immediately before
+      # the pytest step that actually needs qemu) deliberately: an earlier attempt placed
+      # this block before setup-python, and ilammy/msvc-dev-cmd@v1 further down clobbered
+      # that PATH addition (see the comment on that step) - qemu-system-aarch64 came up
+      # "not found" via shutil.which() in the pytest run despite the exe genuinely being
+      # there and PE-verified ARM64-native earlier in that same run. Keeping this as the
+      # LAST thing to touch PATH before pytest sidesteps the problem regardless of root
+      # cause.
+      - name: Set up MSYS2 CLANGARM64 (native ARM64-host QEMU)
+        id: msys2-arm64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANGARM64
+          install: mingw-w64-clang-aarch64-qemu
+          # release:true (the default) downloads MSYS2's own installer rather than
+          # reusing a preinstalled copy. windows-11-arm GitHub runner images ship no
+          # preinstalled MSYS2 at all, so release:false fails outright here (see
+          # msys2/setup-msys2#503 — closed as "no preinstalled MSYS2 on the ARM image").
+
+      # Copy the MSYS2-built binaries, their DLL dependencies, and firmware straight
+      # into C:\Program Files\qemu\ - the exact hardcoded fallback path
+      # _find_qemu_ovmf() (tests/pytest/test_shellcode.py) already probes when
+      # shutil.which() returns None, i.e. the same mechanism choco's install relied
+      # on. Deliberately NOT using $GITHUB_PATH for this: two earlier attempts added
+      # the clangarm64\bin dir to PATH instead, and that PATH entry demonstrably
+      # vanished by the time the pytest step ran (confirmed via a throwaway
+      # diagnostic step - GH Actions' per-step env dump showed a stale "Path" value,
+      # set once by ilammy/msvc-dev-cmd@v1 via $GITHUB_ENV, missing our later
+      # addition - even though the exact same binary WAS found correctly one step
+      # earlier via the exact same PATH mechanism). Rather than chase that
+      # case-sensitivity/env-merge ambiguity (Windows "Path" vs "PATH" as literal,
+      # possibly-distinct keys in the runner's env dict) further, sidestep PATH
+      # for qemu entirely.
+      - name: Install native ARM64 QEMU + firmware into the hardcoded fallback path
+        shell: pwsh
+        run: |
+          $clangarm64Bin = Join-Path (Join-Path "${{ steps.msys2-arm64.outputs.msys2-location }}" "clangarm64") "bin"
+          $shareQemu = Join-Path (Join-Path "${{ steps.msys2-arm64.outputs.msys2-location }}" "clangarm64") "share\qemu"
+          $qemuDir = "C:\Program Files\qemu"
+          $qemuShare = Join-Path $qemuDir "share"
+          New-Item -ItemType Directory -Force -Path $qemuDir, $qemuShare | Out-Null
+          # The two system emulators plus every DLL in the same bin dir (MSYS2 builds
+          # are dynamically linked against glib/pixman/gnutls/etc.; copying the whole
+          # set rather than hand-picking is simpler and correct either way since it's
+          # just this one package's own bin directory, not the full toolchain).
+          Copy-Item (Join-Path $clangarm64Bin "qemu-system-aarch64.exe") $qemuDir -Force
+          Copy-Item (Join-Path $clangarm64Bin "qemu-system-arm.exe") $qemuDir -Force
+          Copy-Item (Join-Path $clangarm64Bin "*.dll") $qemuDir -Force
+          # _find_qemu_ovmf() looks for firmware directly under "<qemu-exe-dir>\share\",
+          # but this MSYS2 package nests it one level deeper, under "share\qemu\" -
+          # copy up so no test code changes are needed. (edk2-aarch64-vars.fd doesn't
+          # exist in this package either, same gap choco's had; test_shellcode.py
+          # already zero-fills a vars file when none is found, so that needs no
+          # CI-side workaround — only the *-code.fd files and ARM32's vars file,
+          # which this package does ship, need to be placed.)
+          Copy-Item (Join-Path $shareQemu "edk2-aarch64-code.fd") (Join-Path $qemuShare "edk2-aarch64-code.fd") -Force
+          Copy-Item (Join-Path $shareQemu "edk2-arm-code.fd") (Join-Path $qemuShare "edk2-arm-code.fd") -Force
+          Copy-Item (Join-Path $shareQemu "edk2-arm-vars.fd") (Join-Path $qemuShare "edk2-arm-vars.fd") -Force
+          # QEMU's OWN internal resource lookup (independent of _find_qemu_ovmf above)
+          # resolves its bundled ROMs/keymaps/BIOS blobs (efi-virtio.rom, etc.) relative
+          # to its binary's install prefix, at "<exe-dir>\..\share\qemu\" by convention -
+          # copy the whole directory tree so that lookup succeeds too. This coexists
+          # fine with the flat *.fd copies above (two different consumers, two
+          # different relative paths, same parent "share" dir).
+          New-Item -ItemType Directory -Force -Path (Join-Path $qemuShare "qemu") | Out-Null
+          Copy-Item -Recurse -Force (Join-Path $shareQemu "*") (Join-Path $qemuShare "qemu")
+          # QEMU's OWN internal resource lookup (independent of _find_qemu_ovmf above)
+          # resolves its bundled ROMs/keymaps/BIOS blobs (efi-virtio.rom, etc.) via
+          # get_relocated_path() (util/cutils.c): the build's CONFIG_QEMU_DATADIR
+          # (/clangarm64/share/qemu) is re-rooted onto the running exe's directory,
+          # treating that as the MSYS2 "<prefix>\bin" dir — so the search lands at
+          # "<exe-dir>\..\share\qemu", i.e. C:\Program Files\share\qemu for the exe at
+          # C:\Program Files\qemu\. Run 41037146428 proved the choco-convention copy
+          # above (C:\Program Files\qemu\share\qemu) is NOT searched: it exited with
+          # "failed to find romfile efi-virtio.rom" (the default -machine virt NIC,
+          # virtio-net-pci, needs that rom even with no drives attached) with this exact
+          # tree present there. Copy the same tree to the MSYS2-relocated location too.
+          $shareDirRoot = Split-Path $qemuDir -Parent
+          $relocatedShareQemu = Join-Path (Join-Path $shareDirRoot "share") "qemu"
+          New-Item -ItemType Directory -Force -Path $relocatedShareQemu | Out-Null
+          Copy-Item -Recurse -Force (Join-Path $shareQemu "*") $relocatedShareQemu -ErrorAction Stop
+          # Loud guard: without efi-virtio.rom here, every QEMU invocation (incl. the real
+          # pytest ones, which auto-add a default NIC) dies with "failed to find romfile".
+          if (-not (Test-Path (Join-Path $relocatedShareQemu "efi-virtio.rom"))) {
+            throw "efi-virtio.rom missing at $relocatedShareQemu - QEMU's internal rom lookup will fail"
+          }
+          Get-ChildItem $qemuDir | Select-Object Name | Format-Table -AutoSize
+
+      - name: Verify QEMU binaries are genuinely ARM64-native (not x64-under-emulation)
+        shell: pwsh
+        run: |
+          function Get-PEMachine {
+            param([string]$Path)
+            $bytes = [System.IO.File]::ReadAllBytes($Path)
+            $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
+            # The 2-byte Machine field sits right after the 4-byte "PE\0\0" signature.
+            return [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+          }
+          foreach ($exe in @("qemu-system-aarch64.exe", "qemu-system-arm.exe")) {
+            $path = "C:\Program Files\qemu\$exe"
+            $m = Get-PEMachine $path
+            $mHex = "0x{0:X4}" -f $m
+            Write-Host "$exe -> PE header Machine = $mHex"
+            # IMAGE_FILE_MACHINE_ARM64 = 0xAA64; x64 (choco's crashing binary) = 0x8664.
+            if ($m -ne 0xAA64) {
+              throw "$exe is NOT an ARM64-native PE binary (Machine=$mHex) - would hit the same x64-under-emulation crash as choco's qemu"
+            }
+          }
+
+      - name: Smoke-test native ARM64 QEMU boot (minimal invocation, no drives/firmware)
+        shell: pwsh
+        run: |
+          # Same minimal shape that instantly crashed the x64 choco binary under
+          # emulation (-nographic -machine virt -cpu cortex-a57 -m 256M -no-reboot,
+          # zero drives/devices: 756ms, 0xC00000FF). If this native ARM64 binary has
+          # the same problem, fail fast here instead of burning time on the full
+          # pytest run. Uses the full hardcoded path (not a bare name off PATH) to
+          # match exactly how the real pytest run will invoke it via
+          # _find_qemu_ovmf()'s fallback.
+          # -nic none is REQUIRED for this to actually have zero devices: without any
+          # -nic/-net option QEMU silently adds its default NIC (virtio-net-pci on
+          # -machine virt), whose option rom (efi-virtio.rom) is looked up from QEMU's
+          # own internal share/qemu search path (see the install step above) — a MISSING
+          # rom there produces a REAL QEMU exit("failed to find romfile ...") in ~1.5s,
+          # which is below this step's 3s instant-crash heuristic and would misfire it.
+          $outFile = Join-Path $env:RUNNER_TEMP "smoke-out.txt"
+          $errFile = Join-Path $env:RUNNER_TEMP "smoke-err.txt"
+          $argList = @("-nographic", "-nic", "none", "-machine", "virt", "-cpu", "cortex-a57", "-m", "256M", "-no-reboot")
+          $sw = [System.Diagnostics.Stopwatch]::StartNew()
+          $proc = Start-Process -FilePath "C:\Program Files\qemu\qemu-system-aarch64.exe" -ArgumentList $argList -PassThru -NoNewWindow `
+            -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+          $exited = $proc.WaitForExit(8000)
+          $sw.Stop()
+          if ($exited) {
+            $stdout = Get-Content $outFile -Raw -ErrorAction SilentlyContinue
+            $stderr = Get-Content $errFile -Raw -ErrorAction SilentlyContinue
+            Write-Host "exited after $($sw.ElapsedMilliseconds) ms, code=$($proc.ExitCode)"
+            Write-Host "stdout: $stdout"
+            Write-Host "stderr: $stderr"
+            if ($sw.ElapsedMilliseconds -lt 3000) {
+              throw "QEMU exited almost instantly ($($sw.ElapsedMilliseconds) ms) - same instant-crash signature as the x64 binary under emulation"
+            }
+          } else {
+            Write-Host "still running after 8000ms (expected: no boot device attached, so it just spins) - no instant crash, killing"
+            try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch {}
+          }
+
+      - name: Run EFI shellcode tests (ARM64 + ARM32, real windows-11-arm hardware)
+        run: pytest tests/pytest -v --timeout=360 -k "efi and (arm64 or arm32)"
+
+# ─────────────────────────────────────────────────────────────────────────────
 # test-summary: single required gate — fails unless every job above PASSED.
 # No test in this workflow is allowed to silently skip (missing binaries/toolchains
 # are hard failures, see PLAN.md), so "success" is the only acceptable result here.
 # ─────────────────────────────────────────────────────────────────────────────
   test-summary:
     runs-on: ubuntu-latest
-    if: always()
     needs:
       - build-windows
       - build-windows-debug
@@ -374,6 +650,7 @@ jobs:
       - build-linux-mingw
       - test-linux-mingw
       - test-efi-qemu
+      - test-efi-windows-arm
     steps:
       - name: Verify every job passed
         run: |

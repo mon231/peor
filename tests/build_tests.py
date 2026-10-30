@@ -32,6 +32,7 @@ NOT built here — needs MSBuild, see tests/tests.sln:
 """
 import sys
 import importlib.util
+import platform
 import subprocess
 from pathlib import Path
 
@@ -145,25 +146,48 @@ def build_efi_source_pes() -> None:
             _report(f"efi {arch}/{test_name}", ok, detail)
 
     # 04_cpp_exceptions: x64/x86 via g++-posix (DWARF/SJLJ EH), arm32 via clang + sjlj_arm32.c
+    #
+    # Windows-host fallback: a natively-installed MSYS2 g++ can fail to link this
+    # freestanding EFI PE outright on toolchain drift (MSYS2 GCC 16's prebuilt
+    # libsupc++.a references CRT symbols — __stack_chk_fail/__chk_fail/_tls_index/
+    # __mingw_snprintf — that a -nostdlib EFI link doesn't provide; its older releases
+    # linked cleanly). When the native attempt fails, retry the identical compile
+    # through WSL's Ubuntu gcc-mingw-w64 g++-posix toolchain: same source, same
+    # artifact, whatever g++ actually links. CI is unaffected (its only toolchain is
+    # Ubuntu's own mingw, which builds this fine — the retry triggers only after a
+    # first failure).
     cpp_targets = [
-        ("x64", ts._EFI_PREBUILT_X64, gpp64_cmd, "x86_64-w64-mingw32-g++-posix",
-         lambda out: ts._compile_cpp_pe(ts._EFI_CPP_EXCEPTIONS_SRC, out, gpp64_wsl, "efi_main", "10", arch="x64")),
-        ("x86", ts._EFI_PREBUILT_X86, gpp32_cmd, "i686-w64-mingw32-g++-posix",
-         lambda out: ts._compile_cpp_pe(ts._EFI_CPP_EXCEPTIONS_SRC, out, gpp32_wsl, "efi_main", "10", arch="x86")),
-        ("arm32", ts._EFI_PREBUILT_ARM32, clang32, "clang (armv7-w64-mingw32)",
-         lambda out: ts._compile_efi_pe_arm32(
+        ("x64", ts._EFI_PREBUILT_X64, gpp64_cmd, "x86_64-w64-mingw32-g++-posix", gpp64_wsl,
+         lambda out, use_wsl: ts._compile_cpp_pe(ts._EFI_CPP_EXCEPTIONS_SRC, out, use_wsl, "efi_main", "10", arch="x64")),
+        ("x86", ts._EFI_PREBUILT_X86, gpp32_cmd, "i686-w64-mingw32-g++-posix", gpp32_wsl,
+         lambda out, use_wsl: ts._compile_cpp_pe(ts._EFI_CPP_EXCEPTIONS_SRC, out, use_wsl, "efi_main", "10", arch="x86")),
+        ("arm32", ts._EFI_PREBUILT_ARM32, clang32, "clang (armv7-w64-mingw32)", clang32_wsl,
+         lambda out, use_wsl: ts._compile_efi_pe_arm32(
              ts._EFI_CPP_EXCEPTIONS_SRC, out, None, "efi_main",
              extra_srcs=[ts._CPP_EH_SUPPORT_DIR / "sjlj_arm32.c"])),
     ]
-    for arch, prebuilt_dir, toolchain, toolchain_name, compile_fn in cpp_targets:
+    for arch, prebuilt_dir, toolchain, toolchain_name, toolchain_wsl, compile_fn in cpp_targets:
         label = f"efi {arch}/04_cpp_exceptions"
         if toolchain is None:
             _report(label, False, f"{toolchain_name} not found (native or WSL)")
             continue
         prebuilt_dir.mkdir(parents=True, exist_ok=True)
-        cc = compile_fn(prebuilt_dir / "04_cpp_exceptions.efi")
-        ok = cc.returncode == 0
-        _report(label, ok, cc.stderr.decode(errors="replace") if not ok else "")
+        cc = compile_fn(prebuilt_dir / "04_cpp_exceptions.efi", toolchain_wsl)
+        if cc.returncode != 0 and toolchain_wsl is False and platform.system() == "Windows":
+            try:
+                cc_wsl = compile_fn(prebuilt_dir / "04_cpp_exceptions.efi", True)
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                cc_wsl = None
+            if cc_wsl is not None and cc_wsl.returncode == 0:
+                cc, detail = cc_wsl, ""
+            elif cc_wsl is not None:
+                detail = ("native: " + cc.stderr.decode(errors="replace")[-300:] + "; "
+                          "wsl: " + cc_wsl.stderr.decode(errors="replace")[-300:])
+            else:
+                detail = "native failed" + cc.stderr.decode(errors="replace")[-300:] + " and WSL retry unavailable"
+        else:
+            detail = cc.stderr.decode(errors="replace") if cc.returncode != 0 else ""
+        _report(label, cc.returncode == 0, detail)
 
 
 def build_efi_loader_templates() -> None:

@@ -845,6 +845,55 @@ _LINUX_LOADER_CFLAGS = [
     "-ffixed-rbx", "-ffixed-r12", "-ffixed-r13", "-ffixed-r14", "-ffixed-r15",
 ]
 
+# AArch64 equivalent of _LINUX_LOADER_CFLAGS: the ARM64 Linux chain (imports_resolver+
+# relocations+ctors runners, asm/*_arm64*) uses x19-x28 as its base/symtab/strtab/hash
+# scratch registers and restores NONE of them (verified: no stp in any arm64 stub), which
+# is exactly the same callee-saved-violation class the x64 flags above paper over. Pin
+# every one so GCC avoids them in the loader's own code. x29 (FP) is deliberately NOT
+# pinned: the loader's prologue/epilogue save+restore their own FP copy, so a mid-call
+# clobber never surfaces; -ffixed-x29 would additionally fight GCC's frame-pointer
+# bookkeeping (aarch64 keeps frame pointers by default).
+_LINUX_LOADER_CFLAGS_ARM64 = [
+    "-O2",
+    "-ffixed-x19", "-ffixed-x20", "-ffixed-x21", "-ffixed-x22", "-ffixed-x23",
+    "-ffixed-x24", "-ffixed-x25", "-ffixed-x26", "-ffixed-x27", "-ffixed-x28",
+]
+
+
+def _ensure_linux_loader_arm64() -> "Path | None":
+    """Return path to the pre-built aarch64 Linux test_loader binary, building it if absent.
+
+    Toolchain selection mirrors this test suite's other Linux-host builds: compiles with
+    native gcc when the host is itself aarch64 (the ubuntu-24.04-arm CI runner), otherwise
+    cross-compiles with aarch64-linux-gnu-gcc — portably inside WSL on Windows hosts (same
+    escape hatch _ensure_linux_loader uses for the x64 loader), natively on an x86_64
+    Linux host that has the cross gcc installed. Returns None (caller fails loudly) when
+    no suitable toolchain is available.
+    """
+    loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux_arm64.pe"
+    if loader.exists():
+        return loader
+    src = TESTS_DIR / "test_loader_linux" / "main.c"
+    if platform.machine() in ("aarch64", "arm64"):
+        cmd = ["gcc", "-O2"] + _LINUX_LOADER_CFLAGS_ARM64 + ["-o", str(loader), str(src), "-ldl"]
+        r = subprocess.run(cmd, capture_output=True, timeout=30)
+        return loader if r.returncode == 0 and loader.exists() else None
+    if platform.system() == "Windows":
+        # WSL presence/absence is nothing to fail on here — build() callers treat
+        # None as "toolchain unavailable" (same contract as _ensure_linux_loader).
+        try:
+            cmd = ("aarch64-linux-gnu-gcc " + " ".join(_LINUX_LOADER_CFLAGS_ARM64)
+                   + f" -o {_win_path_to_wsl(loader)} {_win_path_to_wsl(src)}")
+            r = _wsl_bash_run(cmd, capture_output=True, timeout=60)
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return None
+        return loader if r.returncode == 0 and loader.exists() else None
+    # Native x86_64/other Linux host: cross gcc, no WSL involved.
+    cmd = ["aarch64-linux-gnu-gcc", "-O2"] + _LINUX_LOADER_CFLAGS_ARM64 \
+        + ["-o", str(loader), str(src), "-ldl"]
+    r = subprocess.run(cmd, capture_output=True, timeout=60)
+    return loader if r.returncode == 0 and loader.exists() else None
+
 
 def _ensure_linux_loader(use_wsl: bool) -> "Path | None":
     """Return path to the pre-built test_loader_linux binary.
@@ -1056,17 +1105,18 @@ def _build_linux_write_pe(tmp_path: Path, use_wsl: bool) -> "Path | None":
 def _build_linux_write_pe_arm64(tmp_path: Path) -> "Path | None":
     """Cross-compile tests/Linux/01_linux_write/main.c as an ARM64 PE with libc.so.6 imports.
 
-    NOT YET CALLED by any test - parked pending a remaining bug in
-    asm/imports_resolver_arm64_linux.asm (dlsym-resolved write() crashes with a NULL
-    deref partway through, after PE-base/OEP/dlopen/dlsym/IAT-write all verified
-    correct via register-level inspection). See
-    .superpowers/sdd/2026-10-27-linux-arm-pe-support/progress.md for the full
-    debugging trail and exact continuation point before wiring this back in.
+    Consumed via tests/build_tests.py (--target linux) and, as an on-demand fallback, by
+    test_01_linux_write's arm64 param when the prebuilt binary is missing. The dlsym
+    crash this helper's first draft worked around is fixed (see peor/_chain_builder.py's
+    ARM64 PE-base page-alignment patch from the linux-arm-pe-support plan, Task 1).
 
     Real mingw-w64 has no aarch64-w64-mingw32 target (same limitation documented for the
     EFI ARM tests), so this uses clang+lld (aarch64-w64-mingw32 target) and llvm-dlltool
     instead of GCC mingw + GNU dlltool - same algorithm _build_linux_write_pe uses for x64,
-    different toolchain. Output goes to the stable tests/Linux_arm64/ directory.
+    different toolchain. Runs natively on this host only (no WSL routing: the produced PE
+    is consumed by the aarch64 Linux test loader on aarch64 CI/dev hosts, so the build
+    toolchain just needs to target aarch64-w64-mingw32 from wherever the host lives).
+    Output goes to the stable tests/Linux_arm64/ directory.
     """
     stable = _LINUX_PREBUILD_ARM64 / "01_linux_write_arm64.pe"
     if stable.exists():
@@ -1129,8 +1179,9 @@ def test_01_linux_write(arch, tmp_path):
     PE bitness (PE32+ vs PE32) determines whether the x64 or x86 resolver is used; PE machine
     (AA64) selects the arm64 resolver.
     Tested for x64 (x86_64-w64-mingw32-gcc), x86 (i686-w64-mingw32-gcc), and arm64
-    (clang+lld aarch64-w64-mingw32, executed under qemu-aarch64 user-mode emulation since the
-    dev/CI host is x86_64 — see _find_qemu_user_arm64_wsl).
+    (clang+lld aarch64-w64-mingw32, executed under qemu-aarch64 user-mode emulation on
+    x86_64 hosts — see _find_qemu_user_arm64_wsl — or natively when the host itself is
+    aarch64, as on the ubuntu-24.04-arm CI runner, where no emulation is involved).
     """
     use_wsl = platform.system() == "Windows"
     qemu_arm64 = None
@@ -1143,9 +1194,21 @@ def test_01_linux_write(arch, tmp_path):
     else:
         exe = _LINUX_PREBUILD_ARM64 / "01_linux_write_arm64.pe"
         loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux_arm64.pe"
-        qemu_arm64 = (_find_qemu_user_arm64_wsl() if use_wsl
-                      else (shutil.which("qemu-aarch64-static") or shutil.which("qemu-aarch64")))
-        assert qemu_arm64, "qemu-aarch64 user-mode emulator not found (needed to run the arm64 loader)"
+        host_is_arm64 = platform.machine() in ("aarch64", "arm64")
+        if host_is_arm64:
+            # Native aarch64 host (ubuntu-24.04-arm CI / ARM Linux dev boxes): the
+            # loader and the PE are both aarch64 code — run the loader directly.
+            qemu_arm64 = None
+        else:
+            qemu_arm64 = (_find_qemu_user_arm64_wsl() if use_wsl
+                          else (shutil.which("qemu-aarch64-static") or shutil.which("qemu-aarch64")))
+            assert qemu_arm64, \
+                "qemu-aarch64 user-mode emulator not found (needed to run the arm64 loader on this host)"
+        if not Path(loader).exists():
+            # Fresh-clone fallback so `pytest tests/pytest` alone still passes: build
+            # the loader on demand (native gcc on aarch64 hosts, WSL cross gcc on
+            # Windows, aarch64-linux-gnu-gcc cross on x86_64 Linux).
+            _ensure_linux_loader_arm64()
     assert exe.exists(), f"prebuilt Linux test PE not found: {exe} — run tests/build_tests.sh first"
     assert loader.exists(), f"Linux test_loader not found: {loader} — run tests/build_tests.sh first"
 

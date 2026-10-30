@@ -269,8 +269,12 @@ jobs:
       - name: Build Linux test loaders + prebuilt Linux test PEs (build_tests.py)
         run: python3 tests/build_tests.py --target linux
 
+      # x64 + x86 PEs and loaders. The arm64 variant is built+tested natively on
+      # ubuntu-24.04-arm in test-linux-arm64 below — not here (this runner is x86_64,
+      # so running the aarch64 chain would need qemu-user, while the arm64 runner
+      # needs none; see test_01_linux_write's arm64 branch).
       - name: Cross-compile remaining Linux PE tests (x64 + x86)
-        run: pytest tests/pytest -v --timeout=120 -k "linux"
+        run: pytest tests/pytest -v --timeout=120 -k "linux and not arm64"
 
       - name: Upload Linux build artifacts
         uses: actions/upload-artifact@v4
@@ -314,7 +318,52 @@ jobs:
           pip install pytest pytest-timeout
 
       - name: Run Linux shellcode tests (x64 + x86)
-        run: pytest tests/pytest -v --timeout=60 -k "linux"
+        run: pytest tests/pytest -v --timeout=60 -k "linux and not arm64"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# test-linux-arm64: build + run the ARM64 Linux usermode tests natively on an
+# aarch64 runner (ubuntu-24.04-arm). No qemu-user, no WSL: the loader and the
+# aarch64-cross-built PE are the same machine type as the host, so they exec
+# directly (test_01_linux_write picks direct exec when platform.machine() is
+# aarch64, and skips its qemu requirement). Build+test in one job — unlike the
+# x64 build/test artifact split, there is no second job that would reuse these
+# binaries, so the artifact upload/download for them would be pure overhead.
+# ─────────────────────────────────────────────────────────────────────────────
+  test-linux-arm64:
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # clang+lld (aarch64-w64-mingw32 cross target — mingw-w64 has no aarch64
+      # target) for the PE build; llvm-dlltool for the libc.so.6 import library;
+      # gcc for the native aarch64 test loader; cmake for keystone-engine, which
+      # ships no aarch64 Linux wheel and must build from source.
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y clang lld llvm gcc cmake
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pytest pytest-timeout
+
+      - name: Verify clang's aarch64-w64-mingw32 cross target
+        run: |
+          clang --target=aarch64-w64-mingw32 -print-effective-triple
+
+      - name: Build ARM64 test loader + Linux test PE (build_tests.py)
+        run: python3 tests/build_tests.py --target linux
+
+      - name: Run Linux ARM64 shellcode tests (native, no emulation)
+        run: pytest tests/pytest -v --timeout=60 -k "linux and arm64"
 
   test-efi-qemu:
     runs-on: ubuntu-latest
@@ -649,6 +698,7 @@ jobs:
       - test-windows-debug
       - build-linux-mingw
       - test-linux-mingw
+      - test-linux-arm64
       - test-efi-qemu
       - test-efi-windows-arm
     steps:

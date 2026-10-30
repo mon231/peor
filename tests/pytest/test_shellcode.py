@@ -19,6 +19,7 @@ from peor._pe_features import (
     _detect_pe_features,
     _PLATFORM_LINUX,
     _PLATFORM_EFI,
+    _PLATFORM_ARM64,
     IMAGE_DIRECTORY_ENTRY_IMPORT,
     IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR,
     IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT,
@@ -39,7 +40,17 @@ TESTS_DIR = Path(__file__).parent.parent
 ARCH_DIRS = {
     "x86": TESTS_DIR / "Win_x86",
     "x64": TESTS_DIR / "Win_x64",
+    "arm64": TESTS_DIR / "Win_ARM64",
 }
+# NOTE: no ARCH_DIRS["arm32"] yet. Building a real ARM32 (32-bit ARM) Windows PE via
+# MSVC is BLOCKED-ON-TOOLCHAIN on this dev machine: the only installed Windows SDK
+# (10.0.26100.0) has removed 32-bit ARM desktop support entirely (no um/ARM import
+# libs; Microsoft's own WindowsSdkVersionARMSupportRemoved == this exact SDK
+# version), and no cached/offline older SDK install completed here (see progress.md).
+# Until a working ARM32 toolchain is available, "arm32" must NOT be added to
+# ARCH_DIRS or to any parametrize("arch", ...) list that would run against it --
+# adding it now would either fail to collect (no exe) or silently need a skip,
+# both of which CLAUDE.md/CONTRIBUTING.md forbid.
 
 # Pre-built Linux PE directories (populated by build-linux-mingw CI job or first local run).
 # Tests check these dirs first; compilation only happens when the PE is absent.
@@ -3133,3 +3144,44 @@ def test_compute_stubs_ctors_pe():
     entry = _select_chain(features)
     stubs = _compute_required_stubs(features, entry)
     assert 'ctors' in stubs, "MinGW x86 C++ PE with .ctors should require ctors stub"
+
+
+# ── Platform dispatch tests (Windows ARM64/ARM32) ───────────────────────────
+#
+# A real ARM64 Windows PE has pe_type == PE32+ (same Magic as x64) but
+# machine == IMAGE_FILE_MACHINE_ARM64; a real ARM32 Windows PE has
+# pe_type == PE32 (same Magic as x86) but machine in
+# (IMAGE_FILE_MACHINE_ARMNT, IMAGE_FILE_MACHINE_ARM_Thumb-2). Before Task 1 of
+# docs/superpowers/plans/2026-10-26-windows-arm-pe-support.md, _select_chain's
+# final fallback branch picked purely by pe_type with no machine check, so a
+# real ARM PE would have silently gotten the x64/x86 chain. These tests assert
+# the fix.
+
+
+def test_select_chain_arm64_not_confused_with_x64():
+    """A real ARM64 Windows PE must resolve to the ARM64 chain, never the x64 one."""
+    pe_path = ARCH_DIRS["arm64"] / "01_simple_calc.exe"
+    assert pe_path.exists(), f"{pe_path.name} not found — build tests/tests.sln (Platform=ARM64) first"
+    features = _detect_pe_features(PE(str(pe_path)))
+    entry = _select_chain(features)
+    assert entry is _SHELLCODES[_PLATFORM_ARM64], (
+        "ARM64 PE resolved to the wrong chain — check _select_chain's fallback machine check"
+    )
+
+
+# NOTE: test_select_chain_arm32_not_confused_with_x86 is intentionally not written as a
+# collected test yet. It would be the ARM32 mirror of the test above:
+#
+#   def test_select_chain_arm32_not_confused_with_x86():
+#       pe_path = ARCH_DIRS["arm32"] / "01_simple_calc.exe"
+#       features = _detect_pe_features(PE(str(pe_path)))
+#       entry = _select_chain(features)
+#       assert entry is _SHELLCODES[_PLATFORM_ARM32]
+#
+# but it needs a real ARM32 Windows PE to read headers from, and producing one via MSVC
+# is BLOCKED-ON-TOOLCHAIN on this dev machine (see the ARCH_DIRS comment above and
+# progress.md for the full toolchain-gap evidence). _select_chain's ARM32 fallback
+# branch (peor/_chain_builder.py) and the ARM32 _SHELLCODES entry are already wired
+# and keystone-verified; only this test is parked, pending either a working local
+# ARM32 SDK or the windows-11-arm CI runner. Promote this docstring to a real,
+# collected test the moment a real ARM32 01_simple_calc.exe can be built.

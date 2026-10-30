@@ -550,6 +550,14 @@ jobs:
           Copy-Item (Join-Path $shareQemu "edk2-aarch64-code.fd") (Join-Path $qemuShare "edk2-aarch64-code.fd") -Force
           Copy-Item (Join-Path $shareQemu "edk2-arm-code.fd") (Join-Path $qemuShare "edk2-arm-code.fd") -Force
           Copy-Item (Join-Path $shareQemu "edk2-arm-vars.fd") (Join-Path $qemuShare "edk2-arm-vars.fd") -Force
+          # QEMU's OWN internal resource lookup (independent of _find_qemu_ovmf above)
+          # resolves its bundled ROMs/keymaps/BIOS blobs (efi-virtio.rom, etc.) relative
+          # to its binary's install prefix, at "<exe-dir>\..\share\qemu\" by convention -
+          # copy the whole directory tree so that lookup succeeds too. This coexists
+          # fine with the flat *.fd copies above (two different consumers, two
+          # different relative paths, same parent "share" dir).
+          New-Item -ItemType Directory -Force -Path (Join-Path $qemuShare "qemu") | Out-Null
+          Copy-Item -Recurse -Force (Join-Path $shareQemu "*") (Join-Path $qemuShare "qemu")
           Get-ChildItem $qemuDir | Select-Object Name | Format-Table -AutoSize
 
       - name: Verify QEMU binaries are genuinely ARM64-native (not x64-under-emulation)

@@ -167,7 +167,8 @@ scan `AddressOfNames` for the string, resolve via `AddressOfNameOrdinals` +
 
 When the PE subsystem is POSIX\_CUI (7) or `--platform linux` is specified and
 the PE has an import directory, the Linux import resolver
-(`imports_resolver32/64_linux.asm`) is used instead of the PEB-walk resolver.
+(`imports_resolver32/64_linux.asm`, or `imports_resolver_arm64_linux.asm` for
+AArch64) is used instead of the PEB-walk resolver.
 
 The shellcode is **fully self-contained** — the caller passes no arguments.
 The reference Linux loader invokes it with zero arguments:
@@ -188,7 +189,19 @@ At runtime the resolver:
 
 String literals (`/proc/self/maps`, `dlsym`, `dlopen`, `libc.so`) are embedded
 via the call-over-data trick (no absolute addresses).  All calls use the
-System V ABI (x64: RDI/RSI/RDX; x86: stack cdecl).
+System V ABI (x64: RDI/RSI/RDX; x86: stack cdecl) or AAPCS64 (arm64: X0/X1/X2).
+
+The ARM64 variant resolves `dlopen`/`dlsym` the same way (ELF64 `PT_DYNAMIC`/
+`DT_HASH`/`DT_SYMTAB`/`DT_STRTAB` symbol-table scan against libc's own mapping
+in `/proc/self/maps`), then calls them via `BLR`.  It is subject to the same
+**ARM64 ADRP alignment requirement** documented above for the EFI chain: the
+embedded PE's runtime base must be 4 KB page-aligned, or `ADRP`-based accesses
+inside the PE's own compiled code (e.g. loading an IAT slot to call through it)
+compute the wrong address.  `_PLATFORM_LINUX_ARM64`'s chain entry therefore
+also sets `pe_align=4096`; a Linux loader placing the shellcode blob at an
+arbitrary (non-page-aligned) address — as `tests/test_loader_linux/main.c`'s
+x86/x64 NOP-sled fuzzing does on purpose — must instead place it at a
+page-aligned offset for ARM64 (see that file's `__aarch64__` branch).
 
 ---
 
@@ -498,6 +511,7 @@ pytest tests/pytest -v
 | — | `clangcl_simple_calc` | x64 | clang-cl `/MT` compiled EXE with static CRT; Windows-only (skipped if `clang-cl` absent) | 4950 |
 | — | `01_linux_write` | x64 | Linux-platform PE (subsystem 7) importing `write` from `libc.so.6`; shellcode finds `dlsym`/`dlopen` itself via `/proc/self/maps`; asserts "PEOR\n" in stdout | stdout=PEOR |
 | — | `01_linux_write_x86` | x86 | Same as above but compiled as PE32 with i686-w64-mingw32-gcc; uses x86 Linux chain and 32-bit loader | stdout=PEOR |
+| — | `01_linux_write_arm64` | arm64 | Same as above but cross-compiled with clang+lld (`aarch64-w64-mingw32`) and llvm-dlltool; uses the ARM64 Linux chain (page-aligned PE base, see ADRP alignment note above) and runs under `qemu-aarch64` user-mode emulation | stdout=PEOR |
 | — | `02_linux_cpp_exceptions` | x64, x86 | Linux C++ shellcode: `throw`/`catch` a custom type, return code 42 for typed catch, 88 for catch-all; x64 uses Windows-SEH emulator (`seh_linux64.c`) | 42 |
 | — | `03_linux_with_crt` | x64, x86 | Linux PE using `strlen`/`malloc`/`free`/`memcpy` from `libc.so.6`; tests multi-symbol dlopen/dlsym resolver | 73 |
 | — | `04_linux_signal` | x64, x86 | Linux PE installing SIGUSR1 handler via `signal()`, raising it via `raise()`, returns 77; tests signal-handling imports | 77 |

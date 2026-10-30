@@ -1120,22 +1120,32 @@ def _build_linux_write_pe_arm64(tmp_path: Path) -> "Path | None":
     return exe
 
 
-@pytest.mark.parametrize("arch", ["x64", "x86"])
+@pytest.mark.parametrize("arch", ["x64", "x86", "arm64"])
 def test_01_linux_write(arch, tmp_path):
     """Linux import resolver: PE imports write() from libc.so.6; shellcode writes PEOR to stdout.
 
     On Windows, both compilation and execution run inside WSL.
     The PE is compiled with --subsystem posix (subsystem 7) so peor auto-selects the Linux chain;
-    PE bitness (PE32+ vs PE32) determines whether the x64 or x86 resolver is used.
-    Tested for both x64 (x86_64-w64-mingw32-gcc) and x86 (i686-w64-mingw32-gcc).
+    PE bitness (PE32+ vs PE32) determines whether the x64 or x86 resolver is used; PE machine
+    (AA64) selects the arm64 resolver.
+    Tested for x64 (x86_64-w64-mingw32-gcc), x86 (i686-w64-mingw32-gcc), and arm64
+    (clang+lld aarch64-w64-mingw32, executed under qemu-aarch64 user-mode emulation since the
+    dev/CI host is x86_64 — see _find_qemu_user_arm64_wsl).
     """
     use_wsl = platform.system() == "Windows"
+    qemu_arm64 = None
     if arch == "x64":
         exe = _LINUX_PREBUILD_X64 / "01_linux_write_x64.pe"
         loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux.pe"
-    else:
+    elif arch == "x86":
         exe = _LINUX_PREBUILD_X86 / "01_linux_write_x86.pe"
         loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux_32.pe"
+    else:
+        exe = _LINUX_PREBUILD_ARM64 / "01_linux_write_arm64.pe"
+        loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux_arm64.pe"
+        qemu_arm64 = (_find_qemu_user_arm64_wsl() if use_wsl
+                      else (shutil.which("qemu-aarch64-static") or shutil.which("qemu-aarch64")))
+        assert qemu_arm64, "qemu-aarch64 user-mode emulator not found (needed to run the arm64 loader)"
     assert exe.exists(), f"prebuilt Linux test PE not found: {exe} — run tests/build_tests.sh first"
     assert loader.exists(), f"Linux test_loader not found: {loader} — run tests/build_tests.sh first"
 
@@ -1147,11 +1157,11 @@ def test_01_linux_write(arch, tmp_path):
         # /mnt/c/ paths to C:/Program Files/Git/mnt/c/ before they reach WSL.
         sc_wsl = _win_path_to_wsl(sc)
         loader_wsl = _win_path_to_wsl(loader)
-        result = subprocess.run(
-            ["wsl", "--", loader_wsl, sc_wsl], capture_output=True, timeout=15
-        )
+        cmd = ["wsl", "--"] + ([qemu_arm64, loader_wsl, sc_wsl] if qemu_arm64 else [loader_wsl, sc_wsl])
+        result = subprocess.run(cmd, capture_output=True, timeout=15)
     else:
-        result = subprocess.run([str(loader), str(sc)], capture_output=True, timeout=15)
+        cmd = ([qemu_arm64, str(loader), str(sc)] if qemu_arm64 else [str(loader), str(sc)])
+        result = subprocess.run(cmd, capture_output=True, timeout=15)
 
     assert result.returncode == 0, (
         f"[linux_write {arch}] loader crashed with code {result.returncode}\n"

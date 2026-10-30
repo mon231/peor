@@ -133,6 +133,14 @@ _SHELLCODES = {
         'dir_array_offset':  112,
         'disp64_off':        8,
         'ep_rva_magic':      _EP_RVA_MAGIC,
+        # AArch64 PIC (adrp/ldr, used throughout any non-trivial compiled PE's own
+        # code to reach its own .rdata/IAT) is page-granular: it only stays correct
+        # when the *embedded PE's* runtime base is congruent to its link-time
+        # ImageBase modulo the page size - i.e. page-aligned, same as every other
+        # ARM64 chain entry below that already sets this (_PLATFORM_EFI_ARM64 /
+        # _PLATFORM_EFI_ARM32). x86/x64 have no such requirement (RIP-relative
+        # LEA is byte-granular), which is why only the ARM64 entries need it.
+        'pe_align':          4096,
     },
     _PLATFORM_EFI: {
         'relocs':            RELOCS_64,

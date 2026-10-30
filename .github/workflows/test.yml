@@ -582,6 +582,22 @@ jobs:
             try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch {}
           }
 
+      # TEMPORARY diagnostic: the previous run still hit "qemu-system-aarch64 not
+      # found" via shutil.which() in the pytest step immediately after a smoke-test
+      # step (same job, same shell type) successfully ran the same exe by bare name
+      # via Start-Process - with zero steps in between that could plausibly touch
+      # PATH. That rules out the earlier msvc-dev-cmd-overwrites-PATH theory (this
+      # block now runs after msvc-dev-cmd already). Print exactly what Python sees
+      # before guessing further.
+      - name: Diagnose PATH/PATHEXT/shutil.which visibility for qemu
+        shell: pwsh
+        run: |
+          python -c "import os, shutil; print('PATH='+os.environ.get('PATH','<unset>')); print('PATHEXT='+os.environ.get('PATHEXT','<unset>')); print('which qemu-system-aarch64='+str(shutil.which('qemu-system-aarch64'))); print('which qemu-system-aarch64.exe='+str(shutil.which('qemu-system-aarch64.exe')))"
+          Write-Host "--- pwsh's own PATH ---"
+          Write-Host $env:PATH
+          Write-Host "--- Get-Command ---"
+          Get-Command qemu-system-aarch64.exe -ErrorAction SilentlyContinue | Format-List *
+
       - name: Run EFI shellcode tests (ARM64 + ARM32, real windows-11-arm hardware)
         run: pytest tests/pytest -v --timeout=360 -k "efi and (arm64 or arm32)"
 

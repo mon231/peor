@@ -888,10 +888,16 @@ def _ensure_linux_loader_arm64() -> "Path | None":
         except (subprocess.TimeoutExpired, FileNotFoundError):
             return None
         return loader if r.returncode == 0 and loader.exists() else None
-    # Native x86_64/other Linux host: cross gcc, no WSL involved.
-    cmd = ["aarch64-linux-gnu-gcc", "-O2"] + _LINUX_LOADER_CFLAGS_ARM64 \
-        + ["-o", str(loader), str(src), "-ldl"]
-    r = subprocess.run(cmd, capture_output=True, timeout=60)
+    # Native x86_64/other Linux host: cross gcc, no WSL involved. Missing cross gcc is
+    # the "toolchain unavailable" state (build_tests.py reports a FAIL row and linux
+    # CI's x86_64 jobs don't install this package — pytest there excludes arm64), not
+    # a crash: same FileNotFoundError contract as the Windows/WSL branch above.
+    try:
+        cmd = ["aarch64-linux-gnu-gcc", "-O2"] + _LINUX_LOADER_CFLAGS_ARM64 \
+            + ["-o", str(loader), str(src), "-ldl"]
+        r = subprocess.run(cmd, capture_output=True, timeout=60)
+    except FileNotFoundError:
+        return None
     return loader if r.returncode == 0 and loader.exists() else None
 
 

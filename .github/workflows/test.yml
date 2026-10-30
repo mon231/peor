@@ -650,6 +650,7 @@ jobs:
       - build-linux-mingw
       - test-linux-mingw
       - test-efi-qemu
+      - test-efi-windows-arm
     steps:
       - name: Verify every job passed
         run: |

@@ -511,24 +511,46 @@ jobs:
           # preinstalled MSYS2 at all, so release:false fails outright here (see
           # msys2/setup-msys2#503 — closed as "no preinstalled MSYS2 on the ARM image").
 
-      - name: Arrange native ARM64 QEMU firmware layout + add to PATH
+      # Copy the MSYS2-built binaries, their DLL dependencies, and firmware straight
+      # into C:\Program Files\qemu\ - the exact hardcoded fallback path
+      # _find_qemu_ovmf() (tests/pytest/test_shellcode.py) already probes when
+      # shutil.which() returns None, i.e. the same mechanism choco's install relied
+      # on. Deliberately NOT using $GITHUB_PATH for this: two earlier attempts added
+      # the clangarm64\bin dir to PATH instead, and that PATH entry demonstrably
+      # vanished by the time the pytest step ran (confirmed via a throwaway
+      # diagnostic step - GH Actions' per-step env dump showed a stale "Path" value,
+      # set once by ilammy/msvc-dev-cmd@v1 via $GITHUB_ENV, missing our later
+      # addition - even though the exact same binary WAS found correctly one step
+      # earlier via the exact same PATH mechanism). Rather than chase that
+      # case-sensitivity/env-merge ambiguity (Windows "Path" vs "PATH" as literal,
+      # possibly-distinct keys in the runner's env dict) further, sidestep PATH
+      # for qemu entirely.
+      - name: Install native ARM64 QEMU + firmware into the hardcoded fallback path
         shell: pwsh
         run: |
-          $clangarm64 = Join-Path "${{ steps.msys2-arm64.outputs.msys2-location }}" "clangarm64"
-          $bin = Join-Path $clangarm64 "bin"
-          $shareQemu = Join-Path $clangarm64 "share\qemu"
-          $share = Join-Path $clangarm64 "share"
-          # _find_qemu_ovmf() (tests/pytest/test_shellcode.py) looks for firmware
-          # directly under "<qemu-exe-dir>\..\share\", but this MSYS2 package nests it
-          # one level deeper, under "share\qemu\" - copy up so no test code changes are
-          # needed. (edk2-aarch64-vars.fd doesn't exist in this package either, same gap
-          # as choco's; test_shellcode.py already zero-fills a vars file in that case,
-          # so that needs no CI-side workaround — only the *-code.fd files and ARM32's
-          # vars file, which this package does ship, need to be placed.)
-          Copy-Item (Join-Path $shareQemu "edk2-aarch64-code.fd") (Join-Path $share "edk2-aarch64-code.fd") -Force
-          Copy-Item (Join-Path $shareQemu "edk2-arm-code.fd") (Join-Path $share "edk2-arm-code.fd") -Force
-          Copy-Item (Join-Path $shareQemu "edk2-arm-vars.fd") (Join-Path $share "edk2-arm-vars.fd") -Force
-          echo $bin | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
+          $clangarm64Bin = Join-Path (Join-Path "${{ steps.msys2-arm64.outputs.msys2-location }}" "clangarm64") "bin"
+          $shareQemu = Join-Path (Join-Path "${{ steps.msys2-arm64.outputs.msys2-location }}" "clangarm64") "share\qemu"
+          $qemuDir = "C:\Program Files\qemu"
+          $qemuShare = Join-Path $qemuDir "share"
+          New-Item -ItemType Directory -Force -Path $qemuDir, $qemuShare | Out-Null
+          # The two system emulators plus every DLL in the same bin dir (MSYS2 builds
+          # are dynamically linked against glib/pixman/gnutls/etc.; copying the whole
+          # set rather than hand-picking is simpler and correct either way since it's
+          # just this one package's own bin directory, not the full toolchain).
+          Copy-Item (Join-Path $clangarm64Bin "qemu-system-aarch64.exe") $qemuDir -Force
+          Copy-Item (Join-Path $clangarm64Bin "qemu-system-arm.exe") $qemuDir -Force
+          Copy-Item (Join-Path $clangarm64Bin "*.dll") $qemuDir -Force
+          # _find_qemu_ovmf() looks for firmware directly under "<qemu-exe-dir>\share\",
+          # but this MSYS2 package nests it one level deeper, under "share\qemu\" -
+          # copy up so no test code changes are needed. (edk2-aarch64-vars.fd doesn't
+          # exist in this package either, same gap choco's had; test_shellcode.py
+          # already zero-fills a vars file when none is found, so that needs no
+          # CI-side workaround — only the *-code.fd files and ARM32's vars file,
+          # which this package does ship, need to be placed.)
+          Copy-Item (Join-Path $shareQemu "edk2-aarch64-code.fd") (Join-Path $qemuShare "edk2-aarch64-code.fd") -Force
+          Copy-Item (Join-Path $shareQemu "edk2-arm-code.fd") (Join-Path $qemuShare "edk2-arm-code.fd") -Force
+          Copy-Item (Join-Path $shareQemu "edk2-arm-vars.fd") (Join-Path $qemuShare "edk2-arm-vars.fd") -Force
+          Get-ChildItem $qemuDir | Select-Object Name | Format-Table -AutoSize
 
       - name: Verify QEMU binaries are genuinely ARM64-native (not x64-under-emulation)
         shell: pwsh
@@ -540,9 +562,8 @@ jobs:
             # The 2-byte Machine field sits right after the 4-byte "PE\0\0" signature.
             return [BitConverter]::ToUInt16($bytes, $peOffset + 4)
           }
-          $clangarm64 = Join-Path "${{ steps.msys2-arm64.outputs.msys2-location }}" "clangarm64"
           foreach ($exe in @("qemu-system-aarch64.exe", "qemu-system-arm.exe")) {
-            $path = Join-Path $clangarm64 "bin\$exe"
+            $path = "C:\Program Files\qemu\$exe"
             $m = Get-PEMachine $path
             $mHex = "0x{0:X4}" -f $m
             Write-Host "$exe -> PE header Machine = $mHex"
@@ -559,12 +580,14 @@ jobs:
           # emulation (-nographic -machine virt -cpu cortex-a57 -m 256M -no-reboot,
           # zero drives/devices: 756ms, 0xC00000FF). If this native ARM64 binary has
           # the same problem, fail fast here instead of burning time on the full
-          # pytest run.
+          # pytest run. Uses the full hardcoded path (not a bare name off PATH) to
+          # match exactly how the real pytest run will invoke it via
+          # _find_qemu_ovmf()'s fallback.
           $outFile = Join-Path $env:RUNNER_TEMP "smoke-out.txt"
           $errFile = Join-Path $env:RUNNER_TEMP "smoke-err.txt"
           $argList = @("-nographic", "-machine", "virt", "-cpu", "cortex-a57", "-m", "256M", "-no-reboot")
           $sw = [System.Diagnostics.Stopwatch]::StartNew()
-          $proc = Start-Process -FilePath "qemu-system-aarch64.exe" -ArgumentList $argList -PassThru -NoNewWindow `
+          $proc = Start-Process -FilePath "C:\Program Files\qemu\qemu-system-aarch64.exe" -ArgumentList $argList -PassThru -NoNewWindow `
             -RedirectStandardOutput $outFile -RedirectStandardError $errFile
           $exited = $proc.WaitForExit(8000)
           $sw.Stop()
@@ -581,22 +604,6 @@ jobs:
             Write-Host "still running after 8000ms (expected: no boot device attached, so it just spins) - no instant crash, killing"
             try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch {}
           }
-
-      # TEMPORARY diagnostic: the previous run still hit "qemu-system-aarch64 not
-      # found" via shutil.which() in the pytest step immediately after a smoke-test
-      # step (same job, same shell type) successfully ran the same exe by bare name
-      # via Start-Process - with zero steps in between that could plausibly touch
-      # PATH. That rules out the earlier msvc-dev-cmd-overwrites-PATH theory (this
-      # block now runs after msvc-dev-cmd already). Print exactly what Python sees
-      # before guessing further.
-      - name: Diagnose PATH/PATHEXT/shutil.which visibility for qemu
-        shell: pwsh
-        run: |
-          python -c "import os, shutil; print('PATH='+os.environ.get('PATH','<unset>')); print('PATHEXT='+os.environ.get('PATHEXT','<unset>')); print('which qemu-system-aarch64='+str(shutil.which('qemu-system-aarch64'))); print('which qemu-system-aarch64.exe='+str(shutil.which('qemu-system-aarch64.exe')))"
-          Write-Host "--- pwsh's own PATH ---"
-          Write-Host $env:PATH
-          Write-Host "--- Get-Command ---"
-          Get-Command qemu-system-aarch64.exe -ErrorAction SilentlyContinue | Format-List *
 
       - name: Run EFI shellcode tests (ARM64 + ARM32, real windows-11-arm hardware)
         run: pytest tests/pytest -v --timeout=360 -k "efi and (arm64 or arm32)"

@@ -14,7 +14,10 @@ script doesn't do that itself). CI does the same (see .github/workflows/test.yml
 
 Populates:
   tests/test_loader_linux/test_loader_linux{,_32}.pe        (native gcc Linux loaders)
+  tests/test_loader_linux/test_loader_linux_arm64.pe        (aarch64 loader: native gcc on an
+                                                               aarch64 host, cross gcc elsewhere)
   tests/Linux_x64/*.pe, tests/Linux_x86/*.pe                 (mingw-w64 Linux test PEs)
+  tests/Linux_arm64/01_linux_write_arm64.pe                  (clang+lld aarch64-w64-mingw32 PE)
   tests/Win_x64_EFI/*.efi, tests/Win_x86_EFI/*.efi            (mingw-w64 EFI test PEs)
   tests/Win_ARM64/*.efi,   tests/Win_ARM32/*.efi              (clang/lld EFI test PEs)
   tests/Win_x64_EFI/efi_loader.efi, ... (one per arch)        (EFI loader w/ placeholder
@@ -89,6 +92,19 @@ def build_linux_loaders() -> None:
             _report("linux loader x86 (-m32)", r.returncode == 0, r.stderr.decode(errors="replace"))
         except FileNotFoundError:
             _report("linux loader x86 (-m32)", False, "gcc-multilib not found")
+
+    # ARM64 loader: delegated to the test-suite helper, which picks native gcc on an
+    # aarch64 host (ubuntu-24.04-arm CI), cross aarch64-linux-gnu-gcc on x86_64 Linux,
+    # or aarch64-linux-gnu-gcc inside WSL on Windows hosts. Its x19-x28 -ffixed- pins
+    # (the ARM64 chain stubs clobber the callee-saved regs without saving them) live in
+    # ts._LINUX_LOADER_CFLAGS_ARM64 - keep this delegation, don't inline the gcc call,
+    # so the flags and the host detection stay defined in exactly one place.
+    loader_arm64 = ts._ensure_linux_loader_arm64()
+    _report(
+        "linux loader arm64", loader_arm64 is not None,
+        "aarch64 loader not built (need gcc on an aarch64 host, cross aarch64-linux-gnu-gcc "
+        "on x86_64 Linux, or aarch64-linux-gnu-gcc inside WSL on Windows)",
+    )
 
 
 def build_efi_source_pes() -> None:
@@ -211,6 +227,14 @@ def build_linux_test_pes() -> None:
         _report("linux x86/01_linux_write", exe is not None, "compile failed")
     else:
         _report("linux x86/01_linux_write", False, "i686-w64-mingw32-gcc not found (native or WSL)")
+
+    # 01 arm64: dedicated helper (clang+lld, aarch64-w64-mingw32 cross target; native
+    # host only, no WSL routing). This is the only Linux test currently ported to ARM64.
+    exe = ts._build_linux_write_pe_arm64(tmp_path)
+    _report(
+        "linux arm64/01_linux_write", exe is not None,
+        "compile failed (needs clang with aarch64-w64-mingw32 target + llvm-dlltool + lld)",
+    )
 
     # 02, 05: no dedicated helper — compile straight to the prebuilt path via _compile_cpp_pe.
     cpp_targets = [

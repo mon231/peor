@@ -10,7 +10,7 @@ from peor._pe_features import (
     IMAGE_DIRECTORY_ENTRY_IMPORT,
     _PLATFORM_LINUX, _PLATFORM_EFI,
     _PLATFORM_LINUX_32, _PLATFORM_EFI_32, _PLATFORM_EFI_ARM64, _PLATFORM_EFI_ARM32,
-    _PLATFORM_LINUX_ARM64,
+    _PLATFORM_LINUX_ARM64, _PLATFORM_ARM64, _PLATFORM_ARM32,
     _POSIX_CUI_SUBSYSTEM, _EFI_SUBSYSTEMS, _MACHINE_ARM64, _MACHINE_ARMNT, _MACHINE_ARMTHUMB,
 )
 from peor._shellcodes import (
@@ -27,7 +27,7 @@ from peor._shellcodes import (
     RELOCS_ARM64, CTORS_RUNNER_ARM64, ENTRYPOINT_EFI_ARM64,
     RELOCS_ARM32, CTORS_RUNNER_ARM32, ENTRYPOINT_EFI_ARM32,
     ARM32_EFI_PREFIX,
-    IMPORTS_ARM64_LINUX, ENTRYPOINT_ARM64,
+    IMPORTS_ARM64_LINUX, ENTRYPOINT_ARM64, ENTRYPOINT_ARM32,
 )
 
 # Trailing bytes stripped from import resolvers so they fall through into the next stub.
@@ -134,6 +134,38 @@ _SHELLCODES = {
         'disp64_off':        8,
         'ep_rva_magic':      _EP_RVA_MAGIC,
     },
+    _PLATFORM_ARM64: {
+        'relocs':            RELOCS_ARM64,
+        'imports':           b'',
+        'delay_imports':     b'',
+        'entrypoint':        ENTRYPOINT_ARM64,
+        'seh':               b'',
+        'seh_always':        False,
+        'tls':               b'',
+        'ctors':             CTORS_RUNNER_ARM64,
+        'ctors_rva_magic':   _CTORS_RVA_MAGIC,
+        'ctors_size_magic':  _CTORS_SIZE_MAGIC,
+        'tail':              b'',
+        'dir_array_offset':  112,
+        'disp64_off':        8,
+        'ep_rva_magic':      _EP_RVA_MAGIC,
+    },
+    _PLATFORM_ARM32: {
+        'relocs':            RELOCS_ARM32,
+        'imports':           b'',
+        'delay_imports':     b'',
+        'entrypoint':        ENTRYPOINT_ARM32,
+        'seh':               b'',
+        'seh_always':        False,
+        'tls':               b'',
+        'ctors':             CTORS_RUNNER_ARM32,
+        'ctors_rva_magic':   _CTORS_RVA_MAGIC,
+        'ctors_size_magic':  _CTORS_SIZE_MAGIC,
+        'tail':              b'',
+        'dir_array_offset':  96,
+        'disp32_off':        8,
+        'ep_rva_magic':      _EP_RVA_MAGIC,
+    },
     _PLATFORM_EFI: {
         'relocs':            RELOCS_64,
         'imports':           b'',
@@ -232,6 +264,10 @@ def _select_chain(features: PeFeatures, platform: "str | None" = None) -> dict:
         if features.machine == _MACHINE_ARM64:
             return _SHELLCODES[_PLATFORM_LINUX_ARM64]
         return _SHELLCODES[_PLATFORM_LINUX_32 if features.pe_type == OPTIONAL_HEADER_MAGIC_PE else _PLATFORM_LINUX]
+    if features.machine == _MACHINE_ARM64:
+        return _SHELLCODES[_PLATFORM_ARM64]
+    if features.machine in (_MACHINE_ARMNT, _MACHINE_ARMTHUMB):
+        return _SHELLCODES[_PLATFORM_ARM32]
     entry = _SHELLCODES.get(features.pe_type)
     if entry is None:
         raise ValueError(f"Unsupported PE type: 0x{features.pe_type:04X}")

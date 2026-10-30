@@ -46,6 +46,7 @@ ARCH_DIRS = {
 _LINUX_PREBUILD_X64 = TESTS_DIR / "Linux_x64"
 _LINUX_PREBUILD_X86 = TESTS_DIR / "Linux_x86"
 _LINUX_PREBUILD_ARM64 = TESTS_DIR / "Linux_arm64"
+_LINUX_PREBUILD_ARM32 = TESTS_DIR / "Linux_arm32"
 
 MINGW_CPP_EH_RETURN_CODE = 42
 LINUX_CRT_RETURN_CODE = 73
@@ -1111,6 +1112,103 @@ def _build_linux_write_pe_arm64(tmp_path: Path) -> "Path | None":
     cc2 = subprocess.run(
         [clang, "-target", "aarch64-w64-mingw32", "-nostdlib", "-nodefaultlibs", "-nostartfiles",
          "-fno-unwind-tables", "-fno-asynchronous-unwind-tables", "-fuse-ld=lld",
+         "-Wl,-e,main", "-Wl,--subsystem,posix",
+         str(obj_file), str(imp_lib), "-o", str(exe)],
+        capture_output=True, timeout=30,
+    )
+    if cc2.returncode != 0 or not exe.exists():
+        return None
+    return exe
+
+
+def _find_qemu_user_arm32_wsl() -> "str | None":
+    """Return the WSL-side qemu-arm user-mode-emulation binary name, or None.
+
+    Mirrors _find_qemu_user_arm64_wsl for the 32-bit case. qemu-user (not
+    qemu-system-*) emulates a single ARM32 ELF binary directly on an x86_64
+    host - no VM boot, no firmware.
+    """
+    if platform.system() != "Windows":
+        return None
+    try:
+        r = _wsl_bash_run(
+            "which qemu-arm-static 2>/dev/null || which qemu-arm 2>/dev/null",
+            capture_output=True, timeout=10,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    if r.returncode != 0:
+        return None
+    path = r.stdout.decode(errors="replace").strip()
+    return path or None
+
+
+def _build_linux_write_pe_arm32(tmp_path: Path) -> "Path | None":
+    """Cross-compile tests/Linux/01_linux_write/main.c as an ARM32 PE with libc.so.6 imports.
+
+    NOT YET CALLED by any test - parked pending local execution verification, same
+    reasoning Task 1 applied to _build_linux_write_pe_arm64. See
+    .superpowers/sdd/2026-10-27-linux-arm-pe-support/progress.md (Task 2 entry) for why:
+    building this PE itself only needs the clang+lld armv7-w64-mingw32 toolchain already
+    used by the EFI ARM32 tests (confirmed present, no sudo needed), but *running* it needs
+    a real ARM32 Linux ELF test_loader_linux_arm32 binary, which needs either a
+    arm-linux-gnueabihf glibc cross-toolchain or the armhf runtime libs - both gated behind
+    an interactive `sudo apt-get` password this session could not supply non-interactively.
+
+    Real mingw-w64 has no armv7-w64-mingw32 *gcc* target (same limitation already
+    documented for the ARM64/EFI ARM tests), so this uses clang+lld and llvm-dlltool
+    instead of GCC mingw + GNU dlltool - same algorithm _build_linux_write_pe_arm64 uses.
+    Deliberately does NOT call _fix_arm32_pe_machine_type: that patches Machine from
+    ARMNT (0x01C4) to ARMTHUMB_MIXED (0x01C2) only because EDK2's ARM32 EFI firmware
+    requires it: peor's _select_chain (peor/_chain_builder.py) accepts either machine
+    value for the Linux platform, so the natural lld output (ARMNT) is used as-is.
+    """
+    stable = _LINUX_PREBUILD_ARM32 / "01_linux_write_arm32.pe"
+    if stable.exists():
+        return stable
+    _LINUX_PREBUILD_ARM32.mkdir(parents=True, exist_ok=True)
+
+    src = TESTS_DIR / "Linux" / "01_linux_write" / "main.c"
+    if not src.exists():
+        return None
+
+    clang = _find_clang_arm32()
+    if not clang:
+        return None
+    llvm_dlltool = str(Path(clang).parent / "llvm-dlltool.exe")
+    if not Path(llvm_dlltool).exists():
+        llvm_dlltool = shutil.which("llvm-dlltool")
+    if not llvm_dlltool:
+        return None
+
+    def_file = tmp_path / "libc.so.6_arm32.def"
+    imp_lib  = tmp_path / "liblibc_import_arm32.a"
+    obj_file = tmp_path / "01_linux_write_arm32.o"
+    def_file.write_text(_LIBC_DEF_CONTENT, encoding="ascii")
+
+    dt = subprocess.run(
+        [llvm_dlltool, "-m", "arm", "-D", _LIBC_DLL_NAME, "-d", str(def_file), "-l", str(imp_lib)],
+        capture_output=True, timeout=30,
+    )
+    if dt.returncode != 0:
+        return None
+
+    _ARM32_CFLAGS = [
+        "-target", "armv7-w64-mingw32", "-mthumb",
+        "-nostdlib", "-nodefaultlibs", "-nostartfiles",
+        "-fno-unwind-tables", "-fno-asynchronous-unwind-tables",
+    ]
+
+    cc1 = subprocess.run(
+        [clang] + _ARM32_CFLAGS + ["-c", str(src), "-o", str(obj_file)],
+        capture_output=True, timeout=30,
+    )
+    if cc1.returncode != 0:
+        return None
+
+    exe = stable
+    cc2 = subprocess.run(
+        [clang] + _ARM32_CFLAGS + ["-fuse-ld=lld",
          "-Wl,-e,main", "-Wl,--subsystem,posix",
          str(obj_file), str(imp_lib), "-o", str(exe)],
         capture_output=True, timeout=30,

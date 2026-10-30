@@ -558,6 +558,26 @@ jobs:
           # different relative paths, same parent "share" dir).
           New-Item -ItemType Directory -Force -Path (Join-Path $qemuShare "qemu") | Out-Null
           Copy-Item -Recurse -Force (Join-Path $shareQemu "*") (Join-Path $qemuShare "qemu")
+          # QEMU's OWN internal resource lookup (independent of _find_qemu_ovmf above)
+          # resolves its bundled ROMs/keymaps/BIOS blobs (efi-virtio.rom, etc.) via
+          # get_relocated_path() (util/cutils.c): the build's CONFIG_QEMU_DATADIR
+          # (/clangarm64/share/qemu) is re-rooted onto the running exe's directory,
+          # treating that as the MSYS2 "<prefix>\bin" dir — so the search lands at
+          # "<exe-dir>\..\share\qemu", i.e. C:\Program Files\share\qemu for the exe at
+          # C:\Program Files\qemu\. Run 41037146428 proved the choco-convention copy
+          # above (C:\Program Files\qemu\share\qemu) is NOT searched: it exited with
+          # "failed to find romfile efi-virtio.rom" (the default -machine virt NIC,
+          # virtio-net-pci, needs that rom even with no drives attached) with this exact
+          # tree present there. Copy the same tree to the MSYS2-relocated location too.
+          $shareDirRoot = Split-Path $qemuDir -Parent
+          $relocatedShareQemu = Join-Path (Join-Path $shareDirRoot "share") "qemu"
+          New-Item -ItemType Directory -Force -Path $relocatedShareQemu | Out-Null
+          Copy-Item -Recurse -Force (Join-Path $shareQemu "*") $relocatedShareQemu -ErrorAction Stop
+          # Loud guard: without efi-virtio.rom here, every QEMU invocation (incl. the real
+          # pytest ones, which auto-add a default NIC) dies with "failed to find romfile".
+          if (-not (Test-Path (Join-Path $relocatedShareQemu "efi-virtio.rom"))) {
+            throw "efi-virtio.rom missing at $relocatedShareQemu - QEMU's internal rom lookup will fail"
+          }
           Get-ChildItem $qemuDir | Select-Object Name | Format-Table -AutoSize
 
       - name: Verify QEMU binaries are genuinely ARM64-native (not x64-under-emulation)
@@ -591,9 +611,15 @@ jobs:
           # pytest run. Uses the full hardcoded path (not a bare name off PATH) to
           # match exactly how the real pytest run will invoke it via
           # _find_qemu_ovmf()'s fallback.
+          # -nic none is REQUIRED for this to actually have zero devices: without any
+          # -nic/-net option QEMU silently adds its default NIC (virtio-net-pci on
+          # -machine virt), whose option rom (efi-virtio.rom) is looked up from QEMU's
+          # own internal share/qemu search path (see the install step above) — a MISSING
+          # rom there produces a REAL QEMU exit("failed to find romfile ...") in ~1.5s,
+          # which is below this step's 3s instant-crash heuristic and would misfire it.
           $outFile = Join-Path $env:RUNNER_TEMP "smoke-out.txt"
           $errFile = Join-Path $env:RUNNER_TEMP "smoke-err.txt"
-          $argList = @("-nographic", "-machine", "virt", "-cpu", "cortex-a57", "-m", "256M", "-no-reboot")
+          $argList = @("-nographic", "-nic", "none", "-machine", "virt", "-cpu", "cortex-a57", "-m", "256M", "-no-reboot")
           $sw = [System.Diagnostics.Stopwatch]::StartNew()
           $proc = Start-Process -FilePath "C:\Program Files\qemu\qemu-system-aarch64.exe" -ArgumentList $argList -PassThru -NoNewWindow `
             -RedirectStandardOutput $outFile -RedirectStandardError $errFile

@@ -434,6 +434,51 @@ jobs:
           clang --target=armv7-w64-mingw32 -print-effective-triple
           ld.lld --version
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # keystone-engine (peor's build+runtime dependency, assembles the resolver
+      # ASM stubs) ships no prebuilt win_arm64 wheel on PyPI, so pip must build it
+      # from source here (an LLVM-derived subset) — slow, so cache pip's wheel
+      # cache too: once built once, a pyproject.toml-keyed cache hit lets pip
+      # reuse the built keystone-engine wheel instead of recompiling it.
+      - name: Cache pip wheel cache (keystone-engine build-from-source is slow)
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\pip\Cache
+          key: pip-wheels-windows-11-arm-${{ hashFiles('pyproject.toml', 'setup.py') }}
+
+      # Needed for the keystone-engine source build above: an MSVC dev environment
+      # on PATH (nmake/cl). NOTE: this action writes a "Path" var via $GITHUB_ENV
+      # (visible in its log as "Setting Path") rather than appending via
+      # $GITHUB_PATH, which replaces the PATH subsequent steps inherit instead of
+      # layering onto it. That silently dropped a PATH entry added in an earlier
+      # step in practice (see the MSYS2/QEMU steps below, which learned this the
+      # hard way and were moved to AFTER this step as a result) - do not add
+      # anything to PATH before this step and assume it survives to later ones.
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: arm64
+
+      - name: Install Python dependencies
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+        shell: pwsh
+        run: |
+          # pwsh does not stop a multi-line script just because a native command
+          # (pip) exits non-zero, so check explicitly after each one or a failed
+          # keystone-engine build would silently fall through to "success".
+          python -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pip install -e .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pip install pytest pytest-timeout
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build prebuilt EFI test-source PEs (build_tests.py)
+        run: python tests/build_tests.py --target efi
+
       # choco's qemu package is an x64 Windows binary that runs under windows-11-arm's
       # x64-emulation layer (Prism/xtajit). A real bisection on this exact hardware
       # (progress.md, run 40459337924) proved that crashes QEMU's own CPU/TCG core
@@ -446,6 +491,15 @@ jobs:
       # incompatibility that disabled this package upstream in 2024 has since been fixed
       # upstream; weilnetz.de's qemu.weilnetz.de/aarch64/ "Windows on ARM" installer is
       # an alternative native-ARM64 source if this one ever regresses).
+      #
+      # Placed here (after setup-python/msvc-dev-cmd/build_tests.py, immediately before
+      # the pytest step that actually needs qemu) deliberately: an earlier attempt placed
+      # this block before setup-python, and ilammy/msvc-dev-cmd@v1 further down clobbered
+      # that PATH addition (see the comment on that step) - qemu-system-aarch64 came up
+      # "not found" via shutil.which() in the pytest run despite the exe genuinely being
+      # there and PE-verified ARM64-native earlier in that same run. Keeping this as the
+      # LAST thing to touch PATH before pytest sidesteps the problem regardless of root
+      # cause.
       - name: Set up MSYS2 CLANGARM64 (native ARM64-host QEMU)
         id: msys2-arm64
         uses: msys2/setup-msys2@v2
@@ -527,45 +581,6 @@ jobs:
             Write-Host "still running after 8000ms (expected: no boot device attached, so it just spins) - no instant crash, killing"
             try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch {}
           }
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-
-      # keystone-engine (peor's build+runtime dependency, assembles the resolver
-      # ASM stubs) ships no prebuilt win_arm64 wheel on PyPI, so pip must build it
-      # from source here (an LLVM-derived subset) — slow, so cache pip's wheel
-      # cache too: once built once, a pyproject.toml-keyed cache hit lets pip
-      # reuse the built keystone-engine wheel instead of recompiling it.
-      - name: Cache pip wheel cache (keystone-engine build-from-source is slow)
-        uses: actions/cache@v4
-        with:
-          path: ~\AppData\Local\pip\Cache
-          key: pip-wheels-windows-11-arm-${{ hashFiles('pyproject.toml', 'setup.py') }}
-
-      # Needed for the keystone-engine source build above: an MSVC dev environment
-      # on PATH (nmake/cl).
-      - uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: arm64
-
-      - name: Install Python dependencies
-        env:
-          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-        shell: pwsh
-        run: |
-          # pwsh does not stop a multi-line script just because a native command
-          # (pip) exits non-zero, so check explicitly after each one or a failed
-          # keystone-engine build would silently fall through to "success".
-          python -m pip install --upgrade pip
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          pip install -e .
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          pip install pytest pytest-timeout
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Build prebuilt EFI test-source PEs (build_tests.py)
-        run: python tests/build_tests.py --target efi
 
       - name: Run EFI shellcode tests (ARM64 + ARM32, real windows-11-arm hardware)
         run: pytest tests/pytest -v --timeout=360 -k "efi and (arm64 or arm32)"

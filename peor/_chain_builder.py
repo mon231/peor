@@ -27,7 +27,7 @@ from peor._shellcodes import (
     RELOCS_ARM64, CTORS_RUNNER_ARM64, ENTRYPOINT_EFI_ARM64,
     RELOCS_ARM32, CTORS_RUNNER_ARM32, ENTRYPOINT_EFI_ARM32,
     ARM32_EFI_PREFIX,
-    IMPORTS_ARM64_LINUX, ENTRYPOINT_ARM64, ENTRYPOINT_ARM32,
+    IMPORTS_ARM64_LINUX, IMPORTS_ARM64_UM, ENTRYPOINT_ARM64, ENTRYPOINT_ARM32,
 )
 
 # Trailing bytes stripped from import resolvers so they fall through into the next stub.
@@ -136,7 +136,7 @@ _SHELLCODES = {
     },
     _PLATFORM_ARM64: {
         'relocs':            RELOCS_ARM64,
-        'imports':           b'',
+        'imports':           IMPORTS_ARM64_UM,
         'delay_imports':     b'',
         'entrypoint':        ENTRYPOINT_ARM64,
         'seh':               b'',
@@ -145,7 +145,7 @@ _SHELLCODES = {
         'ctors':             CTORS_RUNNER_ARM64,
         'ctors_rva_magic':   _CTORS_RVA_MAGIC,
         'ctors_size_magic':  _CTORS_SIZE_MAGIC,
-        'tail':              b'',
+        'tail':              _IMPORTS_TAIL_ARM64,
         'dir_array_offset':  112,
         'disp64_off':        8,
         'ep_rva_magic':      _EP_RVA_MAGIC,

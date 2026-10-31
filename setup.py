@@ -121,6 +121,7 @@ def _assemble_shellcodes():
     e_efi_arm64_raw = assemble_arm64(ASM_DIR / 'entrypoint_resolver_efi_arm64.asm')
     e_arm64_raw = assemble_arm64(ASM_DIR / 'entrypoint_resolver_arm64.asm')
     i_arm64_linux = assemble_arm64(ASM_DIR / 'imports_resolver_arm64_linux.asm')
+    i_arm64_um = assemble_arm64(ASM_DIR / 'imports_resolver_arm64.asm')
 
     r_arm32     = assemble_arm32(ASM_DIR / 'relocations_resolver_arm32.asm', patch_pe_offset_pool=True)
     ctors_arm32 = assemble_arm32(ASM_DIR / 'ctors_runner_arm32.asm')
@@ -238,6 +239,7 @@ def _assemble_shellcodes():
         f"CTORS_RUNNER_ARM64     = bytes.fromhex('{ctors_arm64.hex()}')\n"
         f"ENTRYPOINT_EFI_ARM64   = bytes.fromhex('{e_efi_arm64.hex()}')\n"
         f"IMPORTS_ARM64_LINUX    = bytes.fromhex('{i_arm64_linux.hex()}')\n"
+        f"IMPORTS_ARM64_UM       = bytes.fromhex('{i_arm64_um.hex()}')\n"
         f"ENTRYPOINT_ARM64       = bytes.fromhex('{e_arm64.hex()}')\n"
         f"ENTRYPOINT_ARM32       = bytes.fromhex('{e_arm32.hex()}')\n"
         f"RELOCS_ARM32           = bytes.fromhex('{r_arm32.hex()}')\n"

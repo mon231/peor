@@ -31,8 +31,8 @@ NOT built here — needs MSBuild, see tests/tests.sln:
   - Windows-native MSVC .exe test binaries
 """
 import sys
-import importlib.util
 import platform
+import importlib.util
 import subprocess
 from pathlib import Path
 
@@ -330,13 +330,23 @@ def build_linux_test_pes() -> None:
     else:
         _report("linux x86/01_linux_write", False, "i686-w64-mingw32-gcc not found (native or WSL)")
 
-    # 01 arm64: dedicated helper (clang+lld, aarch64-w64-mingw32 cross target; native
-    # host only, no WSL routing). This is the only Linux test currently ported to ARM64.
-    exe = ts._build_linux_write_pe_arm64(tmp_path)
-    _report(
-        "linux arm64/01_linux_write", exe is not None,
-        "compile failed (needs clang with aarch64-w64-mingw32 target + llvm-dlltool + lld)",
-    )
+    # arm64: clang+lld aarch64-w64-mingw32 (no real mingw-w64 GCC targets aarch64) +
+    # llvm-dlltool. 01/03/04/05 all have dedicated helpers; 02 (C++ exceptions) is
+    # deliberately not built here - see the module comment above test_02_linux_cpp_exceptions
+    # in tests/pytest/test_shellcode.py for why (missing C++ EH runtime for this cross target).
+    arm64_targets = [
+        ("01_linux_write", ts._build_linux_write_pe_arm64),
+        ("03_linux_with_crt", ts._build_linux_crt_pe_arm64),
+        ("04_linux_signal", ts._build_linux_signal_pe_arm64),
+        ("05_linux_global_ctor", ts._build_linux_global_ctor_pe_arm64),
+    ]
+    for name, build_fn in arm64_targets:
+        label = f"linux arm64/{name}"
+        # build_fn handles native clang AND the WSL fallback itself (Windows hosts);
+        # None here means both routes failed, so the detail says what a rerun needs.
+        exe = build_fn(tmp_path)
+        _report(label, exe is not None, "" if exe is not None else "compile failed (needs clang with "
+                "aarch64-w64-mingw32 target + llvm-dlltool + lld, native or WSL)")
 
     # 02, 05: no dedicated helper — compile straight to the prebuilt path via _compile_cpp_pe.
     cpp_targets = [
@@ -421,8 +431,10 @@ def build_mingw_windows_pes() -> None:
         if gpp_cmd is None:
             _report(label, False, "g++-posix not found (native or WSL)")
             continue
-        cc = ts._compile_cpp_pe(src17, out17, gpp_wsl, "WinMain", "windows", arch=arch)
-        _report(label, cc.returncode == 0, cc.stderr.decode(errors="replace") if cc.returncode else "")
+        ok, detail = _cc_retry(
+            lambda use_wsl: ts._compile_cpp_pe(src17, out17, use_wsl, "WinMain", "windows", arch=arch),
+            native_usable=not gpp_wsl)
+        _report(label, ok, detail)
 
 
 def build_clangcl_pe() -> None:

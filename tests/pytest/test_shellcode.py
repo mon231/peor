@@ -2,6 +2,7 @@ import os
 import re
 import sys
 import time
+import glob
 import pytest
 import struct
 import shutil
@@ -57,6 +58,7 @@ ARCH_DIRS = {
 _LINUX_PREBUILD_X64 = TESTS_DIR / "Linux_x64"
 _LINUX_PREBUILD_X86 = TESTS_DIR / "Linux_x86"
 _LINUX_PREBUILD_ARM64 = TESTS_DIR / "Linux_arm64"
+_LINUX_PREBUILD_ARM32 = TESTS_DIR / "Linux_arm32"
 
 MINGW_CPP_EH_RETURN_CODE = 42
 LINUX_CRT_RETURN_CODE = 73
@@ -1173,9 +1175,9 @@ def _build_linux_write_pe_arm64(tmp_path: Path) -> "Path | None":
     Real mingw-w64 has no aarch64-w64-mingw32 target (same limitation documented for the
     EFI ARM tests), so this uses clang+lld (aarch64-w64-mingw32 target) and llvm-dlltool
     instead of GCC mingw + GNU dlltool - same algorithm _build_linux_write_pe uses for x64,
-    different toolchain. Runs natively on this host only (no WSL routing: the produced PE
-    is consumed by the aarch64 Linux test loader on aarch64 CI/dev hosts, so the build
-    toolchain just needs to target aarch64-w64-mingw32 from wherever the host lives).
+    different toolchain. Runs natively when the host has a clang with the target (ubuntu
+    runners, ARM dev boxes); on Windows hosts without it, the identical steps are rerun
+    inside WSL (_wsl_build_linux_arm64_libc_pe) no matter where the produced PE later runs.
     Output goes to the stable tests/Linux_arm64/ directory.
     """
     stable = _LINUX_PREBUILD_ARM64 / "01_linux_write_arm64.pe"
@@ -1187,19 +1189,23 @@ def _build_linux_write_pe_arm64(tmp_path: Path) -> "Path | None":
     if not src.exists():
         return None
 
+    def_file = tmp_path / "libc.so.6_arm64.def"
+    imp_lib  = tmp_path / "liblibc_import_arm64.a"
+    obj_file = tmp_path / "01_linux_write_arm64.o"
+    def_file.write_text(_LIBC_DEF_CONTENT, encoding="ascii")
+
     clang = _find_clang_arm64()
     if not clang:
-        return None
+        if platform.system() != "Windows":
+            return None
+        # Windows host without native aarch64-w64-mingw32 clang (no clang on PATH here):
+        # run the identical steps through WSL's clang + llvm-dlltool.
+        return _wsl_build_linux_arm64_libc_pe(def_file, imp_lib, obj_file, src, stable)
     llvm_dlltool = str(Path(clang).parent / "llvm-dlltool.exe")
     if not Path(llvm_dlltool).exists():
         llvm_dlltool = shutil.which("llvm-dlltool")
     if not llvm_dlltool:
         return None
-
-    def_file = tmp_path / "libc.so.6_arm64.def"
-    imp_lib  = tmp_path / "liblibc_import_arm64.a"
-    obj_file = tmp_path / "01_linux_write_arm64.o"
-    def_file.write_text(_LIBC_DEF_CONTENT, encoding="ascii")
 
     dt = subprocess.run(
         [llvm_dlltool, "-m", "arm64", "-D", _LIBC_DLL_NAME, "-d", str(def_file), "-l", str(imp_lib)],
@@ -1221,6 +1227,103 @@ def _build_linux_write_pe_arm64(tmp_path: Path) -> "Path | None":
     cc2 = subprocess.run(
         [clang, "-target", "aarch64-w64-mingw32", "-nostdlib", "-nodefaultlibs", "-nostartfiles",
          "-fno-unwind-tables", "-fno-asynchronous-unwind-tables", "-fuse-ld=lld",
+         "-Wl,-e,main", "-Wl,--subsystem,posix",
+         str(obj_file), str(imp_lib), "-o", str(exe)],
+        capture_output=True, timeout=30,
+    )
+    if cc2.returncode != 0 or not exe.exists():
+        return None
+    return exe
+
+
+def _find_qemu_user_arm32_wsl() -> "str | None":
+    """Return the WSL-side qemu-arm user-mode-emulation binary name, or None.
+
+    Mirrors _find_qemu_user_arm64_wsl for the 32-bit case. qemu-user (not
+    qemu-system-*) emulates a single ARM32 ELF binary directly on an x86_64
+    host - no VM boot, no firmware.
+    """
+    if platform.system() != "Windows":
+        return None
+    try:
+        r = _wsl_bash_run(
+            "which qemu-arm-static 2>/dev/null || which qemu-arm 2>/dev/null",
+            capture_output=True, timeout=10,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    if r.returncode != 0:
+        return None
+    path = r.stdout.decode(errors="replace").strip()
+    return path or None
+
+
+def _build_linux_write_pe_arm32(tmp_path: Path) -> "Path | None":
+    """Cross-compile tests/Linux/01_linux_write/main.c as an ARM32 PE with libc.so.6 imports.
+
+    NOT YET CALLED by any test - parked pending local execution verification, same
+    reasoning Task 1 applied to _build_linux_write_pe_arm64. See
+    .superpowers/sdd/2026-10-27-linux-arm-pe-support/progress.md (Task 2 entry) for why:
+    building this PE itself only needs the clang+lld armv7-w64-mingw32 toolchain already
+    used by the EFI ARM32 tests (confirmed present, no sudo needed), but *running* it needs
+    a real ARM32 Linux ELF test_loader_linux_arm32 binary, which needs either a
+    arm-linux-gnueabihf glibc cross-toolchain or the armhf runtime libs - both gated behind
+    an interactive `sudo apt-get` password this session could not supply non-interactively.
+
+    Real mingw-w64 has no armv7-w64-mingw32 *gcc* target (same limitation already
+    documented for the ARM64/EFI ARM tests), so this uses clang+lld and llvm-dlltool
+    instead of GCC mingw + GNU dlltool - same algorithm _build_linux_write_pe_arm64 uses.
+    Deliberately does NOT call _fix_arm32_pe_machine_type: that patches Machine from
+    ARMNT (0x01C4) to ARMTHUMB_MIXED (0x01C2) only because EDK2's ARM32 EFI firmware
+    requires it: peor's _select_chain (peor/_chain_builder.py) accepts either machine
+    value for the Linux platform, so the natural lld output (ARMNT) is used as-is.
+    """
+    stable = _LINUX_PREBUILD_ARM32 / "01_linux_write_arm32.pe"
+    if stable.exists():
+        return stable
+    _LINUX_PREBUILD_ARM32.mkdir(parents=True, exist_ok=True)
+
+    src = TESTS_DIR / "Linux" / "01_linux_write" / "main.c"
+    if not src.exists():
+        return None
+
+    clang = _find_clang_arm32()
+    if not clang:
+        return None
+    llvm_dlltool = str(Path(clang).parent / "llvm-dlltool.exe")
+    if not Path(llvm_dlltool).exists():
+        llvm_dlltool = shutil.which("llvm-dlltool")
+    if not llvm_dlltool:
+        return None
+
+    def_file = tmp_path / "libc.so.6_arm32.def"
+    imp_lib  = tmp_path / "liblibc_import_arm32.a"
+    obj_file = tmp_path / "01_linux_write_arm32.o"
+    def_file.write_text(_LIBC_DEF_CONTENT, encoding="ascii")
+
+    dt = subprocess.run(
+        [llvm_dlltool, "-m", "arm", "-D", _LIBC_DLL_NAME, "-d", str(def_file), "-l", str(imp_lib)],
+        capture_output=True, timeout=30,
+    )
+    if dt.returncode != 0:
+        return None
+
+    _ARM32_CFLAGS = [
+        "-target", "armv7-w64-mingw32", "-mthumb",
+        "-nostdlib", "-nodefaultlibs", "-nostartfiles",
+        "-fno-unwind-tables", "-fno-asynchronous-unwind-tables",
+    ]
+
+    cc1 = subprocess.run(
+        [clang] + _ARM32_CFLAGS + ["-c", str(src), "-o", str(obj_file)],
+        capture_output=True, timeout=30,
+    )
+    if cc1.returncode != 0:
+        return None
+
+    exe = stable
+    cc2 = subprocess.run(
+        [clang] + _ARM32_CFLAGS + ["-fuse-ld=lld",
          "-Wl,-e,main", "-Wl,--subsystem,posix",
          str(obj_file), str(imp_lib), "-o", str(exe)],
         capture_output=True, timeout=30,
@@ -1299,6 +1402,28 @@ def test_01_linux_write(arch, tmp_path):
 _LINUX_CPP_EXCEPTIONS_SRC = TESTS_DIR / "Linux" / "02_linux_cpp_exceptions" / "main.cpp"
 
 
+# ARM64/ARM32 are deliberately NOT ported for this test (Task 3 investigated, found
+# genuinely blocked - not a "didn't try" skip). x64/x86 build via real mingw g++-posix,
+# whose statically-linked libgcc_eh.a/libsupc++.a provide the whole C++ EH runtime
+# (__cxa_throw/__cxa_begin_catch/__cxa_end_catch/__gxx_personality_seh0, typeinfo vtables).
+# No such library exists for aarch64-w64-mingw32 or armv7-w64-mingw32 under clang+lld (no
+# real mingw-w64 GCC port targets either triple - same root cause already documented for
+# the test PE builds elsewhere in this file). Confirmed empirically: a trivial
+# throw/catch compiled with `clang --target=aarch64-w64-mingw32 -fexceptions -nostdlib
+# -nodefaultlibs -nostartfiles` links clean, but ld.lld then fails with undefined symbols
+# __cxa_allocate_exception, __cxa_throw, __cxa_begin_catch, __cxa_end_catch,
+# __gxx_personality_seh0, and "vtable for __cxxabiv1::__class_type_info" - the entire C++ EH
+# ABI, not just one missing piece. tests/cpp_eh_support/sjlj_arm32.c (the EFI ARM32 C++
+# exceptions precedent) shows what hand-writing this runtime from scratch costs: a
+# per-function, hand-reverse-engineered register/stack-layout hack tied to one specific
+# compiled function's exact codegen, not a reusable library - and even that approach only
+# applies to ARM32 (-fsjlj-exceptions is not a supported exception model for AArch64 in
+# clang, so ARM64 would need a different, real DWARF/SEH-unwind-table-based runtime, which
+# is substantially more work again). This matches this codebase's own existing precedent:
+# EFI's C++ exceptions test (test_04_efi_cpp_exceptions) was never even attempted for arm64,
+# only arm32 got the bespoke SJLJ treatment. Building a general-purpose C++ EH runtime for
+# either cross target is its own dedicated research task, out of scope for a routine test
+# port - see .superpowers/sdd/2026-10-27-linux-arm-pe-support/progress.md's Task 3 entry.
 @pytest.mark.parametrize("arch", ["x64", "x86"])
 def test_02_linux_cpp_exceptions(arch, tmp_path):
     """Linux C++ shellcode: throws and catches a custom type; main returns 42.
@@ -1306,7 +1431,8 @@ def test_02_linux_cpp_exceptions(arch, tmp_path):
     The PE is compiled with posix-threading g++ (DWARF-2 or SJLJ) so exceptions
     are self-contained.  peor's ctors runner initialises the GCC EH runtime before
     main runs.  The Linux loader prints the return value; test checks stdout == '42'.
-    Tested for x64 and x86.
+    Tested for x64 and x86 only - see the module comment directly above this test for why
+    ARM64/ARM32 are parked (genuinely blocked, not skipped).
     """
     use_wsl = platform.system() == "Windows"
     prebuild_dir = _LINUX_PREBUILD_X64 if arch == "x64" else _LINUX_PREBUILD_X86
@@ -1453,6 +1579,24 @@ def _find_clang_arm64() -> "str | None":
     return None
 
 
+def _find_lld_link_arm64() -> "str | None":
+    """Return path to a plain lld-link COFF linker, or None.
+
+    Plain lld-link (not clang's mingw-emulation driver) is what the arm64
+    05 linux PE must be linked with: the mingw-emulation driver folds .ctors
+    into other sections, leaving no ctors section for _detect_pe_features (see
+    _build_linux_global_ctor_pe_arm64). Checks PATH first, then LLVM's
+    /usr/lib/llvm-*/bin install locations (how Debian/Ubuntu distros ship it;
+    the ubuntu-24.04-arm CI runner has no bare `lld-link` on PATH).
+    """
+    path = shutil.which("lld-link")
+    if path:
+        return path
+    for candidate in sorted(glob.glob("/usr/lib/llvm-*/bin/lld-link")):
+        return candidate
+    return None
+
+
 def _find_qemu_user_arm64_wsl() -> "str | None":
     """Return the WSL-side qemu-aarch64 user-mode-emulation binary name, or None.
 
@@ -1492,6 +1636,120 @@ def _find_clang_arm64_wsl() -> "tuple[str | None, bool]":
         except (subprocess.TimeoutExpired, FileNotFoundError):
             pass
     return None, None
+
+
+def _find_llvm_dlltool_wsl() -> "str | None":
+    """Return the WSL-side llvm-dlltool path, or None (non-Windows host / WSL / tool absent)."""
+    if platform.system() != "Windows":
+        return None
+    try:
+        r = _wsl_bash_run(
+            "command -v llvm-dlltool || ls /usr/lib/llvm-*/bin/llvm-dlltool 2>/dev/null | head -1",
+            capture_output=True, timeout=10,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    if r.returncode != 0:
+        return None
+    lines = [ln.strip() for ln in r.stdout.decode(errors="replace").splitlines() if ln.strip()]
+    return lines[-1] if lines else None
+
+
+def _wsl_build_linux_arm64_libc_pe(def_file: Path, imp_lib: Path,
+                                    obj_file: Path, src: Path, exe: Path) -> "Path | None":
+    """The dlltool+clang+lld 3-step build of a libc-importing arm64 linux PE, run inside WSL.
+
+    Windows-host fallback for the native builders (_build_linux_write_pe_arm64 et al.) when
+    no native clang carries the aarch64-w64-mingw32 target on the Windows host: the identical
+    steps run through WSL's clang (every path argument passed as a /mnt path; the .def file is
+    still written host-side and read WSL-side via /mnt, so no quoting gymnastics needed).
+    Returns exe on success, None on any step failure (timeout / missing WSL included) —
+    callers already treat None as 'not built'.
+    """
+    if platform.system() != "Windows":
+        return None
+    dlltool = _find_llvm_dlltool_wsl()
+    if not dlltool:
+        return None
+    wsrc, wdef = _win_path_to_wsl(src), _win_path_to_wsl(def_file)
+    wimp, wobj, wexe = _win_path_to_wsl(imp_lib), _win_path_to_wsl(obj_file), _win_path_to_wsl(exe)
+    # exec prefix: _wsl_bash_run routes through Git Bash on Windows hosts, whose
+    # MSYS path-mangles a command string whose first token is a POSIX path
+    # (/usr/lib/llvm-*/bin/llvm-dlltool -> C:/Program Files/Git/usr/...); starting
+    # the string with a bare word keeps the heuristic away.
+    steps = [
+        f"exec {dlltool} -m arm64 -D {_LIBC_DLL_NAME} -d {wdef} -l {wimp}",
+        f"exec clang -target aarch64-w64-mingw32 -nostdlib -nodefaultlibs -nostartfiles"
+        f" -fno-unwind-tables -fno-asynchronous-unwind-tables"
+        f" -c {wsrc} -o {wobj}",
+        f"exec clang -target aarch64-w64-mingw32 -nostdlib -nodefaultlibs -nostartfiles"
+        f" -fno-unwind-tables -fno-asynchronous-unwind-tables -fuse-ld=lld"
+        f" -Wl,-e,main -Wl,--subsystem,posix {wobj} {wimp} -o {wexe}",
+    ]
+    try:
+        for cmd in steps:
+            r = _wsl_bash_run(cmd, capture_output=True, timeout=90)
+            if r.returncode != 0:
+                return None
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    return exe if exe.exists() else None
+
+
+def _wsl_build_linux_arm64_global_ctor_pe(obj_file: Path, src: Path, exe: Path) -> "Path | None":
+    """WSL twin of _build_linux_global_ctor_pe_arm64's native steps (no libc imports,
+    so no dlltool step; same -fno-exceptions -fno-rtti flags, /mnt paths): compile
+    with clang, LINK with plain lld-link (see _find_lld_link_arm64 for why the
+    mingw-emulation driver must not be used), /mnt paths throughout.
+    Returns exe on success, None on any step failure."""
+    if platform.system() != "Windows":
+        return None
+    flags = ("-target aarch64-w64-mingw32 -nostdlib -nodefaultlibs -nostartfiles"
+             " -fno-unwind-tables -fno-asynchronous-unwind-tables"
+             " -fno-exceptions -fno-rtti")
+    wsrc, wobj, wexe = _win_path_to_wsl(src), _win_path_to_wsl(obj_file), _win_path_to_wsl(exe)
+    # exec prefix: see _wsl_build_linux_arm64_libc_pe (MSYS path-mangling guard).
+    r = _wsl_bash_run(
+        "exec clang " + flags + " -c " + wsrc + " -o " + wobj,
+        capture_output=True, timeout=90,
+    )
+    if r.returncode != 0:
+        return None
+    lld_link = _find_wsl_lld_link()
+    if not lld_link:
+        return None
+    try:
+        r = _wsl_bash_run(
+            f"exec {lld_link} /MACHINE:ARM64 /SUBSYSTEM:POSIX /ENTRY:main"
+            f" {wobj} -out:{wexe}",
+            capture_output=True, timeout=90,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    return exe if (r.returncode == 0 and exe.exists()) else None
+
+
+def _find_wsl_lld_link() -> "str | None":
+    """Return the WSL-side plain lld-link path, or None (non-Windows host / absent tool).
+
+    Same rationale as _find_lld_link_arm64's no-mingw-driver rule: the arm64 05
+    linux PE must be linked by plain lld-link so .ctors survives as a section.
+    Probe starts with a bare word (command), not a POSIX path, so the MSYS
+    path-mangling guard doesn't apply.
+    """
+    if platform.system() != "Windows":
+        return None
+    try:
+        r = _wsl_bash_run(
+            "command -v lld-link || ls /usr/lib/llvm-*/bin/lld-link 2>/dev/null | head -1",
+            capture_output=True, timeout=10,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    if r.returncode != 0:
+        return None
+    lines = [ln.strip() for ln in r.stdout.decode(errors="replace").splitlines() if ln.strip()]
+    return lines[-1] if lines else None
 
 
 def _compile_efi_pe_arm64(src: Path, out: Path, extra_includes: "Path | None",
@@ -2602,18 +2860,174 @@ def _build_linux_crt_pe(tmp_path: Path, use_wsl: bool, *, arch: str = "x64") -> 
     return exe
 
 
-@pytest.mark.parametrize("arch", ["x64", "x86"])
+def _build_linux_crt_pe_arm64(tmp_path: Path) -> "Path | None":
+    """Cross-compile tests/Linux/03_linux_with_crt/main.c as an ARM64 PE with libc.so.6 imports.
+
+    Same clang+lld aarch64-w64-mingw32 + llvm-dlltool toolchain as _build_linux_write_pe_arm64
+    (no real aarch64-w64-mingw32-gcc exists — see that function's docstring). main.c's
+    SYSV_ABI attribute (applied to the libc imports under _WIN64) exists only to correct the
+    x64 Windows-vs-SysV ABI mismatch; on AArch64 it is a harmless no-op (clang emits an
+    "ignored attribute" warning, confirmed empirically) because Windows ARM64 and Linux ARM64
+    share the same AAPCS64 calling convention — no correction is needed or possible there.
+    """
+    stable = _LINUX_PREBUILD_ARM64 / "03_linux_with_crt_arm64.pe"
+    if stable.exists():
+        return stable
+    _LINUX_PREBUILD_ARM64.mkdir(parents=True, exist_ok=True)
+
+    src = TESTS_DIR / "Linux" / "03_linux_with_crt" / "main.c"
+    if not src.exists():
+        return None
+
+    def_file = tmp_path / "libc_crt_arm64.def"
+    imp_lib  = tmp_path / "liblibc_crt_arm64.a"
+    obj_file = tmp_path / "03_linux_with_crt_arm64.o"
+    def_file.write_text(_LIBC_DEF_CONTENT_CRT, encoding="ascii")
+
+    clang = _find_clang_arm64()
+    if not clang:
+        if platform.system() != "Windows":
+            return None
+        # Windows host without native aarch64-w64-mingw32 clang: identical
+        # steps through WSL's clang + llvm-dlltool.
+        return _wsl_build_linux_arm64_libc_pe(def_file, imp_lib, obj_file, src, stable)
+    llvm_dlltool = str(Path(clang).parent / "llvm-dlltool.exe")
+    if not Path(llvm_dlltool).exists():
+        llvm_dlltool = shutil.which("llvm-dlltool")
+    if not llvm_dlltool:
+        return None
+
+    dt = subprocess.run(
+        [llvm_dlltool, "-m", "arm64", "-D", _LIBC_DLL_NAME, "-d", str(def_file), "-l", str(imp_lib)],
+        capture_output=True, timeout=30,
+    )
+    if dt.returncode != 0:
+        return None
+
+    cc1 = subprocess.run(
+        [clang, "-target", "aarch64-w64-mingw32", "-nostdlib", "-nodefaultlibs", "-nostartfiles",
+         "-fno-unwind-tables", "-fno-asynchronous-unwind-tables",
+         "-c", str(src), "-o", str(obj_file)],
+        capture_output=True, timeout=30,
+    )
+    if cc1.returncode != 0:
+        return None
+
+    exe = stable
+    cc2 = subprocess.run(
+        [clang, "-target", "aarch64-w64-mingw32", "-nostdlib", "-nodefaultlibs", "-nostartfiles",
+         "-fno-unwind-tables", "-fno-asynchronous-unwind-tables", "-fuse-ld=lld",
+         "-Wl,-e,main", "-Wl,--subsystem,posix",
+         str(obj_file), str(imp_lib), "-o", str(exe)],
+        capture_output=True, timeout=30,
+    )
+    if cc2.returncode != 0 or not exe.exists():
+        return None
+    return exe
+
+
+def _build_linux_crt_pe_arm32(tmp_path: Path) -> "Path | None":
+    """Cross-compile tests/Linux/03_linux_with_crt/main.c as an ARM32 PE with libc.so.6 imports.
+
+    NOT YET CALLED by any test - parked for the same reason as _build_linux_write_pe_arm32
+    (see its docstring and .superpowers/sdd/2026-10-27-linux-arm-pe-support.md, Task 2 entry):
+    building this PE only needs the clang+lld armv7-w64-mingw32 toolchain (confirmed present),
+    but *running* it needs a real ARM32 Linux ELF test_loader_linux_arm32, which needs an
+    arm-linux-gnueabihf glibc cross-toolchain or the armhf runtime libs — still unavailable in
+    this session's WSL environment as of Task 3 (re-confirmed: no arm-linux-gnueabihf-gcc,
+    dpkg --print-foreign-architectures has no armhf, sudo is non-interactive-only).
+    """
+    stable = _LINUX_PREBUILD_ARM32 / "03_linux_with_crt_arm32.pe"
+    if stable.exists():
+        return stable
+    _LINUX_PREBUILD_ARM32.mkdir(parents=True, exist_ok=True)
+
+    src = TESTS_DIR / "Linux" / "03_linux_with_crt" / "main.c"
+    if not src.exists():
+        return None
+
+    clang = _find_clang_arm32()
+    if not clang:
+        return None
+    llvm_dlltool = str(Path(clang).parent / "llvm-dlltool.exe")
+    if not Path(llvm_dlltool).exists():
+        llvm_dlltool = shutil.which("llvm-dlltool")
+    if not llvm_dlltool:
+        return None
+
+    def_file = tmp_path / "libc_crt_arm32.def"
+    imp_lib  = tmp_path / "liblibc_crt_arm32.a"
+    obj_file = tmp_path / "03_linux_with_crt_arm32.o"
+    def_file.write_text(_LIBC_DEF_CONTENT_CRT, encoding="ascii")
+
+    dt = subprocess.run(
+        [llvm_dlltool, "-m", "arm", "-D", _LIBC_DLL_NAME, "-d", str(def_file), "-l", str(imp_lib)],
+        capture_output=True, timeout=30,
+    )
+    if dt.returncode != 0:
+        return None
+
+    _ARM32_CFLAGS = [
+        "-target", "armv7-w64-mingw32", "-mthumb",
+        "-nostdlib", "-nodefaultlibs", "-nostartfiles",
+        "-fno-unwind-tables", "-fno-asynchronous-unwind-tables",
+    ]
+
+    cc1 = subprocess.run(
+        [clang] + _ARM32_CFLAGS + ["-c", str(src), "-o", str(obj_file)],
+        capture_output=True, timeout=30,
+    )
+    if cc1.returncode != 0:
+        return None
+
+    exe = stable
+    cc2 = subprocess.run(
+        [clang] + _ARM32_CFLAGS + ["-fuse-ld=lld",
+         "-Wl,-e,main", "-Wl,--subsystem,posix",
+         str(obj_file), str(imp_lib), "-o", str(exe)],
+        capture_output=True, timeout=30,
+    )
+    if cc2.returncode != 0 or not exe.exists():
+        return None
+    return exe
+
+
+@pytest.mark.parametrize("arch", ["x64", "x86", "arm64"])
 def test_03_linux_with_crt(arch, tmp_path):
     """Linux C++ shellcode with CRT imports: uses strlen/malloc/free from libc.so.6.
 
     Compiles main.c linking against a libc.so.6 import lib; the Linux import
     resolver dlopen()s libc.so.6 at runtime.  Returns 73 on success.
-    Tested for both x64 and x86.
+    Tested for x64, x86 and arm64 (clang+lld aarch64-w64-mingw32, executed under qemu-aarch64
+    user-mode emulation on x86_64 hosts — see test_01_linux_write's docstring for the toolchain
+    rationale — or natively when the host itself is aarch64).
+    ARM32 is parked, not wired: see _build_linux_crt_pe_arm32's docstring.
     """
     use_wsl = platform.system() == "Windows"
-    exe = (_LINUX_PREBUILD_X64 if arch == "x64" else _LINUX_PREBUILD_X86) / f"03_linux_with_crt_{arch}.pe"
-    loader = (TESTS_DIR / "test_loader_linux"
-              / ("test_loader_linux.pe" if arch == "x64" else "test_loader_linux_32.pe"))
+    qemu_arm64 = None
+    if arch == "x64":
+        exe = _LINUX_PREBUILD_X64 / "03_linux_with_crt_x64.pe"
+        loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux.pe"
+    elif arch == "x86":
+        exe = _LINUX_PREBUILD_X86 / "03_linux_with_crt_x86.pe"
+        loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux_32.pe"
+    else:
+        exe = _LINUX_PREBUILD_ARM64 / "03_linux_with_crt_arm64.pe"
+        loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux_arm64.pe"
+        host_is_arm64 = platform.machine() in ("aarch64", "arm64")
+        if host_is_arm64:
+            # Native aarch64 host (ubuntu-24.04-arm CI / ARM Linux dev boxes): the
+            # loader and the PE are both aarch64 code — run the loader directly.
+            qemu_arm64 = None
+        else:
+            qemu_arm64 = (_find_qemu_user_arm64_wsl() if use_wsl
+                          else (shutil.which("qemu-aarch64-static") or shutil.which("qemu-aarch64")))
+            assert qemu_arm64, \
+                "qemu-aarch64 user-mode emulator not found (needed to run the arm64 loader on this host)"
+        if not Path(loader).exists():
+            # Fresh-clone fallback so `pytest tests/pytest` alone still passes (same
+            # rationale as test_01_linux_write).
+            _ensure_linux_loader_arm64()
 
     assert exe.exists(), f"prebuilt Linux test PE not found: {exe} — run tests/build_tests.sh first"
     assert loader.exists(), f"Linux test_loader not found: {loader} — run tests/build_tests.sh first"
@@ -2624,11 +3038,11 @@ def test_03_linux_with_crt(arch, tmp_path):
     if use_wsl:
         sc_wsl = _win_path_to_wsl(sc)
         loader_wsl = _win_path_to_wsl(loader)
-        result = subprocess.run(
-            ["wsl", "--", loader_wsl, sc_wsl], capture_output=True, timeout=15
-        )
+        cmd = ["wsl", "--"] + ([qemu_arm64, loader_wsl, sc_wsl] if qemu_arm64 else [loader_wsl, sc_wsl])
+        result = subprocess.run(cmd, capture_output=True, timeout=15)
     else:
-        result = subprocess.run([str(loader), str(sc)], capture_output=True, timeout=15)
+        cmd = ([qemu_arm64, str(loader), str(sc)] if qemu_arm64 else [str(loader), str(sc)])
+        result = subprocess.run(cmd, capture_output=True, timeout=15)
 
     assert result.returncode == 0, (
         f"[linux_crt {arch}] loader crashed with code {result.returncode}\n"
@@ -2718,16 +3132,164 @@ def _build_linux_signal_pe(tmp_path: Path, use_wsl: bool, *, arch: str = "x64") 
     return exe
 
 
-@pytest.mark.parametrize("arch", ["x64", "x86"])
+def _build_linux_signal_pe_arm64(tmp_path: Path) -> "Path | None":
+    """Cross-compile tests/Linux/04_linux_signal/main.c as an ARM64 PE with libc.so.6 imports.
+
+    Same clang+lld aarch64-w64-mingw32 + llvm-dlltool toolchain as _build_linux_write_pe_arm64.
+    See _build_linux_crt_pe_arm64's docstring re: main.c's SYSV_ABI attribute being a harmless
+    no-op on AArch64 (Windows ARM64 and Linux ARM64 share the same AAPCS64 convention).
+    """
+    stable = _LINUX_PREBUILD_ARM64 / "04_linux_signal_arm64.pe"
+    if stable.exists():
+        return stable
+    _LINUX_PREBUILD_ARM64.mkdir(parents=True, exist_ok=True)
+
+    src = _LINUX_SIGNAL_SRC
+    if not src.exists():
+        return None
+
+    def_file = tmp_path / "libc_signal_arm64.def"
+    imp_lib  = tmp_path / "liblibc_signal_arm64.a"
+    obj_file = tmp_path / "04_linux_signal_arm64.o"
+    def_file.write_text(_LIBC_DEF_CONTENT_SIGNAL, encoding="ascii")
+
+    clang = _find_clang_arm64()
+    if not clang:
+        if platform.system() != "Windows":
+            return None
+        # Windows host without native aarch64-w64-mingw32 clang: identical
+        # steps through WSL's clang + llvm-dlltool.
+        return _wsl_build_linux_arm64_libc_pe(def_file, imp_lib, obj_file, src, stable)
+    llvm_dlltool = str(Path(clang).parent / "llvm-dlltool.exe")
+    if not Path(llvm_dlltool).exists():
+        llvm_dlltool = shutil.which("llvm-dlltool")
+    if not llvm_dlltool:
+        return None
+
+    dt = subprocess.run(
+        [llvm_dlltool, "-m", "arm64", "-D", _LIBC_DLL_NAME, "-d", str(def_file), "-l", str(imp_lib)],
+        capture_output=True, timeout=30,
+    )
+    if dt.returncode != 0:
+        return None
+
+    cc1 = subprocess.run(
+        [clang, "-target", "aarch64-w64-mingw32", "-nostdlib", "-nodefaultlibs", "-nostartfiles",
+         "-fno-unwind-tables", "-fno-asynchronous-unwind-tables",
+         "-c", str(src), "-o", str(obj_file)],
+        capture_output=True, timeout=30,
+    )
+    if cc1.returncode != 0:
+        return None
+
+    exe = stable
+    cc2 = subprocess.run(
+        [clang, "-target", "aarch64-w64-mingw32", "-nostdlib", "-nodefaultlibs", "-nostartfiles",
+         "-fno-unwind-tables", "-fno-asynchronous-unwind-tables", "-fuse-ld=lld",
+         "-Wl,-e,main", "-Wl,--subsystem,posix",
+         str(obj_file), str(imp_lib), "-o", str(exe)],
+        capture_output=True, timeout=30,
+    )
+    if cc2.returncode != 0 or not exe.exists():
+        return None
+    return exe
+
+
+def _build_linux_signal_pe_arm32(tmp_path: Path) -> "Path | None":
+    """Cross-compile tests/Linux/04_linux_signal/main.c as an ARM32 PE with libc.so.6 imports.
+
+    NOT YET CALLED by any test - parked for the same reason as _build_linux_write_pe_arm32:
+    building succeeds (clang+lld armv7-w64-mingw32, confirmed present) but running it needs a
+    real ARM32 Linux ELF test_loader_linux_arm32, blocked on a missing arm-linux-gnueabihf
+    glibc cross-toolchain in this session's WSL environment (re-confirmed as of Task 3).
+    """
+    stable = _LINUX_PREBUILD_ARM32 / "04_linux_signal_arm32.pe"
+    if stable.exists():
+        return stable
+    _LINUX_PREBUILD_ARM32.mkdir(parents=True, exist_ok=True)
+
+    src = _LINUX_SIGNAL_SRC
+    if not src.exists():
+        return None
+
+    clang = _find_clang_arm32()
+    if not clang:
+        return None
+    llvm_dlltool = str(Path(clang).parent / "llvm-dlltool.exe")
+    if not Path(llvm_dlltool).exists():
+        llvm_dlltool = shutil.which("llvm-dlltool")
+    if not llvm_dlltool:
+        return None
+
+    def_file = tmp_path / "libc_signal_arm32.def"
+    imp_lib  = tmp_path / "liblibc_signal_arm32.a"
+    obj_file = tmp_path / "04_linux_signal_arm32.o"
+    def_file.write_text(_LIBC_DEF_CONTENT_SIGNAL, encoding="ascii")
+
+    dt = subprocess.run(
+        [llvm_dlltool, "-m", "arm", "-D", _LIBC_DLL_NAME, "-d", str(def_file), "-l", str(imp_lib)],
+        capture_output=True, timeout=30,
+    )
+    if dt.returncode != 0:
+        return None
+
+    _ARM32_CFLAGS = [
+        "-target", "armv7-w64-mingw32", "-mthumb",
+        "-nostdlib", "-nodefaultlibs", "-nostartfiles",
+        "-fno-unwind-tables", "-fno-asynchronous-unwind-tables",
+    ]
+
+    cc1 = subprocess.run(
+        [clang] + _ARM32_CFLAGS + ["-c", str(src), "-o", str(obj_file)],
+        capture_output=True, timeout=30,
+    )
+    if cc1.returncode != 0:
+        return None
+
+    exe = stable
+    cc2 = subprocess.run(
+        [clang] + _ARM32_CFLAGS + ["-fuse-ld=lld",
+         "-Wl,-e,main", "-Wl,--subsystem,posix",
+         str(obj_file), str(imp_lib), "-o", str(exe)],
+        capture_output=True, timeout=30,
+    )
+    if cc2.returncode != 0 or not exe.exists():
+        return None
+    return exe
+
+
+@pytest.mark.parametrize("arch", ["x64", "x86", "arm64"])
 def test_04_linux_signal(arch, tmp_path):
     """Linux import resolver: PE imports signal()/raise() from libc.so.6; shellcode installs
     SIGUSR1 handler and raises it; returns 77 (SIGNAL_RETURN_CODE) when handler is called.
-    Tested for both x64 and x86.
+    Tested for x64, x86 and arm64 (see test_01_linux_write for the qemu-aarch64 rationale).
+    ARM32 is parked, not wired: see _build_linux_signal_pe_arm32's docstring.
     """
     use_wsl = platform.system() == "Windows"
-    exe = (_LINUX_PREBUILD_X64 if arch == "x64" else _LINUX_PREBUILD_X86) / f"04_linux_signal_{arch}.pe"
-    loader = (TESTS_DIR / "test_loader_linux"
-              / ("test_loader_linux.pe" if arch == "x64" else "test_loader_linux_32.pe"))
+    qemu_arm64 = None
+    if arch == "x64":
+        exe = _LINUX_PREBUILD_X64 / "04_linux_signal_x64.pe"
+        loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux.pe"
+    elif arch == "x86":
+        exe = _LINUX_PREBUILD_X86 / "04_linux_signal_x86.pe"
+        loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux_32.pe"
+    else:
+        exe = _LINUX_PREBUILD_ARM64 / "04_linux_signal_arm64.pe"
+        loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux_arm64.pe"
+        host_is_arm64 = platform.machine() in ("aarch64", "arm64")
+        if host_is_arm64:
+            # Native aarch64 host (ubuntu-24.04-arm CI / ARM Linux dev boxes): the
+            # loader and the PE are both aarch64 code — run the loader directly.
+            qemu_arm64 = None
+        else:
+            qemu_arm64 = (_find_qemu_user_arm64_wsl() if use_wsl
+                          else (shutil.which("qemu-aarch64-static") or shutil.which("qemu-aarch64")))
+            assert qemu_arm64, \
+                "qemu-aarch64 user-mode emulator not found (needed to run the arm64 loader on this host)"
+        if not Path(loader).exists():
+            # Fresh-clone fallback so `pytest tests/pytest` alone still passes (same
+            # rationale as test_01_linux_write).
+            _ensure_linux_loader_arm64()
 
     assert exe.exists(), f"prebuilt Linux test PE not found: {exe} — run tests/build_tests.sh first"
     assert loader.exists(), f"Linux test_loader not found: {loader} — run tests/build_tests.sh first"
@@ -2738,9 +3300,11 @@ def test_04_linux_signal(arch, tmp_path):
     if use_wsl:
         sc_wsl     = _win_path_to_wsl(sc)
         loader_wsl = _win_path_to_wsl(loader)
-        result = subprocess.run(["wsl", "--", loader_wsl, sc_wsl], capture_output=True, timeout=15)
+        cmd = ["wsl", "--"] + ([qemu_arm64, loader_wsl, sc_wsl] if qemu_arm64 else [loader_wsl, sc_wsl])
+        result = subprocess.run(cmd, capture_output=True, timeout=15)
     else:
-        result = subprocess.run([str(loader), str(sc)], capture_output=True, timeout=15)
+        cmd = ([qemu_arm64, str(loader), str(sc)] if qemu_arm64 else [str(loader), str(sc)])
+        result = subprocess.run(cmd, capture_output=True, timeout=15)
 
     assert result.returncode == 0, (
         f"[linux_signal {arch}] loader crashed with code {result.returncode}\n"
@@ -2756,15 +3320,159 @@ def test_04_linux_signal(arch, tmp_path):
 _LINUX_GLOBAL_CTOR_SRC = TESTS_DIR / "Linux" / "05_linux_global_ctor" / "main.cpp"
 
 
-@pytest.mark.parametrize("arch", ["x64", "x86"])
+def _build_linux_global_ctor_pe_arm64(tmp_path: Path) -> "Path | None":
+    """Compile tests/Linux/05_linux_global_ctor/main.cpp as an ARM64 PE.
+
+    Unlike test 02 (C++ exceptions), this test has no throw/catch - the two Adder global
+    constructors run from .init_array with plain function calls, no C++ exception-handling
+    runtime (__cxa_throw/__cxa_begin_catch/personality routine/typeinfo vtables) involved at
+    all. So, unlike test 02, this ports cleanly to clang + plain lld-link
+    aarch64-w64-mingw32 with
+    -fno-exceptions -fno-rtti and no extra runtime: compile+link produces a clean PE with zero
+    undefined symbols (confirmed empirically - see progress.md's Task 3 entry). The link step
+    MUST be plain lld-link (not clang's -fuse-ld=lld mingw-emulation driver): the driver folds
+    .ctors into other sections, which leaves _detect_pe_features with no ctors section and the
+    chain silently runs the PE with zero static storage - main's fail code exactly.
+    peor's ctors
+    runner (CTORS_RUNNER_ARM64, already wired into _PLATFORM_LINUX_ARM64 by Task 1) is
+    arch-generic and was already proven against this exact .ctors mechanism.
+    No libc imports are needed (main.cpp calls no libc functions), so no dlltool step either.
+    """
+    stable = _LINUX_PREBUILD_ARM64 / "05_linux_global_ctor_arm64.pe"
+    if stable.exists():
+        return stable
+    _LINUX_PREBUILD_ARM64.mkdir(parents=True, exist_ok=True)
+
+    src = _LINUX_GLOBAL_CTOR_SRC
+    if not src.exists():
+        return None
+
+    clang = _find_clang_arm64()
+    if not clang:
+        if platform.system() != "Windows":
+            return None
+        # Windows host without native aarch64-w64-mingw32 clang: identical
+        # steps through WSL's clang.
+        return _wsl_build_linux_arm64_global_ctor_pe(tmp_path / "05_linux_global_ctor_arm64.o",
+                                                     src, stable)
+
+    obj_file = tmp_path / "05_linux_global_ctor_arm64.o"
+    _CXX_FLAGS = [
+        "-target", "aarch64-w64-mingw32", "-nostdlib", "-nodefaultlibs", "-nostartfiles",
+        "-fno-unwind-tables", "-fno-asynchronous-unwind-tables",
+        "-fno-exceptions", "-fno-rtti",
+    ]
+
+    cc1 = subprocess.run(
+        [clang] + _CXX_FLAGS + ["-c", str(src), "-o", str(obj_file)],
+        capture_output=True, timeout=30,
+    )
+    if cc1.returncode != 0:
+        return None
+
+    # Link with plain lld-link, NOT clang's mingw-emulation driver: the latter folds
+    # .ctors into other sections (rdata), which leaves _detect_pe_features with no
+    # ctors section and the chain silently runs the PE with zeroed static storage
+    # (counter={0} -> main's fail code exactly, seen CI-native). Plain lld-link
+    # preserves .ctors as its own section for the ctors runner to consume.
+    exe = stable
+    lld_link = _find_lld_link_arm64()
+    if not lld_link:
+        if platform.system() != "Windows":
+            return None
+        # Windows host with clang but no lld-link is not expected; only WSL fallback.
+        return _wsl_build_linux_arm64_global_ctor_pe(obj_file, src, stable)
+    cc2 = subprocess.run(
+        [lld_link, "/MACHINE:ARM64", "/SUBSYSTEM:POSIX", "/ENTRY:main",
+         str(obj_file), f"-out:{exe}"],
+        capture_output=True, timeout=30,
+    )
+    if cc2.returncode != 0 or not exe.exists():
+        return None
+    return exe
+
+
+def _build_linux_global_ctor_pe_arm32(tmp_path: Path) -> "Path | None":
+    """Compile tests/Linux/05_linux_global_ctor/main.cpp as an ARM32 PE.
+
+    NOT YET CALLED by any test - parked for the same reason as _build_linux_write_pe_arm32:
+    building succeeds (clang+lld armv7-w64-mingw32, confirmed present, no EH runtime needed -
+    see _build_linux_global_ctor_pe_arm64's docstring) but running it needs a real ARM32 Linux
+    ELF test_loader_linux_arm32, blocked on a missing arm-linux-gnueabihf glibc cross-toolchain
+    in this session's WSL environment (re-confirmed as of Task 3).
+    """
+    stable = _LINUX_PREBUILD_ARM32 / "05_linux_global_ctor_arm32.pe"
+    if stable.exists():
+        return stable
+    _LINUX_PREBUILD_ARM32.mkdir(parents=True, exist_ok=True)
+
+    src = _LINUX_GLOBAL_CTOR_SRC
+    if not src.exists():
+        return None
+
+    clang = _find_clang_arm32()
+    if not clang:
+        return None
+
+    obj_file = tmp_path / "05_linux_global_ctor_arm32.o"
+    _CXX_FLAGS = [
+        "-target", "armv7-w64-mingw32", "-mthumb",
+        "-nostdlib", "-nodefaultlibs", "-nostartfiles",
+        "-fno-unwind-tables", "-fno-asynchronous-unwind-tables",
+        "-fno-exceptions", "-fno-rtti",
+    ]
+
+    cc1 = subprocess.run(
+        [clang] + _CXX_FLAGS + ["-c", str(src), "-o", str(obj_file)],
+        capture_output=True, timeout=30,
+    )
+    if cc1.returncode != 0:
+        return None
+
+    exe = stable
+    cc2 = subprocess.run(
+        [clang] + _CXX_FLAGS + ["-fuse-ld=lld",
+         "-Wl,-e,main", "-Wl,--subsystem,posix",
+         str(obj_file), "-o", str(exe)],
+        capture_output=True, timeout=30,
+    )
+    if cc2.returncode != 0 or not exe.exists():
+        return None
+    return exe
+
+
+@pytest.mark.parametrize("arch", ["x64", "x86", "arm64"])
 def test_05_linux_global_ctor(arch, tmp_path):
     """Linux global C++ constructor test: peor's ctors runner fires two Adder constructors
-    before main(); counter reaches 99; main returns 99.  Tested for x64 and x86.
+    before main(); counter reaches 99; main returns 99.  Tested for x64, x86 and arm64
+    (see test_01_linux_write for the qemu-aarch64 rationale).
+    ARM32 is parked, not wired: see _build_linux_global_ctor_pe_arm32's docstring.
     """
     use_wsl = platform.system() == "Windows"
-    exe = (_LINUX_PREBUILD_X64 if arch == "x64" else _LINUX_PREBUILD_X86) / f"05_linux_global_ctor_{arch}.pe"
-    loader = (TESTS_DIR / "test_loader_linux"
-              / ("test_loader_linux.pe" if arch == "x64" else "test_loader_linux_32.pe"))
+    qemu_arm64 = None
+    if arch == "x64":
+        exe = _LINUX_PREBUILD_X64 / "05_linux_global_ctor_x64.pe"
+        loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux.pe"
+    elif arch == "x86":
+        exe = _LINUX_PREBUILD_X86 / "05_linux_global_ctor_x86.pe"
+        loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux_32.pe"
+    else:
+        exe = _LINUX_PREBUILD_ARM64 / "05_linux_global_ctor_arm64.pe"
+        loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux_arm64.pe"
+        host_is_arm64 = platform.machine() in ("aarch64", "arm64")
+        if host_is_arm64:
+            # Native aarch64 host (ubuntu-24.04-arm CI / ARM Linux dev boxes): the
+            # loader and the PE are both aarch64 code — run the loader directly.
+            qemu_arm64 = None
+        else:
+            qemu_arm64 = (_find_qemu_user_arm64_wsl() if use_wsl
+                          else (shutil.which("qemu-aarch64-static") or shutil.which("qemu-aarch64")))
+            assert qemu_arm64, \
+                "qemu-aarch64 user-mode emulator not found (needed to run the arm64 loader on this host)"
+        if not Path(loader).exists():
+            # Fresh-clone fallback so `pytest tests/pytest` alone still passes (same
+            # rationale as test_01_linux_write).
+            _ensure_linux_loader_arm64()
 
     assert exe.exists(), f"prebuilt Linux test PE not found: {exe} — run tests/build_tests.sh first"
     assert loader.exists(), f"Linux test_loader not found: {loader} — run tests/build_tests.sh first"
@@ -2775,9 +3483,11 @@ def test_05_linux_global_ctor(arch, tmp_path):
     if use_wsl:
         sc_wsl     = _win_path_to_wsl(sc)
         loader_wsl = _win_path_to_wsl(loader)
-        result = subprocess.run(["wsl", "--", loader_wsl, sc_wsl], capture_output=True, timeout=15)
+        cmd = ["wsl", "--"] + ([qemu_arm64, loader_wsl, sc_wsl] if qemu_arm64 else [loader_wsl, sc_wsl])
+        result = subprocess.run(cmd, capture_output=True, timeout=15)
     else:
-        result = subprocess.run([str(loader), str(sc)], capture_output=True, timeout=15)
+        cmd = ([qemu_arm64, str(loader), str(sc)] if qemu_arm64 else [str(loader), str(sc)])
+        result = subprocess.run(cmd, capture_output=True, timeout=15)
 
     assert result.returncode == 0, (
         f"[linux_global_ctor {arch}] loader crashed with code {result.returncode}\n"

@@ -127,6 +127,7 @@ def _assemble_shellcodes():
     ctors_arm32 = assemble_arm32(ASM_DIR / 'ctors_runner_arm32.asm')
     e_efi_arm32_raw = assemble_arm32(ASM_DIR / 'entrypoint_resolver_efi_arm32.asm')
     e_arm32_raw = assemble_arm32(ASM_DIR / 'entrypoint_resolver_arm32.asm')
+    i_arm32_linux = assemble_arm32(ASM_DIR / 'imports_resolver_arm32_linux.asm')
     # AAPCS callee-save only: the shellcode is called as EFI_STATUS(void), so r0/r1 are
     # never the firmware's ImageHandle/SystemTable (see entrypoint_resolver_efi_arm32.asm).
     arm32_efi_prefix_raw = assemble_arm32(
@@ -246,6 +247,8 @@ def _assemble_shellcodes():
         f"CTORS_RUNNER_ARM32     = bytes.fromhex('{ctors_arm32.hex()}')\n"
         f"ENTRYPOINT_EFI_ARM32   = bytes.fromhex('{e_efi_arm32.hex()}')\n"
         f"ARM32_EFI_PREFIX       = bytes.fromhex('{arm32_efi_prefix_raw.hex()}')\n"
+        f"IMPORTS_ARM32_LINUX    = bytes.fromhex('{i_arm32_linux.hex()}')\n"
+        f"ENTRYPOINT_ARM32       = bytes.fromhex('{e_arm32.hex()}')\n"
     )
 
     print(f"[peor] assembled shellcodes -> {SHELLCODES_PY}")

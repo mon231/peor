@@ -7,12 +7,15 @@
  * without Windows API imports).
  */
 #include <fcntl.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <ucontext.h>
 #include <unistd.h>
 
 #define NOP_SLED_MAX_OFFSET 1024
@@ -30,6 +33,47 @@ static void fill_nop_sled(uint8_t *mem, size_t nop_offset) {
         mem[i + 2] = NOP_WORD_ARM64[2];
         mem[i + 3] = NOP_WORD_ARM64[3];
     }
+}
+#endif
+
+#if defined(__aarch64__)
+static volatile uint8_t *g_dump_mem;
+static volatile size_t    g_dump_total;
+
+/* Debug aid for dissecting a hanging shellcode: PEOR_LOADER_DUMP=<path> installs a
+   SIGALRM handler that snapshots the whole mapping to <path> one second after the
+   call, then _exit(124)s. A hanging shellcode gets dumped mid-loop; a returning
+   shellcode dumps normally after main() returns. No effect when unset.
+   PEOR_LOADER_WATCH=1 instead samples pc/regs every second forever (no dump, no
+   exit) so a hang can be watched evolve. */
+static void dump_mapping_on_alarm(int sig, siginfo_t *si, void *uc_) {
+    (void)sig; (void)si;
+    ucontext_t *uc = (ucontext_t *)uc_;
+    uint64_t pc = uc->uc_mcontext.pc;
+    unsigned long long *r = uc->uc_mcontext.regs;
+    fprintf(stderr, "PEOR_LOADER_DUMP pc=%llx x0=%llx x1=%llx x2=%llx x3=%llx\n",
+            (unsigned long long)pc, r[0], r[1], r[2], r[3]);
+    fprintf(stderr, "     x8=%llx x19=%llx x20=%llx x21=%llx x22=%llx x23=%llx x24=%llx x30=%llx\n",
+            r[8], r[19], r[20], r[21], r[22], r[23], r[24], r[30]);
+    if (getenv("PEOR_LOADER_WATCH")) {
+        /* 20 ms samples: cheap enough for a few seconds, still readable. */
+        struct itimerval it;
+        memset(&it, 0, sizeof(it));
+        it.it_interval.tv_sec = 0;
+        it.it_interval.tv_usec = 20000;
+        it.it_value = it.it_interval;
+        setitimer(ITIMER_REAL, &it, NULL);
+        return;
+    }
+    const char *path = getenv("PEOR_LOADER_DUMP");
+    if (path) {
+        FILE *df = fopen(path, "wb");
+        if (df) {
+            fwrite((const void *)g_dump_mem, 1, g_dump_total, df);
+            fclose(df);
+        }
+    }
+    _exit(124);
 }
 #endif
 
@@ -105,6 +149,35 @@ int main(int argc, char *argv[]) {
         perror("mprotect");
         munmap(mem, total);
         return 1;
+    }
+
+#if defined(__aarch64__)
+    if (getenv("PEOR_LOADER_DUMP") || getenv("PEOR_LOADER_WATCH")) {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_sigaction = dump_mapping_on_alarm;
+        sa.sa_flags    = SA_SIGINFO;
+        sigaction(SIGALRM, &sa, NULL);
+        g_dump_mem   = mem;
+        g_dump_total = total;
+        alarm(1);
+    }
+#endif
+
+    /* Optional debug aid (PEOR_LOADER_DEBUG=1): print the mapping geometry so a
+       hanging shellcode can be dissected by dumping /proc/<pid>/mem pages at
+       known offsets. Prints to stderr, no output when the variable is unset. */
+    if (getenv("PEOR_LOADER_DEBUG")) {
+        fprintf(stderr, "PEOR_LOADER_DEBUG mem=%p nop_offset=%zu size=%zu total=%zu\n",
+                mem, nop_offset, size, total);
+        FILE *mf = fopen("/proc/self/maps", "re");
+        if (mf) {
+            char line[256];
+            while (fgets(line, sizeof(line), mf)) {
+                fputs(line, stderr);
+            }
+            fclose(mf);
+        }
     }
 
     /* The shellcode finds dlopen/dlsym by itself via /proc/self/maps + ELF parsing.

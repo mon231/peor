@@ -28,6 +28,7 @@ NOT built here — needs MSBuild, see tests/tests.sln:
   - Windows-native MSVC .exe test binaries
 """
 import sys
+import platform
 import importlib.util
 import subprocess
 from pathlib import Path
@@ -45,6 +46,12 @@ _spec.loader.exec_module(ts)
 
 _SIMPLE_EFI_TESTS = ["01_efi_hello", "02_efi_print", "03_efi_simple_calc", "05_efi_memory_services",
                      "06_efi_handle"]
+
+# platform.machine() spellings seen for a native AArch64 host (e.g. the ubuntu-24.04-arm
+# GitHub-hosted runner) - on such a host the ARM64 Linux loader is built with plain native
+# gcc, same as the x64/x86 loaders on an x86_64 host; everywhere else it needs the
+# aarch64-linux-gnu-gcc cross-compiler (confirmed installed in this session's WSL for Task 1).
+_HOST_MACHINE_AARCH64_NAMES = ("aarch64", "arm64")
 
 _FAILURES = []
 
@@ -89,6 +96,24 @@ def build_linux_loaders() -> None:
             _report("linux loader x86 (-m32)", r.returncode == 0, r.stderr.decode(errors="replace"))
         except FileNotFoundError:
             _report("linux loader x86 (-m32)", False, "gcc-multilib not found")
+
+    # ARM64: native gcc on an AArch64 host (e.g. ubuntu-24.04-arm CI runner), otherwise the
+    # aarch64-linux-gnu-gcc cross-compiler (local WSL dev, or any x86_64 host that has it).
+    # No -ffixed-<reg>/-ffixed-xNN flags needed here (unlike x64/x86's -ffixed-rbx etc.) -
+    # main.c already protects against the shellcode's register clobbers generically via
+    # `volatile` locals (see main.c's comment), which works for every arch, not just x64/x86.
+    loader_arm64 = loader_dir / "test_loader_linux_arm64.pe"
+    if loader_arm64.exists():
+        _report("linux loader arm64 (already built)", True)
+    else:
+        host_is_aarch64 = platform.machine().lower() in _HOST_MACHINE_AARCH64_NAMES
+        compiler = "gcc" if host_is_aarch64 else "aarch64-linux-gnu-gcc"
+        cmd = [compiler, "-O2", "-o", str(loader_arm64), str(src)]
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=30)
+            _report("linux loader arm64", r.returncode == 0, r.stderr.decode(errors="replace"))
+        except FileNotFoundError:
+            _report("linux loader arm64", False, f"{compiler} not found")
 
 
 def build_efi_source_pes() -> None:
@@ -211,6 +236,25 @@ def build_linux_test_pes() -> None:
         _report("linux x86/01_linux_write", exe is not None, "compile failed")
     else:
         _report("linux x86/01_linux_write", False, "i686-w64-mingw32-gcc not found (native or WSL)")
+
+    # arm64: clang+lld aarch64-w64-mingw32 (no real mingw-w64 GCC targets aarch64) +
+    # llvm-dlltool. 01/03/04/05 all have dedicated helpers; 02 (C++ exceptions) is
+    # deliberately not built here - see the module comment above test_02_linux_cpp_exceptions
+    # in tests/pytest/test_shellcode.py for why (missing C++ EH runtime for this cross target).
+    clang_arm64 = ts._find_clang_arm64()
+    arm64_targets = [
+        ("01_linux_write", ts._build_linux_write_pe_arm64),
+        ("03_linux_with_crt", ts._build_linux_crt_pe_arm64),
+        ("04_linux_signal", ts._build_linux_signal_pe_arm64),
+        ("05_linux_global_ctor", ts._build_linux_global_ctor_pe_arm64),
+    ]
+    for name, build_fn in arm64_targets:
+        label = f"linux arm64/{name}"
+        if clang_arm64 is None:
+            _report(label, False, "clang with aarch64-w64-mingw32 target not found")
+            continue
+        exe = build_fn(tmp_path)
+        _report(label, exe is not None, "compile failed")
 
     # 02, 05: no dedicated helper — compile straight to the prebuilt path via _compile_cpp_pe.
     cpp_targets = [

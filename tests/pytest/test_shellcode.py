@@ -2805,7 +2805,8 @@ def test_03_linux_with_crt(arch, tmp_path):
     Compiles main.c linking against a libc.so.6 import lib; the Linux import
     resolver dlopen()s libc.so.6 at runtime.  Returns 73 on success.
     Tested for x64, x86 and arm64 (clang+lld aarch64-w64-mingw32, executed under qemu-aarch64
-    user-mode emulation — see test_01_linux_write's docstring for the toolchain rationale).
+    user-mode emulation on x86_64 hosts — see test_01_linux_write's docstring for the toolchain
+    rationale — or natively when the host itself is aarch64).
     ARM32 is parked, not wired: see _build_linux_crt_pe_arm32's docstring.
     """
     use_wsl = platform.system() == "Windows"
@@ -2819,9 +2820,20 @@ def test_03_linux_with_crt(arch, tmp_path):
     else:
         exe = _LINUX_PREBUILD_ARM64 / "03_linux_with_crt_arm64.pe"
         loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux_arm64.pe"
-        qemu_arm64 = (_find_qemu_user_arm64_wsl() if use_wsl
-                      else (shutil.which("qemu-aarch64-static") or shutil.which("qemu-aarch64")))
-        assert qemu_arm64, "qemu-aarch64 user-mode emulator not found (needed to run the arm64 loader)"
+        host_is_arm64 = platform.machine() in ("aarch64", "arm64")
+        if host_is_arm64:
+            # Native aarch64 host (ubuntu-24.04-arm CI / ARM Linux dev boxes): the
+            # loader and the PE are both aarch64 code — run the loader directly.
+            qemu_arm64 = None
+        else:
+            qemu_arm64 = (_find_qemu_user_arm64_wsl() if use_wsl
+                          else (shutil.which("qemu-aarch64-static") or shutil.which("qemu-aarch64")))
+            assert qemu_arm64, \
+                "qemu-aarch64 user-mode emulator not found (needed to run the arm64 loader on this host)"
+        if not Path(loader).exists():
+            # Fresh-clone fallback so `pytest tests/pytest` alone still passes (same
+            # rationale as test_01_linux_write).
+            _ensure_linux_loader_arm64()
 
     assert exe.exists(), f"prebuilt Linux test PE not found: {exe} — run tests/build_tests.sh first"
     assert loader.exists(), f"Linux test_loader not found: {loader} — run tests/build_tests.sh first"
@@ -3066,9 +3078,20 @@ def test_04_linux_signal(arch, tmp_path):
     else:
         exe = _LINUX_PREBUILD_ARM64 / "04_linux_signal_arm64.pe"
         loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux_arm64.pe"
-        qemu_arm64 = (_find_qemu_user_arm64_wsl() if use_wsl
-                      else (shutil.which("qemu-aarch64-static") or shutil.which("qemu-aarch64")))
-        assert qemu_arm64, "qemu-aarch64 user-mode emulator not found (needed to run the arm64 loader)"
+        host_is_arm64 = platform.machine() in ("aarch64", "arm64")
+        if host_is_arm64:
+            # Native aarch64 host (ubuntu-24.04-arm CI / ARM Linux dev boxes): the
+            # loader and the PE are both aarch64 code — run the loader directly.
+            qemu_arm64 = None
+        else:
+            qemu_arm64 = (_find_qemu_user_arm64_wsl() if use_wsl
+                          else (shutil.which("qemu-aarch64-static") or shutil.which("qemu-aarch64")))
+            assert qemu_arm64, \
+                "qemu-aarch64 user-mode emulator not found (needed to run the arm64 loader on this host)"
+        if not Path(loader).exists():
+            # Fresh-clone fallback so `pytest tests/pytest` alone still passes (same
+            # rationale as test_01_linux_write).
+            _ensure_linux_loader_arm64()
 
     assert exe.exists(), f"prebuilt Linux test PE not found: {exe} — run tests/build_tests.sh first"
     assert loader.exists(), f"Linux test_loader not found: {loader} — run tests/build_tests.sh first"
@@ -3218,9 +3241,20 @@ def test_05_linux_global_ctor(arch, tmp_path):
     else:
         exe = _LINUX_PREBUILD_ARM64 / "05_linux_global_ctor_arm64.pe"
         loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux_arm64.pe"
-        qemu_arm64 = (_find_qemu_user_arm64_wsl() if use_wsl
-                      else (shutil.which("qemu-aarch64-static") or shutil.which("qemu-aarch64")))
-        assert qemu_arm64, "qemu-aarch64 user-mode emulator not found (needed to run the arm64 loader)"
+        host_is_arm64 = platform.machine() in ("aarch64", "arm64")
+        if host_is_arm64:
+            # Native aarch64 host (ubuntu-24.04-arm CI / ARM Linux dev boxes): the
+            # loader and the PE are both aarch64 code — run the loader directly.
+            qemu_arm64 = None
+        else:
+            qemu_arm64 = (_find_qemu_user_arm64_wsl() if use_wsl
+                          else (shutil.which("qemu-aarch64-static") or shutil.which("qemu-aarch64")))
+            assert qemu_arm64, \
+                "qemu-aarch64 user-mode emulator not found (needed to run the arm64 loader on this host)"
+        if not Path(loader).exists():
+            # Fresh-clone fallback so `pytest tests/pytest` alone still passes (same
+            # rationale as test_01_linux_write).
+            _ensure_linux_loader_arm64()
 
     assert exe.exists(), f"prebuilt Linux test PE not found: {exe} — run tests/build_tests.sh first"
     assert loader.exists(), f"Linux test_loader not found: {loader} — run tests/build_tests.sh first"

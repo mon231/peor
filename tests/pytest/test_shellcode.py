@@ -915,7 +915,8 @@ def _ensure_linux_loader(use_wsl: bool) -> "Path | None":
         return None
     cmd = ("gcc " + " ".join(_LINUX_LOADER_CFLAGS)
            + f" -o {_win_path_to_wsl(loader)} {_win_path_to_wsl(src)}")
-    r = _wsl_bash_run(cmd, capture_output=True, timeout=30)
+    # 90s: back-to-back WSL round trips derate (see _compile_efi_pe_arm64).
+    r = _wsl_bash_run(cmd, capture_output=True, timeout=90)
     return loader if r.returncode == 0 and loader.exists() else None
 
 
@@ -1459,7 +1460,10 @@ def _compile_efi_pe_arm64(src: Path, out: Path, extra_includes: "Path | None",
         cmd = (f"clang {flags} {inc_flag}"
                f" -Wl,--entry={entry_fn} -Wl,--subsystem=efi_application"
                f" -o {_win_path_to_wsl(out)} {_win_path_to_wsl(src)}")
-        return _wsl_bash_run(cmd, capture_output=True, timeout=30)
+        # 90s, not 30: a WSL round trip derates when several compiles run back to back
+        # (2026-10-30: the 4th in a row blew a 30s cap and crashed build_tests outright)
+        # — native Windows paths below stay at 30, only the WSL one is this lenient.
+        return _wsl_bash_run(cmd, capture_output=True, timeout=90)
     return subprocess.run(
         [clang] + _CLANG_CFLAGS_EFI_ARM64 + extra_defines
         + include_flag
@@ -1540,7 +1544,8 @@ def _compile_efi_pe_arm32(src: Path, out: Path, extra_includes: "Path | None",
         cmd = (f"clang {flags} {inc_flag}"
                f" -Wl,--entry={entry_fn} -Wl,--subsystem=efi_application"
                f" -o {_win_path_to_wsl(out)} {_win_path_to_wsl(src)} {extra_srcs_str}")
-        r = _wsl_bash_run(cmd, capture_output=True, timeout=30)
+        # 90s: same back-to-back WSL round-trip derating as _compile_efi_pe_arm64.
+        r = _wsl_bash_run(cmd, capture_output=True, timeout=90)
     else:
         r = subprocess.run(
             [clang] + _CLANG_CFLAGS_EFI_ARM32 + extra_defines
@@ -1668,7 +1673,9 @@ def _compile_efi_pe(gcc_src: Path, out: Path, extra_includes: "Path | None",
         cmd = (f"{_gcc} {flags} {inc} -Wl,-e,{entry_sym}"
                f" -Wl,--subsystem,10"
                f" -o {_win_path_to_wsl(out)} {_win_path_to_wsl(gcc_src)}")
-        return _wsl_bash_run(cmd, capture_output=True, timeout=30)
+        # 90s: back-to-back WSL round trips derate (see _compile_efi_pe_arm64); a
+        # blown cap here would crash or FAIL a fallback retry for no good reason.
+        return _wsl_bash_run(cmd, capture_output=True, timeout=90)
     include_flag = [f"-I{extra_includes}"] if extra_includes else []
     return subprocess.run(
         [_gcc] + _MINGW_CFLAGS_EFI

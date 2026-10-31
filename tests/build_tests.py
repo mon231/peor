@@ -58,8 +58,89 @@ def _report(label: str, ok: bool, detail: str = "") -> None:
     print(f"[build_tests] {status:4} {label}")
     if not ok:
         _FAILURES.append(f"{label}: {detail}")
-        if detail:
-            print(f"             {detail}")
+    if detail:
+        print(f"             {detail}")
+
+
+def _cc_retry(fn, native_usable: bool) -> "tuple[bool, str]":
+    """fn(use_wsl) -> CompletedProcess — native-first compile with a WSL fallback.
+
+    The toolchain finders probe native before WSL, but only when native is *missing*.
+    When a native toolchain resolves yet fails outright — the 2026-10-30 incident:
+    an MSYS2 update left mingw32's cc1.exe unable to start (rc=1, zero diagnostics for
+    every compile, not even for a missing input file) — the identical build is retried
+    through WSL's own Ubuntu mingw-w64 gcc, same source and artifact. On Linux CI
+    (platform.system() != "Windows") the native result stands and nothing changes:
+
+    The retry is also the crash-to-FAIL seam: a WSL round trip that times out, or
+    finds no WSL at all, raises out of the helpers this wraps (they pass
+    capture_output subprocess calls straight through) — degrade to a FAIL row with a
+    short detail instead of crashing the whole prebuild.
+    """
+    if native_usable:
+        try:
+            cc = fn(False)
+        except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+            native_detail = "native attempt crashed: " + type(exc).__name__
+        else:
+            if cc.returncode == 0:
+                return True, ""
+            native_detail = "native: " + cc.stderr.decode(errors="replace")[-300:]
+            if platform.system() != "Windows":
+                return False, native_detail
+    else:
+        # The finder resolved the toolchain in WSL only; there is no native attempt.
+        native_detail = None
+    try:
+        wcc = fn(True)
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        fallback_note = f"WSL fallback crashed/unavailable: {type(exc).__name__}"
+        return False, fallback_note if native_detail is None else f"{native_detail}; {fallback_note}"
+    if wcc.returncode == 0:
+        return True, ""
+    wsl_detail = "wsl: " + wcc.stderr.decode(errors="replace")[-300:]
+    return False, wsl_detail if native_detail is None else f"{native_detail}; {wsl_detail}"
+
+
+def _build_retry(fn, native_usable: bool) -> "tuple[bool, str]":
+    """_cc_retry's twin for helpers returning Path|None instead of a CompletedProcess."""
+    if native_usable:
+        try:
+            exe = fn(False)
+        except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+            native_detail = "native attempt crashed: " + type(exc).__name__
+        else:
+            if exe is not None:
+                return True, ""
+            native_detail = "native compile failed"
+            if platform.system() != "Windows":
+                return False, native_detail
+    else:
+        native_detail = None
+    try:
+        wexe = fn(True)
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        fallback_note = "WSL fallback crashed/unavailable: " + type(exc).__name__
+        return False, fallback_note if native_detail is None else f"{native_detail}; {fallback_note}"
+    if wexe is not None:
+        return True, ""
+    wsl_detail = "wsl compile produced no artifact"
+    return False, wsl_detail if native_detail is None else f"{native_detail}; {wsl_detail}"
+
+
+def _cc_result(fn) -> "tuple[bool, str]":
+    """(ok, detail) for a helper that routes native->WSL itself and raises neither.
+
+    Same crash-to-FAIL seam as _cc_retry: any TimeoutExpired/FileNotFoundError from the
+    helper's own WSL round trip becomes a FAIL detail, not a crash of the prebuild.
+    """
+    try:
+        cc = fn()
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        return False, f"compile crashed (native and WSL unusable): {type(exc).__name__}"
+    if cc.returncode == 0:
+        return True, ""
+    return False, cc.stderr.decode(errors="replace")[-500:]
 
 
 def build_linux_loaders() -> None:
@@ -119,17 +200,13 @@ def build_efi_source_pes() -> None:
     clang32, clang32_wsl = ts._find_clang_arm32_wsl()
 
     targets = [
-        ("x64", ts._EFI_PREBUILT_X64, gcc64_cmd, "x86_64-w64-mingw32-gcc",
-         lambda src, out: ts._compile_efi_pe(src, out, None, "efi_main", gcc64_wsl, arch="x64")),
-        ("x86", ts._EFI_PREBUILT_X86, gcc32_cmd, "i686-w64-mingw32-gcc",
-         lambda src, out: ts._compile_efi_pe(src, out, None, "efi_main", gcc32_wsl, arch="x86")),
-        ("arm64", ts._EFI_PREBUILT_ARM64, clang64, "clang (aarch64-w64-mingw32)",
-         lambda src, out: ts._compile_efi_pe_arm64(src, out, None, "efi_main")),
-        ("arm32", ts._EFI_PREBUILT_ARM32, clang32, "clang (armv7-w64-mingw32)",
-         lambda src, out: ts._compile_efi_pe_arm32(src, out, None, "efi_main")),
+        ("x64", ts._EFI_PREBUILT_X64, gcc64_cmd, "x86_64-w64-mingw32-gcc", gcc64_wsl),
+        ("x86", ts._EFI_PREBUILT_X86, gcc32_cmd, "i686-w64-mingw32-gcc", gcc32_wsl),
+        ("arm64", ts._EFI_PREBUILT_ARM64, clang64, "clang (aarch64-w64-mingw32)", None),
+        ("arm32", ts._EFI_PREBUILT_ARM32, clang32, "clang (armv7-w64-mingw32)", None),
     ]
 
-    for arch, prebuilt_dir, toolchain, toolchain_name, compile_fn in targets:
+    for arch, prebuilt_dir, toolchain, toolchain_name, toolchain_wsl in targets:
         if toolchain is None:
             for test_name in _SIMPLE_EFI_TESTS:
                 _report(f"efi {arch}/{test_name}", False, f"{toolchain_name} not found (native or WSL)")
@@ -140,9 +217,14 @@ def build_efi_source_pes() -> None:
                 continue
             out = prebuilt_dir / f"{test_name}.efi"
             prebuilt_dir.mkdir(parents=True, exist_ok=True)
-            cc = compile_fn(src, out)
-            ok = cc.returncode == 0
-            detail = cc.stderr.decode(errors="replace") if not ok else ""
+            if arch == "arm64":
+                ok, detail = _cc_result(lambda: ts._compile_efi_pe_arm64(src, out, None, "efi_main"))
+            elif arch == "arm32":
+                ok, detail = _cc_result(lambda: ts._compile_efi_pe_arm32(src, out, None, "efi_main"))
+            else:
+                ok, detail = _cc_retry(
+                    lambda use_wsl: ts._compile_efi_pe(src, out, None, "efi_main", use_wsl, arch=arch),
+                    native_usable=not toolchain_wsl)
             _report(f"efi {arch}/{test_name}", ok, detail)
 
     # 04_cpp_exceptions: x64/x86 via g++-posix (DWARF/SJLJ EH), arm32 via clang + sjlj_arm32.c
@@ -202,27 +284,24 @@ def build_efi_loader_templates() -> None:
     gcc32_cmd, gcc32_wsl = ts._find_mingw_gcc_32()
 
     targets = [
-        ("x64", gcc64_cmd, "x86_64-w64-mingw32-gcc",
-         lambda out: ts._compile_efi_pe(ts._EFI_LOADER_SRC, out, None, "efi_loader_main", gcc64_wsl, arch="x64")),
-        ("x86", gcc32_cmd, "i686-w64-mingw32-gcc",
-         lambda out: ts._compile_efi_pe(ts._EFI_LOADER_SRC, out, None, "efi_loader_main", gcc32_wsl, arch="x86")),
+        ("x64", gcc64_cmd, "x86_64-w64-mingw32-gcc", gcc64_wsl),
+        ("x86", gcc32_cmd, "i686-w64-mingw32-gcc", gcc32_wsl),
     ]
-    for arch, toolchain, toolchain_name, compile_fn in targets:
+    for arch, toolchain, toolchain_name, toolchain_wsl in targets:
         label = f"efi_loader/{arch}"
         if toolchain is None:
             _report(label, False, f"{toolchain_name} not found (native or WSL)")
             continue
         out = ts._EFI_LOADER_PREBUILT[arch]
         out.parent.mkdir(parents=True, exist_ok=True)
-        cc = compile_fn(out)
-        ok = cc.returncode == 0
+        ok, detail = _cc_retry(
+            lambda use_wsl: ts._compile_efi_pe(ts._EFI_LOADER_SRC, out, None, "efi_loader_main", use_wsl, arch=arch),
+            native_usable=not toolchain_wsl)
         if ok:
             # Sanity-check the magic is present & unique, exactly like the test-time patcher will.
             data = out.read_bytes()
             ok = data.count(ts._EFI_LOADER_SHELLCODE_MAGIC) == 1
             detail = "" if ok else "shellcode magic missing or not unique in compiled loader"
-        else:
-            detail = cc.stderr.decode(errors="replace")
         _report(label, ok, detail)
 
 
@@ -237,18 +316,17 @@ def build_linux_test_pes() -> None:
     gpp64_cmd, gpp64_wsl = ts._find_mingw_gpp_posix()
     gpp32_cmd, gpp32_wsl = ts._find_mingw_gpp_posix_32()
 
-    def _use_wsl_or(cmd, wsl):
-        return bool(wsl) if cmd is not None else None
-
     # 01: dedicated helpers already exist for both arches.
     if gcc64_cmd is not None:
-        exe = ts._build_linux_write_pe(tmp_path, _use_wsl_or(gcc64_cmd, gcc64_wsl))
-        _report("linux x64/01_linux_write", exe is not None, "compile failed")
+        ok, detail = _build_retry(lambda use_wsl: ts._build_linux_write_pe(tmp_path, use_wsl),
+                                  native_usable=not gcc64_wsl)
+        _report("linux x64/01_linux_write", ok, detail)
     else:
         _report("linux x64/01_linux_write", False, "x86_64-w64-mingw32-gcc not found (native or WSL)")
     if gcc32_cmd is not None:
-        exe = ts._build_linux_write_pe_32(tmp_path, _use_wsl_or(gcc32_cmd, gcc32_wsl))
-        _report("linux x86/01_linux_write", exe is not None, "compile failed")
+        ok, detail = _build_retry(lambda use_wsl: ts._build_linux_write_pe_32(tmp_path, use_wsl),
+                                  native_usable=not gcc32_wsl)
+        _report("linux x86/01_linux_write", ok, detail)
     else:
         _report("linux x86/01_linux_write", False, "i686-w64-mingw32-gcc not found (native or WSL)")
 
@@ -279,8 +357,10 @@ def build_linux_test_pes() -> None:
                 _report(label, False, "g++-posix not found (native or WSL)")
                 continue
             prebuild_dir.mkdir(parents=True, exist_ok=True)
-            cc = ts._compile_cpp_pe(src, out, gpp_wsl, "main", "posix", arch=arch)
-            _report(label, cc.returncode == 0, cc.stderr.decode(errors="replace"))
+            ok, detail = _cc_retry(
+                lambda use_wsl: ts._compile_cpp_pe(src, out, use_wsl, "main", "posix", arch=arch),
+                native_usable=not gpp_wsl)
+            _report(label, ok, detail)
 
     # 03, 04: dedicated helpers, parameterised by arch.
     for arch, gcc_cmd, gcc_wsl in [("x64", gcc64_cmd, gcc64_wsl), ("x86", gcc32_cmd, gcc32_wsl)]:
@@ -290,10 +370,12 @@ def build_linux_test_pes() -> None:
             _report(label3, False, "mingw-gcc not found (native or WSL)")
             _report(label4, False, "mingw-gcc not found (native or WSL)")
             continue
-        exe3 = ts._build_linux_crt_pe(tmp_path, _use_wsl_or(gcc_cmd, gcc_wsl), arch=arch)
-        _report(label3, exe3 is not None, "compile failed")
-        exe4 = ts._build_linux_signal_pe(tmp_path, _use_wsl_or(gcc_cmd, gcc_wsl), arch=arch)
-        _report(label4, exe4 is not None, "compile failed")
+        exe3ok, detail3 = _build_retry(lambda use_wsl: ts._build_linux_crt_pe(tmp_path, use_wsl, arch=arch),
+                                       native_usable=not gcc_wsl)
+        _report(label3, exe3ok, detail3)
+        exe4ok, detail4 = _build_retry(lambda use_wsl: ts._build_linux_signal_pe(tmp_path, use_wsl, arch=arch),
+                                       native_usable=not gcc_wsl)
+        _report(label4, exe4ok, detail4)
 
 
 def build_mingw_windows_pes() -> None:

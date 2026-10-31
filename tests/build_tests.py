@@ -334,7 +334,6 @@ def build_linux_test_pes() -> None:
     # llvm-dlltool. 01/03/04/05 all have dedicated helpers; 02 (C++ exceptions) is
     # deliberately not built here - see the module comment above test_02_linux_cpp_exceptions
     # in tests/pytest/test_shellcode.py for why (missing C++ EH runtime for this cross target).
-    clang_arm64 = ts._find_clang_arm64()
     arm64_targets = [
         ("01_linux_write", ts._build_linux_write_pe_arm64),
         ("03_linux_with_crt", ts._build_linux_crt_pe_arm64),
@@ -343,12 +342,11 @@ def build_linux_test_pes() -> None:
     ]
     for name, build_fn in arm64_targets:
         label = f"linux arm64/{name}"
-        if clang_arm64 is None:
-            _report(label, False, "clang with aarch64-w64-mingw32 target not found")
-            continue
+        # build_fn handles native clang AND the WSL fallback itself (Windows hosts);
+        # None here means both routes failed, so the detail says what a rerun needs.
         exe = build_fn(tmp_path)
-        _report(label, exe is not None, "compile failed (needs clang with "
-                "aarch64-w64-mingw32 target + llvm-dlltool + lld)")
+        _report(label, exe is not None, "" if exe is not None else "compile failed (needs clang with "
+                "aarch64-w64-mingw32 target + llvm-dlltool + lld, native or WSL)")
 
     # 02, 05: no dedicated helper — compile straight to the prebuilt path via _compile_cpp_pe.
     cpp_targets = [
@@ -433,8 +431,10 @@ def build_mingw_windows_pes() -> None:
         if gpp_cmd is None:
             _report(label, False, "g++-posix not found (native or WSL)")
             continue
-        cc = ts._compile_cpp_pe(src17, out17, gpp_wsl, "WinMain", "windows", arch=arch)
-        _report(label, cc.returncode == 0, cc.stderr.decode(errors="replace") if cc.returncode else "")
+        ok, detail = _cc_retry(
+            lambda use_wsl: ts._compile_cpp_pe(src17, out17, use_wsl, "WinMain", "windows", arch=arch),
+            native_usable=not gpp_wsl)
+        _report(label, ok, detail)
 
 
 def build_clangcl_pe() -> None:

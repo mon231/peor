@@ -1121,9 +1121,9 @@ def _build_linux_write_pe_arm64(tmp_path: Path) -> "Path | None":
     Real mingw-w64 has no aarch64-w64-mingw32 target (same limitation documented for the
     EFI ARM tests), so this uses clang+lld (aarch64-w64-mingw32 target) and llvm-dlltool
     instead of GCC mingw + GNU dlltool - same algorithm _build_linux_write_pe uses for x64,
-    different toolchain. Runs natively on this host only (no WSL routing: the produced PE
-    is consumed by the aarch64 Linux test loader on aarch64 CI/dev hosts, so the build
-    toolchain just needs to target aarch64-w64-mingw32 from wherever the host lives).
+    different toolchain. Runs natively when the host has a clang with the target (ubuntu
+    runners, ARM dev boxes); on Windows hosts without it, the identical steps are rerun
+    inside WSL (_wsl_build_linux_arm64_libc_pe) no matter where the produced PE later runs.
     Output goes to the stable tests/Linux_arm64/ directory.
     """
     stable = _LINUX_PREBUILD_ARM64 / "01_linux_write_arm64.pe"
@@ -1135,19 +1135,23 @@ def _build_linux_write_pe_arm64(tmp_path: Path) -> "Path | None":
     if not src.exists():
         return None
 
+    def_file = tmp_path / "libc.so.6_arm64.def"
+    imp_lib  = tmp_path / "liblibc_import_arm64.a"
+    obj_file = tmp_path / "01_linux_write_arm64.o"
+    def_file.write_text(_LIBC_DEF_CONTENT, encoding="ascii")
+
     clang = _find_clang_arm64()
     if not clang:
-        return None
+        if platform.system() != "Windows":
+            return None
+        # Windows host without native aarch64-w64-mingw32 clang (no clang on PATH here):
+        # run the identical steps through WSL's clang + llvm-dlltool.
+        return _wsl_build_linux_arm64_libc_pe(def_file, imp_lib, obj_file, src, stable)
     llvm_dlltool = str(Path(clang).parent / "llvm-dlltool.exe")
     if not Path(llvm_dlltool).exists():
         llvm_dlltool = shutil.which("llvm-dlltool")
     if not llvm_dlltool:
         return None
-
-    def_file = tmp_path / "libc.so.6_arm64.def"
-    imp_lib  = tmp_path / "liblibc_import_arm64.a"
-    obj_file = tmp_path / "01_linux_write_arm64.o"
-    def_file.write_text(_LIBC_DEF_CONTENT, encoding="ascii")
 
     dt = subprocess.run(
         [llvm_dlltool, "-m", "arm64", "-D", _LIBC_DLL_NAME, "-d", str(def_file), "-l", str(imp_lib)],
@@ -1560,6 +1564,89 @@ def _find_clang_arm64_wsl() -> "tuple[str | None, bool]":
         except (subprocess.TimeoutExpired, FileNotFoundError):
             pass
     return None, None
+
+
+def _find_llvm_dlltool_wsl() -> "str | None":
+    """Return the WSL-side llvm-dlltool path, or None (non-Windows host / WSL / tool absent)."""
+    if platform.system() != "Windows":
+        return None
+    try:
+        r = _wsl_bash_run(
+            "command -v llvm-dlltool || ls /usr/lib/llvm-*/bin/llvm-dlltool 2>/dev/null | head -1",
+            capture_output=True, timeout=10,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    if r.returncode != 0:
+        return None
+    lines = [ln.strip() for ln in r.stdout.decode(errors="replace").splitlines() if ln.strip()]
+    return lines[-1] if lines else None
+
+
+def _wsl_build_linux_arm64_libc_pe(def_file: Path, imp_lib: Path,
+                                    obj_file: Path, src: Path, exe: Path) -> "Path | None":
+    """The dlltool+clang+lld 3-step build of a libc-importing arm64 linux PE, run inside WSL.
+
+    Windows-host fallback for the native builders (_build_linux_write_pe_arm64 et al.) when
+    no native clang carries the aarch64-w64-mingw32 target on the Windows host: the identical
+    steps run through WSL's clang (every path argument passed as a /mnt path; the .def file is
+    still written host-side and read WSL-side via /mnt, so no quoting gymnastics needed).
+    Returns exe on success, None on any step failure (timeout / missing WSL included) —
+    callers already treat None as 'not built'.
+    """
+    if platform.system() != "Windows":
+        return None
+    dlltool = _find_llvm_dlltool_wsl()
+    if not dlltool:
+        return None
+    wsrc, wdef = _win_path_to_wsl(src), _win_path_to_wsl(def_file)
+    wimp, wobj, wexe = _win_path_to_wsl(imp_lib), _win_path_to_wsl(obj_file), _win_path_to_wsl(exe)
+    # exec prefix: _wsl_bash_run routes through Git Bash on Windows hosts, whose
+    # MSYS path-mangles a command string whose first token is a POSIX path
+    # (/usr/lib/llvm-*/bin/llvm-dlltool -> C:/Program Files/Git/usr/...); starting
+    # the string with a bare word keeps the heuristic away.
+    steps = [
+        f"exec {dlltool} -m arm64 -D {_LIBC_DLL_NAME} -d {wdef} -l {wimp}",
+        f"exec clang -target aarch64-w64-mingw32 -nostdlib -nodefaultlibs -nostartfiles"
+        f" -fno-unwind-tables -fno-asynchronous-unwind-tables"
+        f" -c {wsrc} -o {wobj}",
+        f"exec clang -target aarch64-w64-mingw32 -nostdlib -nodefaultlibs -nostartfiles"
+        f" -fno-unwind-tables -fno-asynchronous-unwind-tables -fuse-ld=lld"
+        f" -Wl,-e,main -Wl,--subsystem,posix {wobj} {wimp} -o {wexe}",
+    ]
+    try:
+        for cmd in steps:
+            r = _wsl_bash_run(cmd, capture_output=True, timeout=90)
+            if r.returncode != 0:
+                return None
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    return exe if exe.exists() else None
+
+
+def _wsl_build_linux_arm64_global_ctor_pe(obj_file: Path, src: Path, exe: Path) -> "Path | None":
+    """WSL twin of _build_linux_global_ctor_pe_arm64's native clang steps (no libc imports,
+    so no dlltool step; same -fno-exceptions -fno-rtti flags, /mnt paths).
+    Returns exe on success, None on any step failure."""
+    if platform.system() != "Windows":
+        return None
+    flags = ("-target aarch64-w64-mingw32 -nostdlib -nodefaultlibs -nostartfiles"
+             " -fno-unwind-tables -fno-asynchronous-unwind-tables"
+             " -fno-exceptions -fno-rtti")
+    wsrc, wobj, wexe = _win_path_to_wsl(src), _win_path_to_wsl(obj_file), _win_path_to_wsl(exe)
+    # exec prefix: see _wsl_build_linux_arm64_libc_pe (MSYS path-mangling guard).
+    steps = [
+        f"exec clang {flags} -c {wsrc} -o {wobj}",
+        f"exec clang {flags} -fuse-ld=lld -Wl,-e,main -Wl,--subsystem,posix {wobj} -o {wexe}",
+    ]
+    try:
+        for cmd in steps:
+            r = _wsl_bash_run(cmd, capture_output=True, timeout=90)
+            if r.returncode != 0:
+                return None
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    return exe if exe.exists() else None
 
 
 def _compile_efi_pe_arm64(src: Path, out: Path, extra_includes: "Path | None",
@@ -2689,19 +2776,23 @@ def _build_linux_crt_pe_arm64(tmp_path: Path) -> "Path | None":
     if not src.exists():
         return None
 
+    def_file = tmp_path / "libc_crt_arm64.def"
+    imp_lib  = tmp_path / "liblibc_crt_arm64.a"
+    obj_file = tmp_path / "03_linux_with_crt_arm64.o"
+    def_file.write_text(_LIBC_DEF_CONTENT_CRT, encoding="ascii")
+
     clang = _find_clang_arm64()
     if not clang:
-        return None
+        if platform.system() != "Windows":
+            return None
+        # Windows host without native aarch64-w64-mingw32 clang: identical
+        # steps through WSL's clang + llvm-dlltool.
+        return _wsl_build_linux_arm64_libc_pe(def_file, imp_lib, obj_file, src, stable)
     llvm_dlltool = str(Path(clang).parent / "llvm-dlltool.exe")
     if not Path(llvm_dlltool).exists():
         llvm_dlltool = shutil.which("llvm-dlltool")
     if not llvm_dlltool:
         return None
-
-    def_file = tmp_path / "libc_crt_arm64.def"
-    imp_lib  = tmp_path / "liblibc_crt_arm64.a"
-    obj_file = tmp_path / "03_linux_with_crt_arm64.o"
-    def_file.write_text(_LIBC_DEF_CONTENT_CRT, encoding="ascii")
 
     dt = subprocess.run(
         [llvm_dlltool, "-m", "arm64", "-D", _LIBC_DLL_NAME, "-d", str(def_file), "-l", str(imp_lib)],
@@ -2954,19 +3045,23 @@ def _build_linux_signal_pe_arm64(tmp_path: Path) -> "Path | None":
     if not src.exists():
         return None
 
+    def_file = tmp_path / "libc_signal_arm64.def"
+    imp_lib  = tmp_path / "liblibc_signal_arm64.a"
+    obj_file = tmp_path / "04_linux_signal_arm64.o"
+    def_file.write_text(_LIBC_DEF_CONTENT_SIGNAL, encoding="ascii")
+
     clang = _find_clang_arm64()
     if not clang:
-        return None
+        if platform.system() != "Windows":
+            return None
+        # Windows host without native aarch64-w64-mingw32 clang: identical
+        # steps through WSL's clang + llvm-dlltool.
+        return _wsl_build_linux_arm64_libc_pe(def_file, imp_lib, obj_file, src, stable)
     llvm_dlltool = str(Path(clang).parent / "llvm-dlltool.exe")
     if not Path(llvm_dlltool).exists():
         llvm_dlltool = shutil.which("llvm-dlltool")
     if not llvm_dlltool:
         return None
-
-    def_file = tmp_path / "libc_signal_arm64.def"
-    imp_lib  = tmp_path / "liblibc_signal_arm64.a"
-    obj_file = tmp_path / "04_linux_signal_arm64.o"
-    def_file.write_text(_LIBC_DEF_CONTENT_SIGNAL, encoding="ascii")
 
     dt = subprocess.run(
         [llvm_dlltool, "-m", "arm64", "-D", _LIBC_DLL_NAME, "-d", str(def_file), "-l", str(imp_lib)],
@@ -3146,7 +3241,12 @@ def _build_linux_global_ctor_pe_arm64(tmp_path: Path) -> "Path | None":
 
     clang = _find_clang_arm64()
     if not clang:
-        return None
+        if platform.system() != "Windows":
+            return None
+        # Windows host without native aarch64-w64-mingw32 clang: identical
+        # steps through WSL's clang.
+        return _wsl_build_linux_arm64_global_ctor_pe(tmp_path / "05_linux_global_ctor_arm64.o",
+                                                     src, stable)
 
     obj_file = tmp_path / "05_linux_global_ctor_arm64.o"
     _CXX_FLAGS = [

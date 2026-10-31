@@ -40,7 +40,8 @@ jobs:
           path: |
             tests/Win_x86
             tests/Win_x64
-          key: test-bins-release-${{ runner.os }}-${{ hashFiles('tests/**/*.cpp', 'tests/**/*.c', 'tests/**/*.vcxproj', 'tests/tests.sln') }}
+            tests/Win_ARM64
+          key: test-bins-release-${{ runner.os }}-${{ hashFiles('tests/**/*.cpp', 'tests/**/*.c', 'tests/**/*.vcxproj', 'tests/tests.sln', 'asm/*.asm') }}
 
       - name: Build test suite Release (Win32)
         if: steps.cache-bins-release.outputs.cache-hit != 'true'
@@ -52,6 +53,17 @@ jobs:
         working-directory: tests
         run: msbuild tests.sln /p:Configuration=Release /p:Platform=x64 /m /nologo /verbosity:minimal
 
+      # ARM64 sln projects (01_simple_calc, 03_winapi_messagebox, test_loader) pin
+      # VCToolsVersion 14.51.36231 under PlatformToolset v145 — the VS "18" toolchain
+      # whose project-system carries the ARM64 desktop platform defs (see the
+      # vcxproj comment + Task 1/2 progress ledger). Both the toolset and its
+      # version come with VS 2026 on the runner image; msbuild fails loudly rather
+      # than silently producing x64 binaries if an image regresses.
+      - name: Build test suite Release (ARM64)
+        if: steps.cache-bins-release.outputs.cache-hit != 'true'
+        working-directory: tests
+        run: msbuild tests.sln /p:Configuration=Release /p:Platform=ARM64 /m /nologo /verbosity:minimal
+
       - name: Upload Release test binaries
         uses: actions/upload-artifact@v4
         with:
@@ -59,6 +71,7 @@ jobs:
           path: |
             tests/Win_x86
             tests/Win_x64
+            tests/Win_ARM64
           retention-days: 1
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -91,7 +104,8 @@ jobs:
           path: |
             tests/Win_x86
             tests/Win_x64
-          key: test-bins-debug-${{ runner.os }}-${{ hashFiles('tests/**/*.cpp', 'tests/**/*.c', 'tests/**/*.vcxproj', 'tests/tests.sln') }}
+            tests/Win_ARM64
+          key: test-bins-debug-${{ runner.os }}-${{ hashFiles('tests/**/*.cpp', 'tests/**/*.c', 'tests/**/*.vcxproj', 'tests/tests.sln', 'asm/*.asm') }}
 
       - name: Build test suite Debug (Win32)
         if: steps.cache-bins-debug.outputs.cache-hit != 'true'
@@ -103,6 +117,12 @@ jobs:
         working-directory: tests
         run: msbuild tests.sln /p:Configuration=Debug /p:Platform=x64 /m /nologo /verbosity:minimal
 
+      # See the Release|ARM64 comment above for the v145/14.51.36231 toolset note.
+      - name: Build test suite Debug (ARM64)
+        if: steps.cache-bins-debug.outputs.cache-hit != 'true'
+        working-directory: tests
+        run: msbuild tests.sln /p:Configuration=Debug /p:Platform=ARM64 /m /nologo /verbosity:minimal
+
       - name: Upload Debug test binaries
         uses: actions/upload-artifact@v4
         with:
@@ -110,6 +130,7 @@ jobs:
           path: |
             tests/Win_x86
             tests/Win_x64
+            tests/Win_ARM64
           retention-days: 1
 
   test-windows:

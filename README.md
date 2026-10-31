@@ -140,8 +140,8 @@ falls through immediately.
 ### Usermode Import Resolution
 
 When the PE has a non-zero import directory (`DataDir[1]`), the import stub
-(`imports_resolver32/64.asm`) resolves every entry in `IMAGE_IMPORT_DESCRIPTOR`
-before the reloc stub runs.
+(`imports_resolver32/64/_arm64.asm`) resolves every entry in
+`IMAGE_IMPORT_DESCRIPTOR` before the reloc stub runs.
 
 **Step 1 — find kernel32** via the PEB loader list, without any imports of its
 own:
@@ -150,8 +150,25 @@ own:
 |---|---|---|---|---|
 | x86 | `FS:[0x30]` | `+0x0C` → Ldr | `+0x14` → InMemoryOrderModuleList | `[0]=exe`, `[1]=ntdll`, `[2]=kernel32` |
 | x64 | `GS:[0x60]` | `+0x18` → Ldr | `+0x20` → InMemoryOrderModuleList | same order |
+| ARM64 | `x18`¹ | `+0x18` → Ldr | `+0x20` → InMemoryOrderModuleList | same order |
 
-`DllBase` sits at `+0x10` from an `InMemoryOrderLinks` node.
+`DllBase` sits at `+0x10` from an `InMemoryOrderLinks` node (x86/x64) or
+`+0x20` from the `InMemoryOrderModuleList.Flink` value directly (x64/ARM64 -
+same relationship, phrased from the pointer `imports_resolver64.asm`/
+`imports_resolver_arm64.asm` already hold after the module-list walk).
+
+¹ ARM64 Windows has no "read memory to find the TEB" step: `x18` is the
+platform register that directly **holds** the TEB pointer for the whole
+process (unlike x86/x64, which read it from a segment-relative offset). From
+there, every PEB/Ldr/LDR\_DATA\_TABLE\_ENTRY offset is identical to x64's -
+these are OS data structures, not ISA-dependent; only the register used to
+reach the TEB differs. `imports_resolver_arm64.asm` otherwise mirrors
+`imports_resolver64.asm` exactly: PEB walk → kernel32 export-table scan for
+`GetProcAddress` → `GetProcAddress(kernel32, "LoadLibraryA")` →
+`IMAGE_IMPORT_DESCRIPTOR` walk calling `LoadLibraryA`+`GetProcAddress` for
+every import (this is the real Windows loader path - not the
+`dlopen`/`dlsym` approach the Linux ARM64 import resolver uses for ELF
+imports).
 
 **Step 2 — locate `GetProcAddress`** by walking kernel32's export table:
 scan `AddressOfNames` for the string, resolve via `AddressOfNameOrdinals` +
@@ -625,13 +642,21 @@ and the native `test_loader.exe` for execution.
 | Windows kernel driver | ❌ | ❌ | ❌ | ❌ |
 
 ¹ ARM64/ARM32 Windows GUI/console EXE/DLL support is landing incrementally
-(see `docs/superpowers/plans/2026-10-26-windows-arm-pe-support.md`): relocations,
-the entry-point dispatcher (`DllMain`/OEP), and `.init_array` ctors are wired
-today; usermode imports, delay-load imports, TLS callbacks, SEH and C++ EH land
-in later tasks of that plan. `_select_chain` correctly dispatches a real ARM64/
-ARM32 Windows PE to its own chain instead of silently falling through to x64/x86
-(same `pe_type` — PE32+/PE32 — but a different `machine` field) regardless of
-how much of the chain is implemented so far.
+(see `docs/superpowers/plans/2026-10-26-windows-arm-pe-support.md`). **ARM64**:
+relocations, the entry-point dispatcher (`DllMain`/OEP), `.init_array` ctors,
+and usermode import resolution (`imports_resolver_arm64.asm`) are wired and
+verified against a real MSVC-compiled ARM64 PE (build + static shellcode
+conversion; execution is blocked on this x86\_64 dev machine - ARM64 Windows
+binaries cannot run here, there is no reverse-direction emulation). **ARM32**:
+relocations, the entry-point dispatcher, and ctors are wired; ARM32 is
+otherwise deferred (not in scope) pending a Windows SDK that still ships
+32-bit ARM import libraries (this machine's only installed SDK removed them -
+see the Task 1/2 progress ledger). Delay-load imports, TLS callbacks, SEH and
+C++ EH land in later tasks of that plan for both architectures.
+`_select_chain` correctly dispatches a real ARM64/ARM32 Windows PE to its own
+chain instead of silently falling through to x64/x86 (same `pe_type` — PE32+/
+PE32 — but a different `machine` field) regardless of how much of the chain
+is implemented so far.
 
 Attempting to convert unsupported combinations raises `ValueError` or `PeorUnsupportedError` with a descriptive message.
 

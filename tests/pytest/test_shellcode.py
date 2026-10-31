@@ -2,6 +2,7 @@ import os
 import re
 import sys
 import time
+import glob
 import pytest
 import struct
 import shutil
@@ -1525,6 +1526,24 @@ def _find_clang_arm64() -> "str | None":
     return None
 
 
+def _find_lld_link_arm64() -> "str | None":
+    """Return path to a plain lld-link COFF linker, or None.
+
+    Plain lld-link (not clang's mingw-emulation driver) is what the arm64
+    05 linux PE must be linked with: the mingw-emulation driver folds .ctors
+    into other sections, leaving no ctors section for _detect_pe_features (see
+    _build_linux_global_ctor_pe_arm64). Checks PATH first, then LLVM's
+    /usr/lib/llvm-*/bin install locations (how Debian/Ubuntu distros ship it;
+    the ubuntu-24.04-arm CI runner has no bare `lld-link` on PATH).
+    """
+    path = shutil.which("lld-link")
+    if path:
+        return path
+    for candidate in sorted(glob.glob("/usr/lib/llvm-*/bin/lld-link")):
+        return candidate
+    return None
+
+
 def _find_qemu_user_arm64_wsl() -> "str | None":
     """Return the WSL-side qemu-aarch64 user-mode-emulation binary name, or None.
 
@@ -1625,8 +1644,10 @@ def _wsl_build_linux_arm64_libc_pe(def_file: Path, imp_lib: Path,
 
 
 def _wsl_build_linux_arm64_global_ctor_pe(obj_file: Path, src: Path, exe: Path) -> "Path | None":
-    """WSL twin of _build_linux_global_ctor_pe_arm64's native clang steps (no libc imports,
-    so no dlltool step; same -fno-exceptions -fno-rtti flags, /mnt paths).
+    """WSL twin of _build_linux_global_ctor_pe_arm64's native steps (no libc imports,
+    so no dlltool step; same -fno-exceptions -fno-rtti flags, /mnt paths): compile
+    with clang, LINK with plain lld-link (see _find_lld_link_arm64 for why the
+    mingw-emulation driver must not be used), /mnt paths throughout.
     Returns exe on success, None on any step failure."""
     if platform.system() != "Windows":
         return None
@@ -1635,18 +1656,47 @@ def _wsl_build_linux_arm64_global_ctor_pe(obj_file: Path, src: Path, exe: Path) 
              " -fno-exceptions -fno-rtti")
     wsrc, wobj, wexe = _win_path_to_wsl(src), _win_path_to_wsl(obj_file), _win_path_to_wsl(exe)
     # exec prefix: see _wsl_build_linux_arm64_libc_pe (MSYS path-mangling guard).
-    steps = [
-        f"exec clang {flags} -c {wsrc} -o {wobj}",
-        f"exec clang {flags} -fuse-ld=lld -Wl,-e,main -Wl,--subsystem,posix {wobj} -o {wexe}",
-    ]
+    r = _wsl_bash_run(
+        "exec clang " + flags + " -c " + wsrc + " -o " + wobj,
+        capture_output=True, timeout=90,
+    )
+    if r.returncode != 0:
+        return None
+    lld_link = _find_wsl_lld_link()
+    if not lld_link:
+        return None
     try:
-        for cmd in steps:
-            r = _wsl_bash_run(cmd, capture_output=True, timeout=90)
-            if r.returncode != 0:
-                return None
+        r = _wsl_bash_run(
+            f"exec {lld_link} /MACHINE:ARM64 /SUBSYSTEM:POSIX /ENTRY:main"
+            f" {wobj} -out:{wexe}",
+            capture_output=True, timeout=90,
+        )
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return None
-    return exe if exe.exists() else None
+    return exe if (r.returncode == 0 and exe.exists()) else None
+
+
+def _find_wsl_lld_link() -> "str | None":
+    """Return the WSL-side plain lld-link path, or None (non-Windows host / absent tool).
+
+    Same rationale as _find_lld_link_arm64's no-mingw-driver rule: the arm64 05
+    linux PE must be linked by plain lld-link so .ctors survives as a section.
+    Probe starts with a bare word (command), not a POSIX path, so the MSYS
+    path-mangling guard doesn't apply.
+    """
+    if platform.system() != "Windows":
+        return None
+    try:
+        r = _wsl_bash_run(
+            "command -v lld-link || ls /usr/lib/llvm-*/bin/lld-link 2>/dev/null | head -1",
+            capture_output=True, timeout=10,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    if r.returncode != 0:
+        return None
+    lines = [ln.strip() for ln in r.stdout.decode(errors="replace").splitlines() if ln.strip()]
+    return lines[-1] if lines else None
 
 
 def _compile_efi_pe_arm64(src: Path, out: Path, extra_includes: "Path | None",
@@ -3223,11 +3273,16 @@ def _build_linux_global_ctor_pe_arm64(tmp_path: Path) -> "Path | None":
     Unlike test 02 (C++ exceptions), this test has no throw/catch - the two Adder global
     constructors run from .init_array with plain function calls, no C++ exception-handling
     runtime (__cxa_throw/__cxa_begin_catch/personality routine/typeinfo vtables) involved at
-    all. So, unlike test 02, this ports cleanly to clang+lld aarch64-w64-mingw32 with
+    all. So, unlike test 02, this ports cleanly to clang + plain lld-link
+    aarch64-w64-mingw32 with
     -fno-exceptions -fno-rtti and no extra runtime: compile+link produces a clean PE with zero
-    undefined symbols (confirmed empirically - see progress.md's Task 3 entry). peor's ctors
+    undefined symbols (confirmed empirically - see progress.md's Task 3 entry). The link step
+    MUST be plain lld-link (not clang's -fuse-ld=lld mingw-emulation driver): the driver folds
+    .ctors into other sections, which leaves _detect_pe_features with no ctors section and the
+    chain silently runs the PE with zero static storage - main's fail code exactly.
+    peor's ctors
     runner (CTORS_RUNNER_ARM64, already wired into _PLATFORM_LINUX_ARM64 by Task 1) is
-    arch-generic and was already proven against this exact .init_array mechanism.
+    arch-generic and was already proven against this exact .ctors mechanism.
     No libc imports are needed (main.cpp calls no libc functions), so no dlltool step either.
     """
     stable = _LINUX_PREBUILD_ARM64 / "05_linux_global_ctor_arm64.pe"
@@ -3262,11 +3317,21 @@ def _build_linux_global_ctor_pe_arm64(tmp_path: Path) -> "Path | None":
     if cc1.returncode != 0:
         return None
 
+    # Link with plain lld-link, NOT clang's mingw-emulation driver: the latter folds
+    # .ctors into other sections (rdata), which leaves _detect_pe_features with no
+    # ctors section and the chain silently runs the PE with zeroed static storage
+    # (counter={0} -> main's fail code exactly, seen CI-native). Plain lld-link
+    # preserves .ctors as its own section for the ctors runner to consume.
     exe = stable
+    lld_link = _find_lld_link_arm64()
+    if not lld_link:
+        if platform.system() != "Windows":
+            return None
+        # Windows host with clang but no lld-link is not expected; only WSL fallback.
+        return _wsl_build_linux_arm64_global_ctor_pe(obj_file, src, stable)
     cc2 = subprocess.run(
-        [clang] + _CXX_FLAGS + ["-fuse-ld=lld",
-         "-Wl,-e,main", "-Wl,--subsystem,posix",
-         str(obj_file), "-o", str(exe)],
+        [lld_link, "/MACHINE:ARM64", "/SUBSYSTEM:POSIX", "/ENTRY:main",
+         str(obj_file), f"-out:{exe}"],
         capture_output=True, timeout=30,
     )
     if cc2.returncode != 0 or not exe.exists():

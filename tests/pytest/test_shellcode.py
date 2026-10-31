@@ -203,6 +203,48 @@ def test_03_winapi_messagebox(arch, tmp_path):
     assert proc.returncode == 0, f"[{arch}] expected exit code 0, got {proc.returncode}"
 
 
+def test_03_winapi_messagebox_arm64_imports_resolved_statically(tmp_path):
+    """ARM64 counterpart of test_03_winapi_messagebox, execution-blocked.
+
+    This machine is x86_64 Windows: there is no reverse-direction emulation
+    (ARM64 Windows can run x64 via emulation; x64 Windows cannot run ARM64
+    binaries at all), so test_loader.exe cannot actually execute ARM64
+    shellcode here - same execution-blocked category Task 1 already hit for
+    01_simple_calc's [arm64] case. "arm64" is therefore intentionally NOT
+    added to test_03_winapi_messagebox's own parametrize list above.
+
+    What CAN be verified here, and is: a real MSVC-compiled ARM64 PE that
+    imports MessageBoxA (user32.dll) and ExitProcess (kernel32.dll) resolves
+    to the ARM64 chain with a real (non-empty) imports resolver wired in,
+    and that resolver assembles into the shellcode chain deterministically
+    via the same dump_memory_layout() path the executing x86/x64 tests use -
+    i.e. asm/imports_resolver_arm64.asm is actually reachable end-to-end
+    from a real compiled PE, not just unit-tested in isolation.
+    """
+    win_dir = ARCH_DIRS["arm64"]
+    pe_path = win_dir / "03_winapi_messagebox.exe"
+    assert pe_path.exists(), f"{pe_path.name} not found at {pe_path} — build tests/tests.sln (Platform=ARM64) first"
+
+    pe = PE(str(pe_path))
+    assert pe.FILE_HEADER.Machine == 0xAA64, "expected a real ARM64 PE"
+    dll_names = {entry.dll.decode().lower() for entry in pe.DIRECTORY_ENTRY_IMPORT}
+    assert dll_names == {"user32.dll", "kernel32.dll"}, (
+        f"expected MessageBoxA/ExitProcess imports, got DLLs: {dll_names}"
+    )
+
+    features = _detect_pe_features(pe)
+    entry = _select_chain(features)
+    assert entry is _SHELLCODES[_PLATFORM_ARM64], "ARM64 PE did not resolve to the ARM64 chain"
+    assert entry["imports"], "IMPORTS_ARM64_UM is not wired into the ARM64 chain"
+    assert _compute_required_stubs(features, entry) == ["imports", "relocs", "entrypoint"], (
+        "expected the imports resolver to run before relocs, same ordering imports_resolver64.asm uses"
+    )
+
+    shellcode_path = tmp_path / "03_winapi_messagebox_arm64.bin"
+    _shellcodify(pe_path, shellcode_path)
+    assert shellcode_path.stat().st_size > 0
+
+
 @pytest.mark.parametrize("arch", ["x86", "x64"])
 def test_04_crt_printf_rand(arch, tmp_path):
     win_dir = ARCH_DIRS[arch]

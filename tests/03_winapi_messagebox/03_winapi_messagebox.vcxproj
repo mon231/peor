@@ -33,11 +33,9 @@
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <!-- ARM64 desktop apps require the v180 (VS "18") project-system platform defs
-       (Platforms\ARM64 only exists under v180 on this toolchain, not v170) - same
-       toolset-version matrix Task 1 pinned in 01_simple_calc.vcxproj; see that
-       file and the Task 1 progress ledger for the full finding. ARM32 is DEFERRED
-       (not in scope for this task - see Task 2's progress ledger entry) so no
-       ARM platform configs are added here. -->
+       (Platforms\ARM64 only exists under v180 on this toolchain, not v170); see the
+       same block in 01_simple_calc.vcxproj and Task 1's progress ledger for the
+       toolset-version matrix this is built on. -->
   <PropertyGroup Condition="'$(Platform)'=='ARM64'">
     <VCProjectVersion>18.0</VCProjectVersion>
   </PropertyGroup>

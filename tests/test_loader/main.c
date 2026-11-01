@@ -26,10 +26,24 @@ int main(int argc, char* argv[]) {
     }
 
     srand(GetTickCount());
+#if defined(_M_ARM64)
+    /* AArch64 PIC (adrp/ldr, which any non-trivial compiled PE's own code uses
+       throughout to reach its own .rdata/IAT) is page-granular: it only computes
+       correct addresses when the *embedded PE's* runtime base is congruent to its
+       link-time ImageBase modulo the page size - i.e. page-aligned. VirtualAlloc()
+       below always returns a page-aligned base, so nop_offset must stay exactly 0
+       (peor's _PLATFORM_ARM64 chain pads its stub prefix to a page-size multiple -
+       see peor/_chain_builder.py's 'pe_align': 4096 - so the embedded PE itself
+       lands on the next page boundary after this zero offset).
+       x86/x64 have no such requirement (RIP-relative LEA is byte-granular), which
+       is why only ARM64 pins this to 0 instead of randomizing within the sled. */
+    DWORD nop_offset = 0;
+#else
     /* Keep nop_offset 16-byte aligned so the PE image (which starts at
        mem + nop_offset + prefix_len, where prefix_len is 16-aligned) is
        always 16-byte aligned for MOVDQA/MOVAPS instructions. */
     DWORD nop_offset = (1 + (DWORD)(rand() % (NOP_SLED_MAX_OFFSET / 16))) * 16;
+#endif
 
     void* mem = VirtualAlloc(NULL, size + NOP_SLED_MAX_OFFSET,
                              MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);

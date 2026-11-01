@@ -606,11 +606,40 @@ jobs:
         uses: msys2/setup-msys2@v2
         with:
           msystem: CLANGARM64
-          install: mingw-w64-clang-aarch64-qemu
+          # Deliberately NO install list here: the action's own package-install
+          # step dies fatally on the sporadic "signature ... unknown trust /
+          # database is not valid" pacman failure on arm64 fresh installs
+          # (msys2/setup-msys2#615, hit in run 41283711488 at 07:19:44Z), and the
+          # action has no retry. First-time setup only here; pacman runs with a
+          # retry loop in the next step.
           # release:true (the default) downloads MSYS2's own installer rather than
           # reusing a preinstalled copy. windows-11-arm GitHub runner images ship no
           # preinstalled MSYS2 at all, so release:false fails outright here (see
           # msys2/setup-msys2#503 — closed as "no preinstalled MSYS2 on the ARM image").
+
+      # mingw-w64-clang-aarch64-qemu is a real aarch64-target PE build (see the
+      # clangarm64 note above). Retried because the package-db signature check
+      # sporadically reports unknown trust right after first-time setup
+      # (msys2/setup-msys2#615); in that incident re-running later succeeded,
+      # so a paced retry loop is the CI-side workaround.
+      - name: Install native ARM64 QEMU package via pacman (retry loop)
+        shell: pwsh
+        run: |
+          $msysLocation = "${{ steps.msys2-arm64.outputs.msys2-location }}"
+          $bash = Join-Path (Join-Path $msysLocation "usr") "bin\bash.exe"
+          $ok = $false
+          foreach ($attempt in 1..8) {
+            Write-Host "pacman attempt $attempt"
+            # populate first (fresh keyring needs msys2-trusted imported);
+            # --refresh-keys covers a lagging maintainer key rotation on a miss.
+            & $bash -lc 'pacman-key --populate msys2 >/dev/null 2>&1 || true; pacman-key --refresh-keys >/dev/null 2>&1 || true; pacman --noconfirm -S --needed mingw-w64-clang-aarch64-qemu'
+            if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+            # -Sy between attempts re-downloads the package DBs, clearing the
+            # stale-db half of the #615 failure mode.
+            & $bash -lc 'pacman-key --populate msys2 || true; pacman --noconfirm -Sy mingw-w64-clang-aarch64-qemu || true'
+            Start-Sleep -Seconds 45
+          }
+          if (-not $ok) { throw "pacman failed to install mingw-w64-clang-aarch64-qemu after 8 attempts (msys2/setup-msys2#615)" }
 
       # Copy the MSYS2-built binaries, their DLL dependencies, and firmware straight
       # into C:\Program Files\qemu\ - the exact hardcoded fallback path

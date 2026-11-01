@@ -284,7 +284,7 @@ def build_mingw_windows_pes() -> None:
 
     gpp64_cmd, gpp64_wsl = ts._find_mingw_gpp_posix()
     gpp32_cmd, gpp32_wsl = ts._find_mingw_gpp_posix_32()
-    src17 = TESTS_DIR / "Windows" / "17_mingw_cpp_exceptions" / "main.cpp"
+    src17 = TESTS_DIR / "17_mingw_cpp_exceptions" / "main.cpp"
     for arch, gpp_cmd, gpp_wsl in [("x64", gpp64_cmd, gpp64_wsl), ("x86", gpp32_cmd, gpp32_wsl)]:
         label = f"mingw {arch}/17_mingw_cpp_exceptions"
         out17 = ts._MINGW_WIN_PREBUILT[arch] / "17_mingw_cpp_exceptions.exe"

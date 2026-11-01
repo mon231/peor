@@ -24,10 +24,11 @@ from peor._shellcodes import (
     TLS_CALLBACKS_32, TLS_CALLBACKS_64,
     CXX_EH_FIXER_64,
     CTORS_RUNNER_64, CTORS_RUNNER_32,
-    RELOCS_ARM64, CTORS_RUNNER_ARM64, ENTRYPOINT_EFI_ARM64,
+    RELOCS_ARM64, CTORS_RUNNER_ARM64, ENTRYPOINT_EFI_ARM64, CXX_EH_FIXER_ARM64,
     RELOCS_ARM32, CTORS_RUNNER_ARM32, ENTRYPOINT_EFI_ARM32,
     ARM32_EFI_PREFIX,
     IMPORTS_ARM64_LINUX, IMPORTS_ARM64_UM, ENTRYPOINT_ARM64,
+    DELAY_IMPORTS_ARM64_UM, SEH_REGISTRAR_ARM64, TLS_CALLBACKS_ARM64,
     IMPORTS_ARM32_LINUX, ENTRYPOINT_ARM32,
 )
 
@@ -147,18 +148,27 @@ _SHELLCODES = {
     _PLATFORM_ARM64: {
         'relocs':            RELOCS_ARM64,
         'imports':           IMPORTS_ARM64_UM,
-        'delay_imports':     b'',
+        'delay_imports':     DELAY_IMPORTS_ARM64_UM,
         'entrypoint':        ENTRYPOINT_ARM64,
-        'seh':               b'',
+        'seh':               SEH_REGISTRAR_ARM64,
         'seh_always':        False,
-        'tls':               b'',
+        'tls':               TLS_CALLBACKS_ARM64,
         'ctors':             CTORS_RUNNER_ARM64,
         'ctors_rva_magic':   _CTORS_RVA_MAGIC,
         'ctors_size_magic':  _CTORS_SIZE_MAGIC,
+        'cxx_eh_fixer':      CXX_EH_FIXER_ARM64,
+        'cxx_pe_size_magic': _CXX_EH_PE_SIZE_MAGIC_64,
+        'cxx_iat_rva_magic': _CXX_EH_IAT_RVA_MAGIC_64,
         'tail':              _IMPORTS_TAIL_ARM64,
         'dir_array_offset':  112,
         'disp64_off':        8,
         'ep_rva_magic':      _EP_RVA_MAGIC,
+        # Same AArch64 PIC (adrp/ldr) page-granularity requirement the
+        # _PLATFORM_LINUX_ARM64 entry above documents: the compiled PE's own
+        # code reaches its .rdata/IAT with page-granular adrp addressing, so
+        # the embedded PE's runtime base must be congruent to its link-time
+        # ImageBase modulo the page size - i.e. page-aligned.
+        'pe_align':          4096,
     },
     _PLATFORM_ARM32: {
         'relocs':            RELOCS_ARM32,

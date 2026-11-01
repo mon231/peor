@@ -10,6 +10,7 @@ from peor._pe_features import (
     IMAGE_DIRECTORY_ENTRY_IMPORT,
     _PLATFORM_LINUX, _PLATFORM_EFI,
     _PLATFORM_LINUX_32, _PLATFORM_EFI_32, _PLATFORM_EFI_ARM64, _PLATFORM_EFI_ARM32,
+    _PLATFORM_LINUX_ARM64, _PLATFORM_ARM64, _PLATFORM_ARM32, _PLATFORM_LINUX_ARM32,
     _POSIX_CUI_SUBSYSTEM, _EFI_SUBSYSTEMS, _MACHINE_ARM64, _MACHINE_ARMNT, _MACHINE_ARMTHUMB,
 )
 from peor._shellcodes import (
@@ -23,14 +24,19 @@ from peor._shellcodes import (
     TLS_CALLBACKS_32, TLS_CALLBACKS_64,
     CXX_EH_FIXER_64,
     CTORS_RUNNER_64, CTORS_RUNNER_32,
-    RELOCS_ARM64, CTORS_RUNNER_ARM64, ENTRYPOINT_EFI_ARM64,
+    RELOCS_ARM64, CTORS_RUNNER_ARM64, ENTRYPOINT_EFI_ARM64, CXX_EH_FIXER_ARM64,
     RELOCS_ARM32, CTORS_RUNNER_ARM32, ENTRYPOINT_EFI_ARM32,
     ARM32_EFI_PREFIX,
+    IMPORTS_ARM64_LINUX, IMPORTS_ARM64_UM, ENTRYPOINT_ARM64,
+    DELAY_IMPORTS_ARM64_UM, SEH_REGISTRAR_ARM64, TLS_CALLBACKS_ARM64,
+    IMPORTS_ARM32_LINUX, ENTRYPOINT_ARM32,
 )
 
 # Trailing bytes stripped from import resolvers so they fall through into the next stub.
 _IMPORTS_TAIL_32 = b'\xc3'        # RET
 _IMPORTS_TAIL_64 = b'\xff\xe0'    # JMP RAX
+_IMPORTS_TAIL_ARM64 = b'\xc0\x03\x5f\xd6'  # RET (AArch64 encoding of "ret")
+_IMPORTS_TAIL_ARM32 = b'\x70\x47'  # "bx lr" (Thumb-2 encoding, verified via keystone)
 
 # Magic placeholders in cxx_eh_fixer64.asm patched at build time.
 _CXX_EH_PE_SIZE_MAGIC_64 = b'\x78\x56\x34\x12'   # 0x12345678 LE
@@ -115,6 +121,87 @@ _SHELLCODES = {
         'disp32_off':        8,
         'ep_rva_magic':      _EP_RVA_MAGIC,
     },
+    _PLATFORM_LINUX_ARM64: {
+        'relocs':            RELOCS_ARM64,
+        'imports':           IMPORTS_ARM64_LINUX,
+        'delay_imports':     b'',
+        'entrypoint':        ENTRYPOINT_ARM64,
+        'seh':               b'',
+        'seh_always':        False,
+        'tls':               b'',
+        'ctors':             CTORS_RUNNER_ARM64,
+        'ctors_rva_magic':   _CTORS_RVA_MAGIC,
+        'ctors_size_magic':  _CTORS_SIZE_MAGIC,
+        'tail':              _IMPORTS_TAIL_ARM64,
+        'dir_array_offset':  112,
+        'disp64_off':        8,
+        'ep_rva_magic':      _EP_RVA_MAGIC,
+        # AArch64 PIC (adrp/ldr, used throughout any non-trivial compiled PE's own
+        # code to reach its own .rdata/IAT) is page-granular: it only stays correct
+        # when the *embedded PE's* runtime base is congruent to its link-time
+        # ImageBase modulo the page size - i.e. page-aligned, same as every other
+        # ARM64 chain entry below that already sets this (_PLATFORM_EFI_ARM64 /
+        # _PLATFORM_EFI_ARM32). x86/x64 have no such requirement (RIP-relative
+        # LEA is byte-granular), which is why only the ARM64 entries need it.
+        'pe_align':          4096,
+    },
+    _PLATFORM_ARM64: {
+        'relocs':            RELOCS_ARM64,
+        'imports':           IMPORTS_ARM64_UM,
+        'delay_imports':     DELAY_IMPORTS_ARM64_UM,
+        'entrypoint':        ENTRYPOINT_ARM64,
+        'seh':               SEH_REGISTRAR_ARM64,
+        'seh_always':        False,
+        'tls':               TLS_CALLBACKS_ARM64,
+        'ctors':             CTORS_RUNNER_ARM64,
+        'ctors_rva_magic':   _CTORS_RVA_MAGIC,
+        'ctors_size_magic':  _CTORS_SIZE_MAGIC,
+        'cxx_eh_fixer':      CXX_EH_FIXER_ARM64,
+        'cxx_pe_size_magic': _CXX_EH_PE_SIZE_MAGIC_64,
+        'cxx_iat_rva_magic': _CXX_EH_IAT_RVA_MAGIC_64,
+        'tail':              _IMPORTS_TAIL_ARM64,
+        'dir_array_offset':  112,
+        'disp64_off':        8,
+        'ep_rva_magic':      _EP_RVA_MAGIC,
+        # Same AArch64 PIC (adrp/ldr) page-granularity requirement the
+        # _PLATFORM_LINUX_ARM64 entry above documents: the compiled PE's own
+        # code reaches its .rdata/IAT with page-granular adrp addressing, so
+        # the embedded PE's runtime base must be congruent to its link-time
+        # ImageBase modulo the page size - i.e. page-aligned.
+        'pe_align':          4096,
+    },
+    _PLATFORM_ARM32: {
+        'relocs':            RELOCS_ARM32,
+        'imports':           b'',
+        'delay_imports':     b'',
+        'entrypoint':        ENTRYPOINT_ARM32,
+        'seh':               b'',
+        'seh_always':        False,
+        'tls':               b'',
+        'ctors':             CTORS_RUNNER_ARM32,
+        'ctors_rva_magic':   _CTORS_RVA_MAGIC,
+        'ctors_size_magic':  _CTORS_SIZE_MAGIC,
+        'tail':              b'',
+        'dir_array_offset':  96,
+        'disp32_off':        8,
+        'ep_rva_magic':      _EP_RVA_MAGIC,
+    },
+    _PLATFORM_LINUX_ARM32: {
+        'relocs':            RELOCS_ARM32,
+        'imports':           IMPORTS_ARM32_LINUX,
+        'delay_imports':     b'',
+        'entrypoint':        ENTRYPOINT_ARM32,
+        'seh':               b'',
+        'seh_always':        False,
+        'tls':               b'',
+        'ctors':             CTORS_RUNNER_ARM32,
+        'ctors_rva_magic':   _CTORS_RVA_MAGIC,
+        'ctors_size_magic':  _CTORS_SIZE_MAGIC,
+        'tail':              _IMPORTS_TAIL_ARM32,
+        'dir_array_offset':  96,
+        'disp32_off':        8,
+        'ep_rva_magic':      _EP_RVA_MAGIC,
+    },
     _PLATFORM_EFI: {
         'relocs':            RELOCS_64,
         'imports':           b'',
@@ -194,6 +281,10 @@ def _strip_tail(shellcode: bytes, tail: bytes) -> bytes:
 def _select_chain(features: PeFeatures, platform: "str | None" = None) -> dict:
     """Return the _SHELLCODES entry for this PE, or raise ValueError."""
     if platform == _PLATFORM_LINUX:
+        if features.machine == _MACHINE_ARM64:
+            return _SHELLCODES[_PLATFORM_LINUX_ARM64]
+        if features.machine in (_MACHINE_ARMNT, _MACHINE_ARMTHUMB):
+            return _SHELLCODES[_PLATFORM_LINUX_ARM32]
         return _SHELLCODES[_PLATFORM_LINUX_32 if features.pe_type == OPTIONAL_HEADER_MAGIC_PE else _PLATFORM_LINUX]
     if platform == _PLATFORM_EFI:
         if features.machine == _MACHINE_ARM64:
@@ -208,7 +299,15 @@ def _select_chain(features: PeFeatures, platform: "str | None" = None) -> dict:
             return _SHELLCODES[_PLATFORM_EFI_ARM32]
         return _SHELLCODES[_PLATFORM_EFI_32 if features.pe_type == OPTIONAL_HEADER_MAGIC_PE else _PLATFORM_EFI]
     if features.subsystem == _POSIX_CUI_SUBSYSTEM:
+        if features.machine == _MACHINE_ARM64:
+            return _SHELLCODES[_PLATFORM_LINUX_ARM64]
+        if features.machine in (_MACHINE_ARMNT, _MACHINE_ARMTHUMB):
+            return _SHELLCODES[_PLATFORM_LINUX_ARM32]
         return _SHELLCODES[_PLATFORM_LINUX_32 if features.pe_type == OPTIONAL_HEADER_MAGIC_PE else _PLATFORM_LINUX]
+    if features.machine == _MACHINE_ARM64:
+        return _SHELLCODES[_PLATFORM_ARM64]
+    if features.machine in (_MACHINE_ARMNT, _MACHINE_ARMTHUMB):
+        return _SHELLCODES[_PLATFORM_ARM32]
     entry = _SHELLCODES.get(features.pe_type)
     if entry is None:
         raise ValueError(f"Unsupported PE type: 0x{features.pe_type:04X}")

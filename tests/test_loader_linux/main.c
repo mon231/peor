@@ -7,16 +7,75 @@
  * without Windows API imports).
  */
 #include <fcntl.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <ucontext.h>
 #include <unistd.h>
 
 #define NOP_SLED_MAX_OFFSET 1024
-#define NOP_BYTE            ((uint8_t)0x90)
+#define NOP_BYTE            ((uint8_t)0x90)   /* x86/x64 single-byte NOP */
+
+/* ARM64 has no 1-byte NOP (fixed 4-byte instruction width) - fill the sled with
+ * the real 4-byte NOP encoding (nop_offset is always 16-byte aligned, so always
+ * a whole number of 4-byte instruction slots) instead of a repeating byte. */
+#if defined(__aarch64__)
+static const uint8_t NOP_WORD_ARM64[4] = {0x1F, 0x20, 0x03, 0xD5};
+static void fill_nop_sled(uint8_t *mem, size_t nop_offset) {
+    for (size_t i = 0; i < nop_offset; i += 4) {
+        mem[i + 0] = NOP_WORD_ARM64[0];
+        mem[i + 1] = NOP_WORD_ARM64[1];
+        mem[i + 2] = NOP_WORD_ARM64[2];
+        mem[i + 3] = NOP_WORD_ARM64[3];
+    }
+}
+#endif
+
+#if defined(__aarch64__)
+static volatile uint8_t *g_dump_mem;
+static volatile size_t    g_dump_total;
+
+/* Debug aid for dissecting a hanging shellcode: PEOR_LOADER_DUMP=<path> installs a
+   SIGALRM handler that snapshots the whole mapping to <path> one second after the
+   call, then _exit(124)s. A hanging shellcode gets dumped mid-loop; a returning
+   shellcode dumps normally after main() returns. No effect when unset.
+   PEOR_LOADER_WATCH=1 instead samples pc/regs every second forever (no dump, no
+   exit) so a hang can be watched evolve. */
+static void dump_mapping_on_alarm(int sig, siginfo_t *si, void *uc_) {
+    (void)sig; (void)si;
+    ucontext_t *uc = (ucontext_t *)uc_;
+    uint64_t pc = uc->uc_mcontext.pc;
+    unsigned long long *r = uc->uc_mcontext.regs;
+    fprintf(stderr, "PEOR_LOADER_DUMP pc=%llx x0=%llx x1=%llx x2=%llx x3=%llx\n",
+            (unsigned long long)pc, r[0], r[1], r[2], r[3]);
+    fprintf(stderr, "     x8=%llx x19=%llx x20=%llx x21=%llx x22=%llx x23=%llx x24=%llx x30=%llx\n",
+            r[8], r[19], r[20], r[21], r[22], r[23], r[24], r[30]);
+    if (getenv("PEOR_LOADER_WATCH")) {
+        /* 20 ms samples: cheap enough for a few seconds, still readable. */
+        struct itimerval it;
+        memset(&it, 0, sizeof(it));
+        it.it_interval.tv_sec = 0;
+        it.it_interval.tv_usec = 20000;
+        it.it_value = it.it_interval;
+        setitimer(ITIMER_REAL, &it, NULL);
+        return;
+    }
+    const char *path = getenv("PEOR_LOADER_DUMP");
+    if (path) {
+        FILE *df = fopen(path, "wb");
+        if (df) {
+            fwrite((const void *)g_dump_mem, 1, g_dump_total, df);
+            fclose(df);
+        }
+    }
+    _exit(124);
+}
+#endif
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
@@ -38,10 +97,24 @@ int main(int argc, char *argv[]) {
     }
     size_t size = (size_t)st.st_size;
 
+#if defined(__aarch64__)
+    /* AArch64 PIC (adrp/ldr, which any non-trivial compiled PE's own code uses
+       throughout to reach its own .rdata/IAT) is page-granular: it only computes
+       correct addresses when the *embedded PE's* runtime base is congruent to its
+       link-time ImageBase modulo the page size - i.e. page-aligned. mmap() below
+       always returns a page-aligned address, so nop_offset must stay exactly 0
+       (peor's _PLATFORM_LINUX_ARM64 chain pads its stub prefix to a page-size
+       multiple - see peor/_chain_builder.py's 'pe_align': 4096 - so the embedded
+       PE itself lands on the next page boundary after this zero offset).
+       x86/x64 have no such requirement (RIP-relative LEA is byte-granular), which
+       is why only ARM64 pins this to 0 instead of randomizing within the sled. */
+    size_t nop_offset = 0;
+#else
     /* Keep nop_offset 16-byte aligned so the PE image is always 16-byte aligned
        for MOVDQA/MOVAPS instructions in the shellcode. */
     srand((unsigned)getpid());
     size_t nop_offset = (size_t)(1 + (rand() % (NOP_SLED_MAX_OFFSET / 16))) * 16;
+#endif
     size_t total      = size + NOP_SLED_MAX_OFFSET + 4096;
 
     /* Declare as volatile so GCC always reloads mem/total from the stack slot
@@ -57,7 +130,11 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+#if defined(__aarch64__)
+    fill_nop_sled(mem, nop_offset);
+#else
     memset(mem, NOP_BYTE, nop_offset);
+#endif
     uint8_t *shellcode_start = mem + nop_offset;
 
     ssize_t nread = read(fd, shellcode_start, size);
@@ -72,6 +149,35 @@ int main(int argc, char *argv[]) {
         perror("mprotect");
         munmap(mem, total);
         return 1;
+    }
+
+#if defined(__aarch64__)
+    if (getenv("PEOR_LOADER_DUMP") || getenv("PEOR_LOADER_WATCH")) {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_sigaction = dump_mapping_on_alarm;
+        sa.sa_flags    = SA_SIGINFO;
+        sigaction(SIGALRM, &sa, NULL);
+        g_dump_mem   = mem;
+        g_dump_total = total;
+        alarm(1);
+    }
+#endif
+
+    /* Optional debug aid (PEOR_LOADER_DEBUG=1): print the mapping geometry so a
+       hanging shellcode can be dissected by dumping /proc/<pid>/mem pages at
+       known offsets. Prints to stderr, no output when the variable is unset. */
+    if (getenv("PEOR_LOADER_DEBUG")) {
+        fprintf(stderr, "PEOR_LOADER_DEBUG mem=%p nop_offset=%zu size=%zu total=%zu\n",
+                mem, nop_offset, size, total);
+        FILE *mf = fopen("/proc/self/maps", "re");
+        if (mf) {
+            char line[256];
+            while (fgets(line, sizeof(line), mf)) {
+                fputs(line, stderr);
+            }
+            fclose(mf);
+        }
     }
 
     /* The shellcode finds dlopen/dlsym by itself via /proc/self/maps + ELF parsing.

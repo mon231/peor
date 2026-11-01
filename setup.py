@@ -119,10 +119,20 @@ def _assemble_shellcodes():
     r_arm64     = assemble_arm64(ASM_DIR / 'relocations_resolver_arm64.asm', patch_pe_offset_pool=True)
     ctors_arm64 = assemble_arm64(ASM_DIR / 'ctors_runner_arm64.asm')
     e_efi_arm64_raw = assemble_arm64(ASM_DIR / 'entrypoint_resolver_efi_arm64.asm')
+    e_arm64_raw = assemble_arm64(ASM_DIR / 'entrypoint_resolver_arm64.asm')
+    i_arm64_linux = assemble_arm64(ASM_DIR / 'imports_resolver_arm64_linux.asm')
+    i_arm64_um = assemble_arm64(ASM_DIR / 'imports_resolver_arm64.asm')
+    dl_arm64_um  = assemble_arm64(ASM_DIR / 'imports_resolver_arm64_delayload.asm')
+    s_arm64_um   = assemble_arm64(ASM_DIR / 'seh_registrar_arm64.asm')
+    t_arm64_um   = assemble_arm64(ASM_DIR / 'tls_callbacks_arm64.asm')
+    f_arm64      = assemble_arm64(ASM_DIR / 'cxx_eh_fixer_arm64.asm')
+
 
     r_arm32     = assemble_arm32(ASM_DIR / 'relocations_resolver_arm32.asm', patch_pe_offset_pool=True)
     ctors_arm32 = assemble_arm32(ASM_DIR / 'ctors_runner_arm32.asm')
     e_efi_arm32_raw = assemble_arm32(ASM_DIR / 'entrypoint_resolver_efi_arm32.asm')
+    e_arm32_raw = assemble_arm32(ASM_DIR / 'entrypoint_resolver_arm32.asm')
+    i_arm32_linux = assemble_arm32(ASM_DIR / 'imports_resolver_arm32_linux.asm')
     # AAPCS callee-save only: the shellcode is called as EFI_STATUS(void), so r0/r1 are
     # never the firmware's ImageHandle/SystemTable (see entrypoint_resolver_efi_arm32.asm).
     arm32_efi_prefix_raw = assemble_arm32(
@@ -151,6 +161,8 @@ def _assemble_shellcodes():
         ('entrypoint_resolver_efi32.asm',      e_efi32_raw),
         ('entrypoint_resolver_efi_arm64.asm',  e_efi_arm64_raw),
         ('entrypoint_resolver_efi_arm32.asm',  e_efi_arm32_raw),
+        ('entrypoint_resolver_arm64.asm',      e_arm64_raw),
+        ('entrypoint_resolver_arm32.asm',      e_arm32_raw),
     ]:
         if bytes(ep_raw).count(_EP_RVA_PLACEHOLDER) != 1:
             raise RuntimeError(f"Expected exactly one EP_RVA_MAGIC 0xCECECECE in {ep_name}")
@@ -160,6 +172,8 @@ def _assemble_shellcodes():
     e_efi32     = e_efi32_raw
     e_efi_arm64 = e_efi_arm64_raw
     e_efi_arm32 = e_efi_arm32_raw
+    e_arm64     = e_arm64_raw
+    e_arm32     = e_arm32_raw
 
     s64  = assemble(ASM_DIR / 'seh_registrar64.asm',         keystone.KS_ARCH_X86, keystone.KS_MODE_64)
     s32  = assemble(ASM_DIR / 'seh_registrar32.asm',         keystone.KS_ARCH_X86, keystone.KS_MODE_32)
@@ -230,10 +244,21 @@ def _assemble_shellcodes():
         f"RELOCS_ARM64           = bytes.fromhex('{r_arm64.hex()}')\n"
         f"CTORS_RUNNER_ARM64     = bytes.fromhex('{ctors_arm64.hex()}')\n"
         f"ENTRYPOINT_EFI_ARM64   = bytes.fromhex('{e_efi_arm64.hex()}')\n"
+        f"IMPORTS_ARM64_LINUX    = bytes.fromhex('{i_arm64_linux.hex()}')\n"
+        f"IMPORTS_ARM64_UM       = bytes.fromhex('{i_arm64_um.hex()}')\n"
+        f"DELAY_IMPORTS_ARM64_UM = bytes.fromhex('{dl_arm64_um.hex()}')\n"
+        f"SEH_REGISTRAR_ARM64    = bytes.fromhex('{s_arm64_um.hex()}')\n"
+        f"TLS_CALLBACKS_ARM64    = bytes.fromhex('{t_arm64_um.hex()}')\n"
+        f"CXX_EH_FIXER_ARM64     = bytes.fromhex('{f_arm64.hex()}')\n"
+
+        f"ENTRYPOINT_ARM64       = bytes.fromhex('{e_arm64.hex()}')\n"
+        f"ENTRYPOINT_ARM32       = bytes.fromhex('{e_arm32.hex()}')\n"
         f"RELOCS_ARM32           = bytes.fromhex('{r_arm32.hex()}')\n"
         f"CTORS_RUNNER_ARM32     = bytes.fromhex('{ctors_arm32.hex()}')\n"
         f"ENTRYPOINT_EFI_ARM32   = bytes.fromhex('{e_efi_arm32.hex()}')\n"
         f"ARM32_EFI_PREFIX       = bytes.fromhex('{arm32_efi_prefix_raw.hex()}')\n"
+        f"IMPORTS_ARM32_LINUX    = bytes.fromhex('{i_arm32_linux.hex()}')\n"
+        f"ENTRYPOINT_ARM32       = bytes.fromhex('{e_arm32.hex()}')\n"
     )
 
     print(f"[peor] assembled shellcodes -> {SHELLCODES_PY}")

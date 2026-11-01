@@ -140,8 +140,8 @@ falls through immediately.
 ### Usermode Import Resolution
 
 When the PE has a non-zero import directory (`DataDir[1]`), the import stub
-(`imports_resolver32/64.asm`) resolves every entry in `IMAGE_IMPORT_DESCRIPTOR`
-before the reloc stub runs.
+(`imports_resolver32/64/_arm64.asm`) resolves every entry in
+`IMAGE_IMPORT_DESCRIPTOR` before the reloc stub runs.
 
 **Step 1 — find kernel32** via the PEB loader list, without any imports of its
 own:
@@ -150,8 +150,25 @@ own:
 |---|---|---|---|---|
 | x86 | `FS:[0x30]` | `+0x0C` → Ldr | `+0x14` → InMemoryOrderModuleList | `[0]=exe`, `[1]=ntdll`, `[2]=kernel32` |
 | x64 | `GS:[0x60]` | `+0x18` → Ldr | `+0x20` → InMemoryOrderModuleList | same order |
+| ARM64 | `x18`¹ | `+0x18` → Ldr | `+0x20` → InMemoryOrderModuleList | same order |
 
-`DllBase` sits at `+0x10` from an `InMemoryOrderLinks` node.
+`DllBase` sits at `+0x10` from an `InMemoryOrderLinks` node (x86/x64) or
+`+0x20` from the `InMemoryOrderModuleList.Flink` value directly (x64/ARM64 -
+same relationship, phrased from the pointer `imports_resolver64.asm`/
+`imports_resolver_arm64.asm` already hold after the module-list walk).
+
+¹ ARM64 Windows has no "read memory to find the TEB" step: `x18` is the
+platform register that directly **holds** the TEB pointer for the whole
+process (unlike x86/x64, which read it from a segment-relative offset). From
+there, every PEB/Ldr/LDR\_DATA\_TABLE\_ENTRY offset is identical to x64's -
+these are OS data structures, not ISA-dependent; only the register used to
+reach the TEB differs. `imports_resolver_arm64.asm` otherwise mirrors
+`imports_resolver64.asm` exactly: PEB walk → kernel32 export-table scan for
+`GetProcAddress` → `GetProcAddress(kernel32, "LoadLibraryA")` →
+`IMAGE_IMPORT_DESCRIPTOR` walk calling `LoadLibraryA`+`GetProcAddress` for
+every import (this is the real Windows loader path - not the
+`dlopen`/`dlsym` approach the Linux ARM64 import resolver uses for ELF
+imports).
 
 **Step 2 — locate `GetProcAddress`** by walking kernel32's export table:
 scan `AddressOfNames` for the string, resolve via `AddressOfNameOrdinals` +
@@ -167,7 +184,8 @@ scan `AddressOfNames` for the string, resolve via `AddressOfNameOrdinals` +
 
 When the PE subsystem is POSIX\_CUI (7) or `--platform linux` is specified and
 the PE has an import directory, the Linux import resolver
-(`imports_resolver32/64_linux.asm`) is used instead of the PEB-walk resolver.
+(`imports_resolver32/64_linux.asm`, or `imports_resolver_arm64_linux.asm` for
+AArch64) is used instead of the PEB-walk resolver.
 
 The shellcode is **fully self-contained** — the caller passes no arguments.
 The reference Linux loader invokes it with zero arguments:
@@ -188,7 +206,19 @@ At runtime the resolver:
 
 String literals (`/proc/self/maps`, `dlsym`, `dlopen`, `libc.so`) are embedded
 via the call-over-data trick (no absolute addresses).  All calls use the
-System V ABI (x64: RDI/RSI/RDX; x86: stack cdecl).
+System V ABI (x64: RDI/RSI/RDX; x86: stack cdecl) or AAPCS64 (arm64: X0/X1/X2).
+
+The ARM64 variant resolves `dlopen`/`dlsym` the same way (ELF64 `PT_DYNAMIC`/
+`DT_HASH`/`DT_SYMTAB`/`DT_STRTAB` symbol-table scan against libc's own mapping
+in `/proc/self/maps`), then calls them via `BLR`.  It is subject to the same
+**ARM64 ADRP alignment requirement** documented above for the EFI chain: the
+embedded PE's runtime base must be 4 KB page-aligned, or `ADRP`-based accesses
+inside the PE's own compiled code (e.g. loading an IAT slot to call through it)
+compute the wrong address.  `_PLATFORM_LINUX_ARM64`'s chain entry therefore
+also sets `pe_align=4096`; a Linux loader placing the shellcode blob at an
+arbitrary (non-page-aligned) address — as `tests/test_loader_linux/main.c`'s
+x86/x64 NOP-sled fuzzing does on purpose — must instead place it at a
+page-aligned offset for ARM64 (see that file's `__aarch64__` branch).
 
 ---
 
@@ -438,6 +468,13 @@ header (or the RVA supplied by `--entry`).  If `IMAGE_FILE_DLL` is set in
 correct calling convention (x86 stdcall / x64 Microsoft ABI).  For EXEs it
 jumps directly to the entry point.
 
+`entrypoint_resolver_arm64.asm` / `entrypoint_resolver_arm32.asm` are the ARM64/
+ARM32 (Thumb-2) analogs for the generic (non-EFI) Windows chain, using AAPCS64/
+AAPCS32's calling convention instead (no shadow space, unlike x64's Microsoft
+ABI). Same `DllMain`-vs-OEP dispatch logic; `EP_RVA_MAGIC` is patched via a
+literal-pool slot rather than folded into a `mov`/`movz` immediate, since ARM's
+fixed-width instructions can't hold a raw, byte-searchable 32-bit value inline.
+
 ---
 
 ## Module Structure
@@ -462,8 +499,10 @@ object for memory-layout reads (`pe.get_data()`, `pe.sections`).
 
 All tests live in `tests/` and are driven by `pytest`.  Each test:
 1. Calls `dump_memory_layout` to produce a shellcode binary.
-2. Executes it via `tests/Win_x86/test_loader.exe` or
-   `tests/Win_x64/test_loader.exe`.
+2. Executes it via `tests/Win_x86/test_loader.exe`,
+   `tests/Win_x64/test_loader.exe`, or `tests/Win_ARM64/test_loader.exe`
+   (ARM64 loaders run on ARM64 Windows hosts — the `windows-11-arm` CI
+   runner; x64 hosts skip ARM64 execution cases cleanly).
 3. Asserts on the process exit code.
 
 Build the test PEs first (see **Building**), then run:
@@ -474,30 +513,31 @@ pytest tests/pytest -v
 
 | # | Test | Arch | What it verifies | Expected exit |
 |---|---|---|---|---|
-| 01 | `01_simple_calc` | x86, x64 | Importless EXE; loop 0–99, no relocations needed | 4950 |
-| 02 | `02_relocs_functions` | x86, x64 | Importless EXE with static globals and `.reloc` section; tests relocation resolver | 90 |
+| 01 | `01_simple_calc` | x86, x64, arm64 | Importless EXE; loop 0–99, no relocations needed | 4950 |
+| 02 | `02_relocs_functions` | x86, x64, arm64 | Importless EXE with static globals and `.reloc` section; tests relocation resolver | 90 |
 | 03 | `03_winapi_messagebox` | x86, x64 | EXE calling `MessageBoxA`; tests import resolver and interactive dialog | 0 (skipped in CI) |
-| 04 | `04_crt_printf_rand` | x86, x64 | CRT EXE (`printf` + `rand`); tests full CRT startup with imports | 0 (stdout = `Random: <n>`) |
-| 05 | `05_dll_entry` | x86, x64 | DLL whose `DllMain` calls `ExitProcess(42)`; tests DLL entry dispatch | 42 |
-| 06 | `06_stripped_relocs` | x86, x64 | EXE compiled `/FIXED` (no `.reloc` section); resolver must skip relocation | 99 |
-| 07 | `07_cpp_exceptions` | x86, x64 | `__try`/`__except` with `RaiseException(77,...)`; tests SEH registrar | 77 |
-| 08 | `08_cpp_thread` | x86, x64 | `std::thread` lambda sets `result=42`; tests CRT thread machinery | 42 |
-| 09 | `09_resources` | x86, x64 | EXE reads string resource 100 from its own `.rsrc` section via `__ImageBase`; tests resource preservation | 42 |
-| 10 | `10_tls_callbacks` | x86, x64 | TLS callback sets `g_result=88`; tests TLS callback invoker runs before `main` | 88 |
-| 11 | `11_cpp_exceptions` | x86, x64 | Typed C++ `throw`/`catch`; tests that the correct catch branch fires | 123 |
-| 12 | `12_seh_exceptions` | x86, x64 | Same as 11 but compiled `/EHa` (SEH-integrated C++ exceptions) | 123 |
-| 13 | `13_tls_multi_callbacks` | x86, x64 | Five TLS callbacks in sequence with ordering check | computed sum |
-| 14 | `14_global_ctors` | x86, x64 | File-scope C++ constructor runs before `main` | 42 |
-| 15 | `15_nested_exceptions` | x64 | Nested/rethrown C++ exceptions test multi-frame unwind | 55 |
-| 16 | `16_delay_load` | x86, x64 | Delay-loaded `winmm.dll!timeGetTime`; tests delay-load IAT pre-patching | 1..250 |
-| — | `certificate_signed_pe` | x86, x64 | PE with a dummy `WIN_CERTIFICATE` appended; verifies security directory is handled | 90 |
+| 04 | `04_crt_printf_rand` | x86, x64, arm64 | CRT EXE (`printf` + `rand`); tests full CRT startup with imports | 0 (stdout = `Random: <n>`) |
+| 05 | `05_dll_entry` | x86, x64, arm64 | DLL whose `DllMain` calls `ExitProcess(42)`; tests DLL entry dispatch | 42 |
+| 06 | `06_stripped_relocs` | x86, x64, arm64 | EXE: x86/x64 compiled `/FIXED` (no `.reloc`), resolver must skip relocation; the arm64 linker cannot strip `.reloc` (LNK1246) so the arm64 case exercises real relocations instead | 99 |
+| 07 | `07_cpp_exceptions` | x86, x64, arm64 | `__try`/`__except` with `RaiseException(77,...)`; tests SEH registrar | 77 |
+| 08 | `08_cpp_thread` | x86, x64, arm64 | `std::thread` lambda sets `result=42`; tests CRT thread machinery | 42 |
+| 09 | `09_resources` | x86, x64, arm64 | EXE reads string resource 100 from its own `.rsrc` section via `__ImageBase`; tests resource preservation | 42 |
+| 10 | `10_tls_callbacks` | x86, x64, arm64 | TLS callback sets `g_result=88`; tests TLS callback invoker runs before `main` | 88 |
+| 11 | `11_cpp_exceptions` | x86, x64, arm64 | Typed C++ `throw`/`catch`; tests that the correct catch branch fires | 123 |
+| 12 | `12_seh_exceptions` | x86, x64, arm64 | Same as 11 but compiled `/EHa` (SEH-integrated C++ exceptions) | 123 |
+| 13 | `13_tls_multi_callbacks` | x86, x64, arm64 | Five TLS callbacks in sequence with ordering check | computed sum |
+| 14 | `14_global_ctors` | x86, x64, arm64 | File-scope C++ constructor runs before `main` | 42 |
+| 15 | `15_nested_exceptions` | x86, x64, arm64 | Nested/rethrown C++ exceptions test multi-frame unwind | 55 |
+| 16 | `16_delay_load` | x86, x64, arm64 | Delay-loaded `winmm.dll!timeGetTime`; tests delay-load IAT pre-patching | 1..250 |
+| — | `certificate_signed_pe` | x86, x64, arm64 | PE with a dummy `WIN_CERTIFICATE` appended; verifies security directory is handled | 90 |
 | — | `clr_pe_rejection` | — | CLR/managed PE raises `ValueError` | ValueError |
 | — | `disp32_overflow` | — | Relocs resolver disp32 overflow check raises `ValueError` | ValueError |
-| — | `custom_entry` | x64 | `--entry DllMain` calls a named export instead of OEP | 42 |
-| — | `mingw_simple_calc` | x64 | MinGW cross-compiled importless EXE; uses WSL on Windows, native compiler on Linux CI; Linux loader prints full int to stdout | stdout=4950 |
-| — | `clangcl_simple_calc` | x64 | clang-cl `/MT` compiled EXE with static CRT; Windows-only (skipped if `clang-cl` absent) | 4950 |
+| — | `custom_entry` | x86, x64, arm64 | `--entry DllMain` calls a named export instead of OEP | 42 |
+| — | `mingw_simple_calc` | x64 | MinGW cross-compiled importless EXE; uses WSL on Windows, native compiler on Linux CI; Linux loader prints full int to stdout (arm64 case pending a MinGW aarch64 build path) | stdout=4950 |
+| — | `clangcl_simple_calc` | x64 | clang-cl `/MT` compiled EXE with static CRT; Windows-only (skipped if `clang-cl` absent; arm64 case pending a clang-cl aarch64 cross path) | 4950 |
 | — | `01_linux_write` | x64 | Linux-platform PE (subsystem 7) importing `write` from `libc.so.6`; shellcode finds `dlsym`/`dlopen` itself via `/proc/self/maps`; asserts "PEOR\n" in stdout | stdout=PEOR |
 | — | `01_linux_write_x86` | x86 | Same as above but compiled as PE32 with i686-w64-mingw32-gcc; uses x86 Linux chain and 32-bit loader | stdout=PEOR |
+| — | `01_linux_write_arm64` | arm64 | Same as above but cross-compiled with clang+lld (`aarch64-w64-mingw32`) and llvm-dlltool; uses the ARM64 Linux chain (page-aligned PE base, see ADRP alignment note above) and runs under `qemu-aarch64` user-mode emulation | stdout=PEOR |
 | — | `02_linux_cpp_exceptions` | x64, x86 | Linux C++ shellcode: `throw`/`catch` a custom type, return code 42 for typed catch, 88 for catch-all; x64 uses Windows-SEH emulator (`seh_linux64.c`) | 42 |
 | — | `03_linux_with_crt` | x64, x86 | Linux PE using `strlen`/`malloc`/`free`/`memcpy` from `libc.so.6`; tests multi-symbol dlopen/dlsym resolver | 73 |
 | — | `04_linux_signal` | x64, x86 | Linux PE installing SIGUSR1 handler via `signal()`, raising it via `raise()`, returns 77; tests signal-handling imports | 77 |
@@ -609,13 +649,38 @@ and the native `test_loader.exe` for execution.
 
 ## Supported PE Types
 
-| Type | x86 | x64 |
-|---|---|---|
-| Windows GUI/console EXE | ✅ | ✅ |
-| Windows DLL | ✅ | ✅ |
-| Linux user-mode EXE (POSIX\_CUI, subsystem 7) | ✅ | ✅ |
-| EFI application (subsystems 10–13) | ✅ | ✅ |
-| Windows kernel driver | ❌ | ❌ |
+| Type | x86 | x64 | ARM64 | ARM32 |
+|---|---|---|---|---|
+| Windows GUI/console EXE | ✅ | ✅ | ⚠️¹ | ⚠️¹ |
+| Windows DLL | ✅ | ✅ | ⚠️¹ | ⚠️¹ |
+| Linux user-mode EXE (POSIX\_CUI, subsystem 7) | ✅ | ✅ | ✅ | ❌ |
+| EFI application (subsystems 10–13) | ✅ | ✅ | ✅ | ✅ |
+| Windows kernel driver | ❌ | ❌ | ❌ | ❌ |
+
+¹ ARM64/ARM32 Windows GUI/console EXE/DLL support is landing incrementally
+(see `docs/superpowers/plans/2026-10-26-windows-arm-pe-support.md`). **ARM64**:
+the full usermode Windows chain is wired — relocations, usermode + delay-load
+imports (`imports_resolver_arm64.asm`,
+`imports_resolver_arm64_delayload.asm`), the C++ EH fixer that hooks the
+`RtlPcToFileHeader` IAT slot (`cxx_eh_fixer_arm64.asm`; MSVC ARM64 C++ PEs
+reference that function through the IAT exactly like their x64 counterparts),
+SEH registration via `ntdll!RtlAddFunctionTable`
+(`seh_registrar_arm64.asm`; AArch64 `RUNTIME_FUNCTION` is 2 DWORDs, so
+EntryCount is `DataDir[3].Size / 8`), TLS callbacks, `.init_array` ctors,
+and the `DllMain`/OEP dispatcher — all verified against real MSVC-compiled
+ARM64 test PEs (01–21 build with `Platform=ARM64`; every PE round-trips
+through peor's conversion deterministically, and the feature table drives the
+exact same stub chain x64 uses). Execution proof lands on the
+`windows-11-arm` CI runner (x86_64 hosts cannot run ARM64 PE code — there is
+no reverse-direction emulation locally), where the `[arm64]` pytest params of
+the Windows usermode/feature suites run for real. **ARM32**: relocations, the
+entry-point dispatcher, and ctors are wired; ARM32 is otherwise deferred (not
+in scope) pending a Windows SDK that still ships 32-bit ARM import libraries
+(this machine's only installed SDK removed them - see the Task 1/2 progress
+ledger). `_select_chain` correctly dispatches a real ARM64/ARM32 Windows PE to
+its own chain instead of silently falling through to x64/x86 (same `pe_type`
+— PE32+/PE32 — but a different `machine` field) regardless of how much of the
+chain is implemented so far.
 
 Attempting to convert unsupported combinations raises `ValueError` or `PeorUnsupportedError` with a descriptive message.
 

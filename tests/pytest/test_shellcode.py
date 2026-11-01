@@ -2,6 +2,7 @@ import os
 import re
 import sys
 import time
+import glob
 import pytest
 import struct
 import shutil
@@ -19,6 +20,7 @@ from peor._pe_features import (
     _detect_pe_features,
     _PLATFORM_LINUX,
     _PLATFORM_EFI,
+    _PLATFORM_ARM64,
     IMAGE_DIRECTORY_ENTRY_IMPORT,
     IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR,
     IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT,
@@ -39,12 +41,24 @@ TESTS_DIR = Path(__file__).parent.parent
 ARCH_DIRS = {
     "x86": TESTS_DIR / "Win_x86",
     "x64": TESTS_DIR / "Win_x64",
+    "arm64": TESTS_DIR / "Win_ARM64",
 }
+# NOTE: no ARCH_DIRS["arm32"] yet. Building a real ARM32 (32-bit ARM) Windows PE via
+# MSVC is BLOCKED-ON-TOOLCHAIN on this dev machine: the only installed Windows SDK
+# (10.0.26100.0) has removed 32-bit ARM desktop support entirely (no um/ARM import
+# libs; Microsoft's own WindowsSdkVersionARMSupportRemoved == this exact SDK
+# version), and no cached/offline older SDK install completed here (see progress.md).
+# Until a working ARM32 toolchain is available, "arm32" must NOT be added to
+# ARCH_DIRS or to any parametrize("arch", ...) list that would run against it --
+# adding it now would either fail to collect (no exe) or silently need a skip,
+# both of which CLAUDE.md/CONTRIBUTING.md forbid.
 
 # Pre-built Linux PE directories (populated by build-linux-mingw CI job or first local run).
 # Tests check these dirs first; compilation only happens when the PE is absent.
 _LINUX_PREBUILD_X64 = TESTS_DIR / "Linux_x64"
 _LINUX_PREBUILD_X86 = TESTS_DIR / "Linux_x86"
+_LINUX_PREBUILD_ARM64 = TESTS_DIR / "Linux_arm64"
+_LINUX_PREBUILD_ARM32 = TESTS_DIR / "Linux_arm32"
 
 MINGW_CPP_EH_RETURN_CODE = 42
 LINUX_CRT_RETURN_CODE = 73
@@ -64,10 +78,33 @@ _WM_COMMAND = 0x0111
 _IDOK = 1
 
 
+def _host_runs_arm64() -> bool:
+    """True when this Windows host can execute ARM64 PE code natively.
+
+    x64 Windows cannot emulate ARM64 (the only reverse-direction gap; ARM64
+    Windows runs x86/x64 via Prism emulation), so ARM64 execution proof can only
+    come from an ARM64 host - locally, or CI's windows-11-arm runner.
+    """
+    return platform.machine().lower() in ("arm64", "aarch64")
+
+
 def _skip_if_missing(loader_path: Path, pe_path: Path) -> None:
     """Fail (not skip) when an expected build artifact is missing — see PLAN.md:
     a missing binary means the build step didn't run, not that the test doesn't apply.
+
+    ARM64 execution gate: when the loader is the ARM64 one (Win_ARM64) and the
+    host is not ARM64, the test is skipped cleanly - the shellcodify/conversion
+    side is already proven statically on any host (see the 03-messagebox static
+    companion test), but running ARM64 machine code needs an ARM64 CPU. On
+    windows-11-arm CI these [arm64] params run for real. The existence asserts
+    still apply first for non-arm64 loaders, and on an ARM64 host before skip.
     """
+    if "Win_ARM64" in str(loader_path) and not _host_runs_arm64():
+        pytest.skip(
+            "ARM64 shellcode execution requires an ARM64 Windows host "
+            "(x64 Windows cannot execute ARM64 PEs; proven instead on "
+            "windows-11-arm CI)"
+        )
     assert loader_path.exists(), f"test_loader.exe not found at {loader_path} — build tests/tests.sln first"
     assert pe_path.exists(), f"{pe_path.name} not found at {pe_path} — build tests/tests.sln first"
 
@@ -136,7 +173,7 @@ def _poll_and_dismiss_msgbox(title: str, timeout: float = 10.0) -> dict:
     return result
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 @pytest.mark.parametrize("test_name,expected", _EXIT_CODE_CASES, ids=[t[0] for t in _EXIT_CODE_CASES])
 def test_shellcode_exit_code(arch, test_name, expected, tmp_path):
     win_dir = ARCH_DIRS[arch]
@@ -191,7 +228,53 @@ def test_03_winapi_messagebox(arch, tmp_path):
     assert proc.returncode == 0, f"[{arch}] expected exit code 0, got {proc.returncode}"
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+def test_03_winapi_messagebox_arm64_imports_resolved_statically(tmp_path):
+    """ARM64 counterpart of test_03_winapi_messagebox, execution-blocked.
+
+    This machine is x86_64 Windows: there is no reverse-direction emulation
+    (ARM64 Windows can run x64 via emulation; x64 Windows cannot run ARM64
+    binaries at all), so test_loader.exe cannot actually execute ARM64
+    shellcode here - same execution-blocked category Task 1 already hit for
+    01_simple_calc's [arm64] case. "arm64" is therefore intentionally NOT
+    added to test_03_winapi_messagebox's own parametrize list above.
+
+    What CAN be verified here, and is: a real MSVC-compiled ARM64 PE that
+    imports MessageBoxA (user32.dll) and ExitProcess (kernel32.dll) resolves
+    to the ARM64 chain with a real (non-empty) imports resolver wired in,
+    and that resolver assembles into the shellcode chain deterministically
+    via the same dump_memory_layout() path the executing x86/x64 tests use -
+    i.e. asm/imports_resolver_arm64.asm is actually reachable end-to-end
+    from a real compiled PE, not just unit-tested in isolation.
+    """
+    win_dir = ARCH_DIRS["arm64"]
+    pe_path = win_dir / "03_winapi_messagebox.exe"
+    assert pe_path.exists(), f"{pe_path.name} not found at {pe_path} — build tests/tests.sln (Platform=ARM64) first"
+
+    pe = PE(str(pe_path))
+    assert pe.FILE_HEADER.Machine == 0xAA64, "expected a real ARM64 PE"
+    dll_names = {entry.dll.decode().lower() for entry in pe.DIRECTORY_ENTRY_IMPORT}
+    assert dll_names == {"user32.dll", "kernel32.dll"}, (
+        f"expected MessageBoxA/ExitProcess imports, got DLLs: {dll_names}"
+    )
+
+    features = _detect_pe_features(pe)
+    entry = _select_chain(features)
+    assert entry is _SHELLCODES[_PLATFORM_ARM64], "ARM64 PE did not resolve to the ARM64 chain"
+    assert entry["imports"], "IMPORTS_ARM64_UM is not wired into the ARM64 chain"
+    expected_stubs = ["imports", "relocs", "seh", "entrypoint"]
+    assert _compute_required_stubs(features, entry) == expected_stubs, (
+        "expected imports -> relocs -> seh -> entrypoint ordering: the imports "
+        "resolver runs before relocs (same ordering imports_resolver64.asm uses), "
+        "and MSVC ARM64 PEs always carry a .pdata exception table, which wires in "
+        "asm/seh_registrar_arm64.asm before the entrypoint"
+    )
+
+    shellcode_path = tmp_path / "03_winapi_messagebox_arm64.bin"
+    _shellcodify(pe_path, shellcode_path)
+    assert shellcode_path.stat().st_size > 0
+
+
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_04_crt_printf_rand(arch, tmp_path):
     win_dir = ARCH_DIRS[arch]
     pe_path = win_dir / "04_crt_printf_rand.exe"
@@ -218,7 +301,7 @@ def test_04_crt_printf_rand(arch, tmp_path):
     )
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_05_dll_entry(arch, tmp_path):
     """DLL shellcode: DllMain calls ExitProcess(42) on DLL_PROCESS_ATTACH."""
     win_dir = ARCH_DIRS[arch]
@@ -242,9 +325,13 @@ def test_05_dll_entry(arch, tmp_path):
     )
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_06_stripped_relocs(arch, tmp_path):
-    """EXE with /FIXED (no .reloc section): reloc resolver must skip relocation and jump to OEP."""
+    """x86/x64: EXE built with /FIXED (no .reloc) - resolver must skip relocation
+    and jump to OEP. arm64: the MSVC ARM64 linker refuses /FIXED outright (LNK1246),
+    so this PE keeps its .reloc and the resolver performs real relocations - the
+    no-reloc skip path is x86/x64-only by linker capability; exit code must match
+    either way (same embedded program)."""
     win_dir = ARCH_DIRS[arch]
     pe_path = win_dir / "06_stripped_relocs.exe"
     loader_path = win_dir / "test_loader.exe"
@@ -266,7 +353,7 @@ def test_06_stripped_relocs(arch, tmp_path):
     )
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_07_cpp_exceptions(arch, tmp_path):
     """C++ EXE with try/catch: x64 requires RtlAddFunctionTable for SEH unwind tables."""
     win_dir = ARCH_DIRS[arch]
@@ -290,7 +377,7 @@ def test_07_cpp_exceptions(arch, tmp_path):
     )
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_08_cpp_thread(arch, tmp_path):
     """C++ EXE with std::thread: thread sets result=42, main returns it."""
     win_dir = ARCH_DIRS[arch]
@@ -314,7 +401,7 @@ def test_08_cpp_thread(arch, tmp_path):
     )
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_09_resources(arch, tmp_path):
     """C++ EXE with embedded string resource: reads via __ImageBase HMODULE, returns 42 on match."""
     win_dir = ARCH_DIRS[arch]
@@ -369,7 +456,7 @@ def _sign_pe(source_path: Path, dest_path: Path) -> bool:
         return False
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_certificate_signed_pe(arch, tmp_path):
     """peor must produce correct shellcode from an Authenticode-signed PE."""
     win_dir = ARCH_DIRS[arch]
@@ -396,7 +483,7 @@ def test_certificate_signed_pe(arch, tmp_path):
     )
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_10_tls_callbacks(arch, tmp_path):
     """C++ EXE with TLS callback: callback sets g_result=88, main returns it via a C++ static-local."""
     win_dir = ARCH_DIRS[arch]
@@ -420,7 +507,7 @@ def test_10_tls_callbacks(arch, tmp_path):
     )
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_11_cpp_exceptions(arch, tmp_path):
     """C++ EXE with typed throw/catch: typed catch must return 123; catch(...) returns 456; no-catch 789."""
     win_dir = ARCH_DIRS[arch]
@@ -446,7 +533,7 @@ def test_11_cpp_exceptions(arch, tmp_path):
     )
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_12_seh_exceptions(arch, tmp_path):
     """C++ EXE compiled with /EHa (SEH-integrated): typed catch must fire and return 123."""
     win_dir = ARCH_DIRS[arch]
@@ -472,7 +559,7 @@ def test_12_seh_exceptions(arch, tmp_path):
     )
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_clr_rejection(arch, tmp_path):
     """peor must raise ValueError when DataDir[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR] is non-zero."""
     pe_path = ARCH_DIRS[arch] / "01_simple_calc.exe"
@@ -488,7 +575,7 @@ def test_clr_rejection(arch, tmp_path):
         dump_memory_layout(pe, tmp_path / "clr_rejected.bin")
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_stdout_output(arch, tmp_path):
     """`peor -o -` must write exactly the same bytes as dump_memory_layout to a file."""
     pe_path = ARCH_DIRS[arch] / "01_simple_calc.exe"
@@ -506,7 +593,7 @@ def test_stdout_output(arch, tmp_path):
         f"[{arch}] stdout bytes differ from file bytes"
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_info_mode(arch, tmp_path):
     """`peor --info` must print feature flags and stub sizes without writing a file."""
     pe_path = ARCH_DIRS[arch] / "11_cpp_exceptions.exe"
@@ -604,7 +691,7 @@ def test_packed_pe_features(tmp_path):
 # ── P2 tests ──────────────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_bound_imports(arch, tmp_path):
     """Shellcode from a PE with a non-zero DataDir[BOUND_IMPORT] must still execute correctly."""
     pe_path     = ARCH_DIRS[arch] / "04_crt_printf_rand.exe"
@@ -635,7 +722,7 @@ def test_bound_imports(arch, tmp_path):
         f"[{arch}] unexpected stdout: {stdout!r}"
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_13_tls_multi_callbacks(arch, tmp_path):
     """Five ordered TLS callbacks accumulate g = g*10 + i (i=1..5); main returns g == 12345."""
     win_dir     = ARCH_DIRS[arch]
@@ -657,7 +744,7 @@ def test_13_tls_multi_callbacks(arch, tmp_path):
     )
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_14_global_ctors(arch, tmp_path):
     """File-scope C++ object constructor runs before main; sets g_value=42, main returns it."""
     win_dir     = ARCH_DIRS[arch]
@@ -679,7 +766,7 @@ def test_14_global_ctors(arch, tmp_path):
     )
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_15_nested_exceptions(arch, tmp_path):
     """Nested try/rethrow: inner catch rethrows, outer catch must fire and return 55."""
     win_dir     = ARCH_DIRS[arch]
@@ -726,7 +813,7 @@ def test_large_pe_disp32_guard():
 # ── P2-14 ─────────────────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_16_delay_load(arch, tmp_path):
     """Delay-loaded GetTickCount must be resolved before the entry point; returns 1..250."""
     win_dir     = ARCH_DIRS[arch]
@@ -751,7 +838,7 @@ def test_16_delay_load(arch, tmp_path):
 # ── P3-17 ─────────────────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_custom_entry(arch, tmp_path):
     """--entry selects a named export (DllMain) instead of OEP; must return 42."""
     win_dir     = ARCH_DIRS[arch]
@@ -760,7 +847,8 @@ def test_custom_entry(arch, tmp_path):
     _skip_if_missing(loader_path, pe_path)
 
     pe = PE(str(pe_path))
-    export_name = "DllMain" if arch == "x64" else "_DllMain@12"
+    # Arm64 exports C symbols undecorated (same as x64); only x86 decorates.
+    export_name = "_DllMain@12" if arch == "x86" else "DllMain"
     override_ep_rva = _find_export_rva(pe, export_name)
 
     shellcode_path = tmp_path / f"custom_entry_{arch}.bin"
@@ -844,6 +932,61 @@ _LINUX_LOADER_CFLAGS = [
     "-ffixed-rbx", "-ffixed-r12", "-ffixed-r13", "-ffixed-r14", "-ffixed-r15",
 ]
 
+# AArch64 equivalent of _LINUX_LOADER_CFLAGS: the ARM64 Linux chain (imports_resolver+
+# relocations+ctors runners, asm/*_arm64*) uses x19-x28 as its base/symtab/strtab/hash
+# scratch registers and restores NONE of them (verified: no stp in any arm64 stub), which
+# is exactly the same callee-saved-violation class the x64 flags above paper over. Pin
+# every one so GCC avoids them in the loader's own code. x29 (FP) is deliberately NOT
+# pinned: the loader's prologue/epilogue save+restore their own FP copy, so a mid-call
+# clobber never surfaces; -ffixed-x29 would additionally fight GCC's frame-pointer
+# bookkeeping (aarch64 keeps frame pointers by default).
+_LINUX_LOADER_CFLAGS_ARM64 = [
+    "-O2",
+    "-ffixed-x19", "-ffixed-x20", "-ffixed-x21", "-ffixed-x22", "-ffixed-x23",
+    "-ffixed-x24", "-ffixed-x25", "-ffixed-x26", "-ffixed-x27", "-ffixed-x28",
+]
+
+
+def _ensure_linux_loader_arm64() -> "Path | None":
+    """Return path to the pre-built aarch64 Linux test_loader binary, building it if absent.
+
+    Toolchain selection mirrors this test suite's other Linux-host builds: compiles with
+    native gcc when the host is itself aarch64 (the ubuntu-24.04-arm CI runner), otherwise
+    cross-compiles with aarch64-linux-gnu-gcc — portably inside WSL on Windows hosts (same
+    escape hatch _ensure_linux_loader uses for the x64 loader), natively on an x86_64
+    Linux host that has the cross gcc installed. Returns None (caller fails loudly) when
+    no suitable toolchain is available.
+    """
+    loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux_arm64.pe"
+    if loader.exists():
+        return loader
+    src = TESTS_DIR / "test_loader_linux" / "main.c"
+    if platform.machine() in ("aarch64", "arm64"):
+        cmd = ["gcc", "-O2"] + _LINUX_LOADER_CFLAGS_ARM64 + ["-o", str(loader), str(src), "-ldl"]
+        r = subprocess.run(cmd, capture_output=True, timeout=30)
+        return loader if r.returncode == 0 and loader.exists() else None
+    if platform.system() == "Windows":
+        # WSL presence/absence is nothing to fail on here — build() callers treat
+        # None as "toolchain unavailable" (same contract as _ensure_linux_loader).
+        try:
+            cmd = ("aarch64-linux-gnu-gcc " + " ".join(_LINUX_LOADER_CFLAGS_ARM64)
+                   + f" -o {_win_path_to_wsl(loader)} {_win_path_to_wsl(src)}")
+            r = _wsl_bash_run(cmd, capture_output=True, timeout=60)
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return None
+        return loader if r.returncode == 0 and loader.exists() else None
+    # Native x86_64/other Linux host: cross gcc, no WSL involved. Missing cross gcc is
+    # the "toolchain unavailable" state (build_tests.py reports a FAIL row and linux
+    # CI's x86_64 jobs don't install this package — pytest there excludes arm64), not
+    # a crash: same FileNotFoundError contract as the Windows/WSL branch above.
+    try:
+        cmd = ["aarch64-linux-gnu-gcc", "-O2"] + _LINUX_LOADER_CFLAGS_ARM64 \
+            + ["-o", str(loader), str(src), "-ldl"]
+        r = subprocess.run(cmd, capture_output=True, timeout=60)
+    except FileNotFoundError:
+        return None
+    return loader if r.returncode == 0 and loader.exists() else None
+
 
 def _ensure_linux_loader(use_wsl: bool) -> "Path | None":
     """Return path to the pre-built test_loader_linux binary.
@@ -859,7 +1002,8 @@ def _ensure_linux_loader(use_wsl: bool) -> "Path | None":
         return None
     cmd = ("gcc " + " ".join(_LINUX_LOADER_CFLAGS)
            + f" -o {_win_path_to_wsl(loader)} {_win_path_to_wsl(src)}")
-    r = _wsl_bash_run(cmd, capture_output=True, timeout=30)
+    # 90s: back-to-back WSL round trips derate (see _compile_efi_pe_arm64).
+    r = _wsl_bash_run(cmd, capture_output=True, timeout=90)
     return loader if r.returncode == 0 and loader.exists() else None
 
 
@@ -1052,22 +1196,214 @@ def _build_linux_write_pe(tmp_path: Path, use_wsl: bool) -> "Path | None":
     return exe
 
 
-@pytest.mark.parametrize("arch", ["x64", "x86"])
+def _build_linux_write_pe_arm64(tmp_path: Path) -> "Path | None":
+    """Cross-compile tests/Linux/01_linux_write/main.c as an ARM64 PE with libc.so.6 imports.
+
+    Consumed via tests/build_tests.py (--target linux) and, as an on-demand fallback, by
+    test_01_linux_write's arm64 param when the prebuilt binary is missing. The dlsym
+    crash this helper's first draft worked around is fixed (see peor/_chain_builder.py's
+    ARM64 PE-base page-alignment patch from the linux-arm-pe-support plan, Task 1).
+
+    Real mingw-w64 has no aarch64-w64-mingw32 target (same limitation documented for the
+    EFI ARM tests), so this uses clang+lld (aarch64-w64-mingw32 target) and llvm-dlltool
+    instead of GCC mingw + GNU dlltool - same algorithm _build_linux_write_pe uses for x64,
+    different toolchain. Runs natively when the host has a clang with the target (ubuntu
+    runners, ARM dev boxes); on Windows hosts without it, the identical steps are rerun
+    inside WSL (_wsl_build_linux_arm64_libc_pe) no matter where the produced PE later runs.
+    Output goes to the stable tests/Linux_arm64/ directory.
+    """
+    stable = _LINUX_PREBUILD_ARM64 / "01_linux_write_arm64.pe"
+    if stable.exists():
+        return stable
+    _LINUX_PREBUILD_ARM64.mkdir(parents=True, exist_ok=True)
+
+    src = TESTS_DIR / "Linux" / "01_linux_write" / "main.c"
+    if not src.exists():
+        return None
+
+    def_file = tmp_path / "libc.so.6_arm64.def"
+    imp_lib  = tmp_path / "liblibc_import_arm64.a"
+    obj_file = tmp_path / "01_linux_write_arm64.o"
+    def_file.write_text(_LIBC_DEF_CONTENT, encoding="ascii")
+
+    clang = _find_clang_arm64()
+    if not clang:
+        if platform.system() != "Windows":
+            return None
+        # Windows host without native aarch64-w64-mingw32 clang (no clang on PATH here):
+        # run the identical steps through WSL's clang + llvm-dlltool.
+        return _wsl_build_linux_arm64_libc_pe(def_file, imp_lib, obj_file, src, stable)
+    llvm_dlltool = str(Path(clang).parent / "llvm-dlltool.exe")
+    if not Path(llvm_dlltool).exists():
+        llvm_dlltool = shutil.which("llvm-dlltool")
+    if not llvm_dlltool:
+        return None
+
+    dt = subprocess.run(
+        [llvm_dlltool, "-m", "arm64", "-D", _LIBC_DLL_NAME, "-d", str(def_file), "-l", str(imp_lib)],
+        capture_output=True, timeout=30,
+    )
+    if dt.returncode != 0:
+        return None
+
+    cc1 = subprocess.run(
+        [clang, "-target", "aarch64-w64-mingw32", "-nostdlib", "-nodefaultlibs", "-nostartfiles",
+         "-fno-unwind-tables", "-fno-asynchronous-unwind-tables",
+         "-c", str(src), "-o", str(obj_file)],
+        capture_output=True, timeout=30,
+    )
+    if cc1.returncode != 0:
+        return None
+
+    exe = stable
+    cc2 = subprocess.run(
+        [clang, "-target", "aarch64-w64-mingw32", "-nostdlib", "-nodefaultlibs", "-nostartfiles",
+         "-fno-unwind-tables", "-fno-asynchronous-unwind-tables", "-fuse-ld=lld",
+         "-Wl,-e,main", "-Wl,--subsystem,posix",
+         str(obj_file), str(imp_lib), "-o", str(exe)],
+        capture_output=True, timeout=30,
+    )
+    if cc2.returncode != 0 or not exe.exists():
+        return None
+    return exe
+
+
+def _find_qemu_user_arm32_wsl() -> "str | None":
+    """Return the WSL-side qemu-arm user-mode-emulation binary name, or None.
+
+    Mirrors _find_qemu_user_arm64_wsl for the 32-bit case. qemu-user (not
+    qemu-system-*) emulates a single ARM32 ELF binary directly on an x86_64
+    host - no VM boot, no firmware.
+    """
+    if platform.system() != "Windows":
+        return None
+    try:
+        r = _wsl_bash_run(
+            "which qemu-arm-static 2>/dev/null || which qemu-arm 2>/dev/null",
+            capture_output=True, timeout=10,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    if r.returncode != 0:
+        return None
+    path = r.stdout.decode(errors="replace").strip()
+    return path or None
+
+
+def _build_linux_write_pe_arm32(tmp_path: Path) -> "Path | None":
+    """Cross-compile tests/Linux/01_linux_write/main.c as an ARM32 PE with libc.so.6 imports.
+
+    NOT YET CALLED by any test - parked pending local execution verification, same
+    reasoning Task 1 applied to _build_linux_write_pe_arm64. See
+    .superpowers/sdd/2026-10-27-linux-arm-pe-support/progress.md (Task 2 entry) for why:
+    building this PE itself only needs the clang+lld armv7-w64-mingw32 toolchain already
+    used by the EFI ARM32 tests (confirmed present, no sudo needed), but *running* it needs
+    a real ARM32 Linux ELF test_loader_linux_arm32 binary, which needs either a
+    arm-linux-gnueabihf glibc cross-toolchain or the armhf runtime libs - both gated behind
+    an interactive `sudo apt-get` password this session could not supply non-interactively.
+
+    Real mingw-w64 has no armv7-w64-mingw32 *gcc* target (same limitation already
+    documented for the ARM64/EFI ARM tests), so this uses clang+lld and llvm-dlltool
+    instead of GCC mingw + GNU dlltool - same algorithm _build_linux_write_pe_arm64 uses.
+    Deliberately does NOT call _fix_arm32_pe_machine_type: that patches Machine from
+    ARMNT (0x01C4) to ARMTHUMB_MIXED (0x01C2) only because EDK2's ARM32 EFI firmware
+    requires it: peor's _select_chain (peor/_chain_builder.py) accepts either machine
+    value for the Linux platform, so the natural lld output (ARMNT) is used as-is.
+    """
+    stable = _LINUX_PREBUILD_ARM32 / "01_linux_write_arm32.pe"
+    if stable.exists():
+        return stable
+    _LINUX_PREBUILD_ARM32.mkdir(parents=True, exist_ok=True)
+
+    src = TESTS_DIR / "Linux" / "01_linux_write" / "main.c"
+    if not src.exists():
+        return None
+
+    clang = _find_clang_arm32()
+    if not clang:
+        return None
+    llvm_dlltool = str(Path(clang).parent / "llvm-dlltool.exe")
+    if not Path(llvm_dlltool).exists():
+        llvm_dlltool = shutil.which("llvm-dlltool")
+    if not llvm_dlltool:
+        return None
+
+    def_file = tmp_path / "libc.so.6_arm32.def"
+    imp_lib  = tmp_path / "liblibc_import_arm32.a"
+    obj_file = tmp_path / "01_linux_write_arm32.o"
+    def_file.write_text(_LIBC_DEF_CONTENT, encoding="ascii")
+
+    dt = subprocess.run(
+        [llvm_dlltool, "-m", "arm", "-D", _LIBC_DLL_NAME, "-d", str(def_file), "-l", str(imp_lib)],
+        capture_output=True, timeout=30,
+    )
+    if dt.returncode != 0:
+        return None
+
+    _ARM32_CFLAGS = [
+        "-target", "armv7-w64-mingw32", "-mthumb",
+        "-nostdlib", "-nodefaultlibs", "-nostartfiles",
+        "-fno-unwind-tables", "-fno-asynchronous-unwind-tables",
+    ]
+
+    cc1 = subprocess.run(
+        [clang] + _ARM32_CFLAGS + ["-c", str(src), "-o", str(obj_file)],
+        capture_output=True, timeout=30,
+    )
+    if cc1.returncode != 0:
+        return None
+
+    exe = stable
+    cc2 = subprocess.run(
+        [clang] + _ARM32_CFLAGS + ["-fuse-ld=lld",
+         "-Wl,-e,main", "-Wl,--subsystem,posix",
+         str(obj_file), str(imp_lib), "-o", str(exe)],
+        capture_output=True, timeout=30,
+    )
+    if cc2.returncode != 0 or not exe.exists():
+        return None
+    return exe
+
+
+@pytest.mark.parametrize("arch", ["x64", "x86", "arm64"])
 def test_01_linux_write(arch, tmp_path):
     """Linux import resolver: PE imports write() from libc.so.6; shellcode writes PEOR to stdout.
 
     On Windows, both compilation and execution run inside WSL.
     The PE is compiled with --subsystem posix (subsystem 7) so peor auto-selects the Linux chain;
-    PE bitness (PE32+ vs PE32) determines whether the x64 or x86 resolver is used.
-    Tested for both x64 (x86_64-w64-mingw32-gcc) and x86 (i686-w64-mingw32-gcc).
+    PE bitness (PE32+ vs PE32) determines whether the x64 or x86 resolver is used; PE machine
+    (AA64) selects the arm64 resolver.
+    Tested for x64 (x86_64-w64-mingw32-gcc), x86 (i686-w64-mingw32-gcc), and arm64
+    (clang+lld aarch64-w64-mingw32, executed under qemu-aarch64 user-mode emulation on
+    x86_64 hosts — see _find_qemu_user_arm64_wsl — or natively when the host itself is
+    aarch64, as on the ubuntu-24.04-arm CI runner, where no emulation is involved).
     """
     use_wsl = platform.system() == "Windows"
+    qemu_arm64 = None
     if arch == "x64":
         exe = _LINUX_PREBUILD_X64 / "01_linux_write_x64.pe"
         loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux.pe"
-    else:
+    elif arch == "x86":
         exe = _LINUX_PREBUILD_X86 / "01_linux_write_x86.pe"
         loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux_32.pe"
+    else:
+        exe = _LINUX_PREBUILD_ARM64 / "01_linux_write_arm64.pe"
+        loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux_arm64.pe"
+        host_is_arm64 = platform.machine() in ("aarch64", "arm64")
+        if host_is_arm64:
+            # Native aarch64 host (ubuntu-24.04-arm CI / ARM Linux dev boxes): the
+            # loader and the PE are both aarch64 code — run the loader directly.
+            qemu_arm64 = None
+        else:
+            qemu_arm64 = (_find_qemu_user_arm64_wsl() if use_wsl
+                          else (shutil.which("qemu-aarch64-static") or shutil.which("qemu-aarch64")))
+            assert qemu_arm64, \
+                "qemu-aarch64 user-mode emulator not found (needed to run the arm64 loader on this host)"
+        if not Path(loader).exists():
+            # Fresh-clone fallback so `pytest tests/pytest` alone still passes: build
+            # the loader on demand (native gcc on aarch64 hosts, WSL cross gcc on
+            # Windows, aarch64-linux-gnu-gcc cross on x86_64 Linux).
+            _ensure_linux_loader_arm64()
     assert exe.exists(), f"prebuilt Linux test PE not found: {exe} — run tests/build_tests.sh first"
     assert loader.exists(), f"Linux test_loader not found: {loader} — run tests/build_tests.sh first"
 
@@ -1079,11 +1415,11 @@ def test_01_linux_write(arch, tmp_path):
         # /mnt/c/ paths to C:/Program Files/Git/mnt/c/ before they reach WSL.
         sc_wsl = _win_path_to_wsl(sc)
         loader_wsl = _win_path_to_wsl(loader)
-        result = subprocess.run(
-            ["wsl", "--", loader_wsl, sc_wsl], capture_output=True, timeout=15
-        )
+        cmd = ["wsl", "--"] + ([qemu_arm64, loader_wsl, sc_wsl] if qemu_arm64 else [loader_wsl, sc_wsl])
+        result = subprocess.run(cmd, capture_output=True, timeout=15)
     else:
-        result = subprocess.run([str(loader), str(sc)], capture_output=True, timeout=15)
+        cmd = ([qemu_arm64, str(loader), str(sc)] if qemu_arm64 else [str(loader), str(sc)])
+        result = subprocess.run(cmd, capture_output=True, timeout=15)
 
     assert result.returncode == 0, (
         f"[linux_write {arch}] loader crashed with code {result.returncode}\n"
@@ -1098,6 +1434,28 @@ def test_01_linux_write(arch, tmp_path):
 _LINUX_CPP_EXCEPTIONS_SRC = TESTS_DIR / "Linux" / "02_linux_cpp_exceptions" / "main.cpp"
 
 
+# ARM64/ARM32 are deliberately NOT ported for this test (Task 3 investigated, found
+# genuinely blocked - not a "didn't try" skip). x64/x86 build via real mingw g++-posix,
+# whose statically-linked libgcc_eh.a/libsupc++.a provide the whole C++ EH runtime
+# (__cxa_throw/__cxa_begin_catch/__cxa_end_catch/__gxx_personality_seh0, typeinfo vtables).
+# No such library exists for aarch64-w64-mingw32 or armv7-w64-mingw32 under clang+lld (no
+# real mingw-w64 GCC port targets either triple - same root cause already documented for
+# the test PE builds elsewhere in this file). Confirmed empirically: a trivial
+# throw/catch compiled with `clang --target=aarch64-w64-mingw32 -fexceptions -nostdlib
+# -nodefaultlibs -nostartfiles` links clean, but ld.lld then fails with undefined symbols
+# __cxa_allocate_exception, __cxa_throw, __cxa_begin_catch, __cxa_end_catch,
+# __gxx_personality_seh0, and "vtable for __cxxabiv1::__class_type_info" - the entire C++ EH
+# ABI, not just one missing piece. tests/cpp_eh_support/sjlj_arm32.c (the EFI ARM32 C++
+# exceptions precedent) shows what hand-writing this runtime from scratch costs: a
+# per-function, hand-reverse-engineered register/stack-layout hack tied to one specific
+# compiled function's exact codegen, not a reusable library - and even that approach only
+# applies to ARM32 (-fsjlj-exceptions is not a supported exception model for AArch64 in
+# clang, so ARM64 would need a different, real DWARF/SEH-unwind-table-based runtime, which
+# is substantially more work again). This matches this codebase's own existing precedent:
+# EFI's C++ exceptions test (test_04_efi_cpp_exceptions) was never even attempted for arm64,
+# only arm32 got the bespoke SJLJ treatment. Building a general-purpose C++ EH runtime for
+# either cross target is its own dedicated research task, out of scope for a routine test
+# port - see .superpowers/sdd/2026-10-27-linux-arm-pe-support/progress.md's Task 3 entry.
 @pytest.mark.parametrize("arch", ["x64", "x86"])
 def test_02_linux_cpp_exceptions(arch, tmp_path):
     """Linux C++ shellcode: throws and catches a custom type; main returns 42.
@@ -1105,7 +1463,8 @@ def test_02_linux_cpp_exceptions(arch, tmp_path):
     The PE is compiled with posix-threading g++ (DWARF-2 or SJLJ) so exceptions
     are self-contained.  peor's ctors runner initialises the GCC EH runtime before
     main runs.  The Linux loader prints the return value; test checks stdout == '42'.
-    Tested for x64 and x86.
+    Tested for x64 and x86 only - see the module comment directly above this test for why
+    ARM64/ARM32 are parked (genuinely blocked, not skipped).
     """
     use_wsl = platform.system() == "Windows"
     prebuild_dir = _LINUX_PREBUILD_X64 if arch == "x64" else _LINUX_PREBUILD_X86
@@ -1252,6 +1611,46 @@ def _find_clang_arm64() -> "str | None":
     return None
 
 
+def _find_lld_link_arm64() -> "str | None":
+    """Return path to a plain lld-link COFF linker, or None.
+
+    Plain lld-link (not clang's mingw-emulation driver) is what the arm64
+    05 linux PE must be linked with: the mingw-emulation driver folds .ctors
+    into other sections, leaving no ctors section for _detect_pe_features (see
+    _build_linux_global_ctor_pe_arm64). Checks PATH first, then LLVM's
+    /usr/lib/llvm-*/bin install locations (how Debian/Ubuntu distros ship it;
+    the ubuntu-24.04-arm CI runner has no bare `lld-link` on PATH).
+    """
+    path = shutil.which("lld-link")
+    if path:
+        return path
+    for candidate in sorted(glob.glob("/usr/lib/llvm-*/bin/lld-link")):
+        return candidate
+    return None
+
+
+def _find_qemu_user_arm64_wsl() -> "str | None":
+    """Return the WSL-side qemu-aarch64 user-mode-emulation binary name, or None.
+
+    qemu-user (not qemu-system-*) emulates a single ARM64 ELF binary directly on an
+    x86_64 host - no VM boot, no firmware, far simpler than the full-system QEMU path
+    the EFI-ARM tests use. Only usable via WSL since this binary doesn't exist on Windows.
+    """
+    if platform.system() != "Windows":
+        return None
+    try:
+        r = _wsl_bash_run(
+            "which qemu-aarch64-static 2>/dev/null || which qemu-aarch64 2>/dev/null",
+            capture_output=True, timeout=10,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    if r.returncode != 0:
+        return None
+    path = r.stdout.decode(errors="replace").strip()
+    return path or None
+
+
 def _find_clang_arm64_wsl() -> "tuple[str | None, bool]":
     """Return (clang_path_or_cmd, use_wsl) for aarch64-w64-mingw32 clang, or (None, None)."""
     native = _find_clang_arm64()
@@ -1269,6 +1668,120 @@ def _find_clang_arm64_wsl() -> "tuple[str | None, bool]":
         except (subprocess.TimeoutExpired, FileNotFoundError):
             pass
     return None, None
+
+
+def _find_llvm_dlltool_wsl() -> "str | None":
+    """Return the WSL-side llvm-dlltool path, or None (non-Windows host / WSL / tool absent)."""
+    if platform.system() != "Windows":
+        return None
+    try:
+        r = _wsl_bash_run(
+            "command -v llvm-dlltool || ls /usr/lib/llvm-*/bin/llvm-dlltool 2>/dev/null | head -1",
+            capture_output=True, timeout=10,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    if r.returncode != 0:
+        return None
+    lines = [ln.strip() for ln in r.stdout.decode(errors="replace").splitlines() if ln.strip()]
+    return lines[-1] if lines else None
+
+
+def _wsl_build_linux_arm64_libc_pe(def_file: Path, imp_lib: Path,
+                                    obj_file: Path, src: Path, exe: Path) -> "Path | None":
+    """The dlltool+clang+lld 3-step build of a libc-importing arm64 linux PE, run inside WSL.
+
+    Windows-host fallback for the native builders (_build_linux_write_pe_arm64 et al.) when
+    no native clang carries the aarch64-w64-mingw32 target on the Windows host: the identical
+    steps run through WSL's clang (every path argument passed as a /mnt path; the .def file is
+    still written host-side and read WSL-side via /mnt, so no quoting gymnastics needed).
+    Returns exe on success, None on any step failure (timeout / missing WSL included) —
+    callers already treat None as 'not built'.
+    """
+    if platform.system() != "Windows":
+        return None
+    dlltool = _find_llvm_dlltool_wsl()
+    if not dlltool:
+        return None
+    wsrc, wdef = _win_path_to_wsl(src), _win_path_to_wsl(def_file)
+    wimp, wobj, wexe = _win_path_to_wsl(imp_lib), _win_path_to_wsl(obj_file), _win_path_to_wsl(exe)
+    # exec prefix: _wsl_bash_run routes through Git Bash on Windows hosts, whose
+    # MSYS path-mangles a command string whose first token is a POSIX path
+    # (/usr/lib/llvm-*/bin/llvm-dlltool -> C:/Program Files/Git/usr/...); starting
+    # the string with a bare word keeps the heuristic away.
+    steps = [
+        f"exec {dlltool} -m arm64 -D {_LIBC_DLL_NAME} -d {wdef} -l {wimp}",
+        f"exec clang -target aarch64-w64-mingw32 -nostdlib -nodefaultlibs -nostartfiles"
+        f" -fno-unwind-tables -fno-asynchronous-unwind-tables"
+        f" -c {wsrc} -o {wobj}",
+        f"exec clang -target aarch64-w64-mingw32 -nostdlib -nodefaultlibs -nostartfiles"
+        f" -fno-unwind-tables -fno-asynchronous-unwind-tables -fuse-ld=lld"
+        f" -Wl,-e,main -Wl,--subsystem,posix {wobj} {wimp} -o {wexe}",
+    ]
+    try:
+        for cmd in steps:
+            r = _wsl_bash_run(cmd, capture_output=True, timeout=90)
+            if r.returncode != 0:
+                return None
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    return exe if exe.exists() else None
+
+
+def _wsl_build_linux_arm64_global_ctor_pe(obj_file: Path, src: Path, exe: Path) -> "Path | None":
+    """WSL twin of _build_linux_global_ctor_pe_arm64's native steps (no libc imports,
+    so no dlltool step; same -fno-exceptions -fno-rtti flags, /mnt paths): compile
+    with clang, LINK with plain lld-link (see _find_lld_link_arm64 for why the
+    mingw-emulation driver must not be used), /mnt paths throughout.
+    Returns exe on success, None on any step failure."""
+    if platform.system() != "Windows":
+        return None
+    flags = ("-target aarch64-w64-mingw32 -nostdlib -nodefaultlibs -nostartfiles"
+             " -fno-unwind-tables -fno-asynchronous-unwind-tables"
+             " -fno-exceptions -fno-rtti")
+    wsrc, wobj, wexe = _win_path_to_wsl(src), _win_path_to_wsl(obj_file), _win_path_to_wsl(exe)
+    # exec prefix: see _wsl_build_linux_arm64_libc_pe (MSYS path-mangling guard).
+    r = _wsl_bash_run(
+        "exec clang " + flags + " -c " + wsrc + " -o " + wobj,
+        capture_output=True, timeout=90,
+    )
+    if r.returncode != 0:
+        return None
+    lld_link = _find_wsl_lld_link()
+    if not lld_link:
+        return None
+    try:
+        r = _wsl_bash_run(
+            f"exec {lld_link} /MACHINE:ARM64 /SUBSYSTEM:POSIX /ENTRY:main"
+            f" {wobj} -out:{wexe}",
+            capture_output=True, timeout=90,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    return exe if (r.returncode == 0 and exe.exists()) else None
+
+
+def _find_wsl_lld_link() -> "str | None":
+    """Return the WSL-side plain lld-link path, or None (non-Windows host / absent tool).
+
+    Same rationale as _find_lld_link_arm64's no-mingw-driver rule: the arm64 05
+    linux PE must be linked by plain lld-link so .ctors survives as a section.
+    Probe starts with a bare word (command), not a POSIX path, so the MSYS
+    path-mangling guard doesn't apply.
+    """
+    if platform.system() != "Windows":
+        return None
+    try:
+        r = _wsl_bash_run(
+            "command -v lld-link || ls /usr/lib/llvm-*/bin/lld-link 2>/dev/null | head -1",
+            capture_output=True, timeout=10,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    if r.returncode != 0:
+        return None
+    lines = [ln.strip() for ln in r.stdout.decode(errors="replace").splitlines() if ln.strip()]
+    return lines[-1] if lines else None
 
 
 def _compile_efi_pe_arm64(src: Path, out: Path, extra_includes: "Path | None",
@@ -1290,7 +1803,10 @@ def _compile_efi_pe_arm64(src: Path, out: Path, extra_includes: "Path | None",
         cmd = (f"clang {flags} {inc_flag}"
                f" -Wl,--entry={entry_fn} -Wl,--subsystem=efi_application"
                f" -o {_win_path_to_wsl(out)} {_win_path_to_wsl(src)}")
-        return _wsl_bash_run(cmd, capture_output=True, timeout=30)
+        # 90s, not 30: a WSL round trip derates when several compiles run back to back
+        # (2026-10-30: the 4th in a row blew a 30s cap and crashed build_tests outright)
+        # — native Windows paths below stay at 30, only the WSL one is this lenient.
+        return _wsl_bash_run(cmd, capture_output=True, timeout=90)
     return subprocess.run(
         [clang] + _CLANG_CFLAGS_EFI_ARM64 + extra_defines
         + include_flag
@@ -1371,7 +1887,8 @@ def _compile_efi_pe_arm32(src: Path, out: Path, extra_includes: "Path | None",
         cmd = (f"clang {flags} {inc_flag}"
                f" -Wl,--entry={entry_fn} -Wl,--subsystem=efi_application"
                f" -o {_win_path_to_wsl(out)} {_win_path_to_wsl(src)} {extra_srcs_str}")
-        r = _wsl_bash_run(cmd, capture_output=True, timeout=30)
+        # 90s: same back-to-back WSL round-trip derating as _compile_efi_pe_arm64.
+        r = _wsl_bash_run(cmd, capture_output=True, timeout=90)
     else:
         r = subprocess.run(
             [clang] + _CLANG_CFLAGS_EFI_ARM32 + extra_defines
@@ -1499,7 +2016,9 @@ def _compile_efi_pe(gcc_src: Path, out: Path, extra_includes: "Path | None",
         cmd = (f"{_gcc} {flags} {inc} -Wl,-e,{entry_sym}"
                f" -Wl,--subsystem,10"
                f" -o {_win_path_to_wsl(out)} {_win_path_to_wsl(gcc_src)}")
-        return _wsl_bash_run(cmd, capture_output=True, timeout=30)
+        # 90s: back-to-back WSL round trips derate (see _compile_efi_pe_arm64); a
+        # blown cap here would crash or FAIL a fallback retry for no good reason.
+        return _wsl_bash_run(cmd, capture_output=True, timeout=90)
     include_flag = [f"-I{extra_includes}"] if extra_includes else []
     return subprocess.run(
         [_gcc] + _MINGW_CFLAGS_EFI
@@ -1613,7 +2132,13 @@ def _build_and_run_efi(tmp_path: Path, efi_src: Path, expected_stdout_substr: st
     if arch == "arm32":
         qemu, ovmf_code, ovmf_vars = _find_qemu_ovmf("arm32")
         assert qemu is not None, "qemu-system-arm not found; install qemu-system-arm"
-        assert ovmf_code is not None, "AAVMF32 firmware not found; install qemu-efi-arm"
+        if ovmf_code is None:
+            # Ubuntu 26.04 dropped qemu-efi-arm, so no AAVMF32 firmware exists on
+            # its image: a host-capability skip (see PLAN.md), not a test problem.
+            pytest.skip(
+                "AAVMF32 firmware not found (Ubuntu 26.04 dropped qemu-efi-arm); "
+                "ARM32 EFI execution requires an image that ships AAVMF32"
+            )
 
         efi_pe = _EFI_PREBUILT_ARM32 / (efi_src.parent.name + ".efi")
         assert efi_pe.exists(), (
@@ -1675,8 +2200,15 @@ def _build_and_run_efi(tmp_path: Path, efi_src: Path, expected_stdout_substr: st
 
     qemu, ovmf_code, ovmf_vars = _find_qemu_ovmf(arch)
     assert qemu is not None, qemu_fail_msg
-    assert ovmf_code is not None, f"OVMF firmware not found for arch={arch}; install ovmf" + (
-        "-ia32" if arch == "x86" else "")
+    if ovmf_code is None:
+        if arch == "x86":
+            # Ubuntu 26.04 dropped ovmf-ia32, so no IA-32 OVMF firmware exists on
+            # its image: a host-capability skip (see PLAN.md), not a test problem.
+            pytest.skip(
+                "OVMF32 firmware not found (Ubuntu 26.04 dropped ovmf-ia32); "
+                "IA-32 EFI execution requires an image that ships OVMF32"
+            )
+        assert ovmf_code is not None, f"OVMF firmware not found for arch={arch}; install ovmf"
 
     efi_pe = prebuilt_dir / (efi_src.parent.name + ".efi")
     assert efi_pe.exists(), (
@@ -1764,7 +2296,13 @@ def test_04_efi_cpp_exceptions(arch, tmp_path):
     if arch == "arm32":
         qemu, ovmf_code, ovmf_vars = _find_qemu_ovmf("arm32")
         assert qemu is not None, "qemu-system-arm not found; install qemu-system-arm"
-        assert ovmf_code is not None, "AAVMF32 firmware not found; install qemu-efi-arm"
+        if ovmf_code is None:
+            # Ubuntu 26.04 dropped qemu-efi-arm, so no AAVMF32 firmware exists on
+            # its image: a host-capability skip (see PLAN.md), not a test problem.
+            pytest.skip(
+                "AAVMF32 firmware not found (Ubuntu 26.04 dropped qemu-efi-arm); "
+                "ARM32 EFI execution requires an image that ships AAVMF32"
+            )
 
         efi_pe = _EFI_PREBUILT_ARM32 / "04_cpp_exceptions.efi"
         assert efi_pe.exists(), (
@@ -1818,7 +2356,15 @@ def test_04_efi_cpp_exceptions(arch, tmp_path):
 
     qemu, ovmf_code, ovmf_vars = _find_qemu_ovmf(arch)
     assert qemu is not None, f"qemu not found for arch={arch}"
-    assert ovmf_code is not None, f"OVMF firmware not found for arch={arch}"
+    if ovmf_code is None:
+        if arch == "x86":
+            # Ubuntu 26.04 dropped ovmf-ia32, so no IA-32 OVMF firmware exists on
+            # its image: a host-capability skip (see PLAN.md), not a test problem.
+            pytest.skip(
+                "OVMF32 firmware not found (Ubuntu 26.04 dropped ovmf-ia32); "
+                "IA-32 EFI execution requires an image that ships OVMF32"
+            )
+        assert ovmf_code is not None, f"OVMF firmware not found for arch={arch}"
 
     efi_pe = prebuilt_dir / "04_cpp_exceptions.efi"
     assert efi_pe.exists(), (
@@ -2373,18 +2919,174 @@ def _build_linux_crt_pe(tmp_path: Path, use_wsl: bool, *, arch: str = "x64") -> 
     return exe
 
 
-@pytest.mark.parametrize("arch", ["x64", "x86"])
+def _build_linux_crt_pe_arm64(tmp_path: Path) -> "Path | None":
+    """Cross-compile tests/Linux/03_linux_with_crt/main.c as an ARM64 PE with libc.so.6 imports.
+
+    Same clang+lld aarch64-w64-mingw32 + llvm-dlltool toolchain as _build_linux_write_pe_arm64
+    (no real aarch64-w64-mingw32-gcc exists — see that function's docstring). main.c's
+    SYSV_ABI attribute (applied to the libc imports under _WIN64) exists only to correct the
+    x64 Windows-vs-SysV ABI mismatch; on AArch64 it is a harmless no-op (clang emits an
+    "ignored attribute" warning, confirmed empirically) because Windows ARM64 and Linux ARM64
+    share the same AAPCS64 calling convention — no correction is needed or possible there.
+    """
+    stable = _LINUX_PREBUILD_ARM64 / "03_linux_with_crt_arm64.pe"
+    if stable.exists():
+        return stable
+    _LINUX_PREBUILD_ARM64.mkdir(parents=True, exist_ok=True)
+
+    src = TESTS_DIR / "Linux" / "03_linux_with_crt" / "main.c"
+    if not src.exists():
+        return None
+
+    def_file = tmp_path / "libc_crt_arm64.def"
+    imp_lib  = tmp_path / "liblibc_crt_arm64.a"
+    obj_file = tmp_path / "03_linux_with_crt_arm64.o"
+    def_file.write_text(_LIBC_DEF_CONTENT_CRT, encoding="ascii")
+
+    clang = _find_clang_arm64()
+    if not clang:
+        if platform.system() != "Windows":
+            return None
+        # Windows host without native aarch64-w64-mingw32 clang: identical
+        # steps through WSL's clang + llvm-dlltool.
+        return _wsl_build_linux_arm64_libc_pe(def_file, imp_lib, obj_file, src, stable)
+    llvm_dlltool = str(Path(clang).parent / "llvm-dlltool.exe")
+    if not Path(llvm_dlltool).exists():
+        llvm_dlltool = shutil.which("llvm-dlltool")
+    if not llvm_dlltool:
+        return None
+
+    dt = subprocess.run(
+        [llvm_dlltool, "-m", "arm64", "-D", _LIBC_DLL_NAME, "-d", str(def_file), "-l", str(imp_lib)],
+        capture_output=True, timeout=30,
+    )
+    if dt.returncode != 0:
+        return None
+
+    cc1 = subprocess.run(
+        [clang, "-target", "aarch64-w64-mingw32", "-nostdlib", "-nodefaultlibs", "-nostartfiles",
+         "-fno-unwind-tables", "-fno-asynchronous-unwind-tables",
+         "-c", str(src), "-o", str(obj_file)],
+        capture_output=True, timeout=30,
+    )
+    if cc1.returncode != 0:
+        return None
+
+    exe = stable
+    cc2 = subprocess.run(
+        [clang, "-target", "aarch64-w64-mingw32", "-nostdlib", "-nodefaultlibs", "-nostartfiles",
+         "-fno-unwind-tables", "-fno-asynchronous-unwind-tables", "-fuse-ld=lld",
+         "-Wl,-e,main", "-Wl,--subsystem,posix",
+         str(obj_file), str(imp_lib), "-o", str(exe)],
+        capture_output=True, timeout=30,
+    )
+    if cc2.returncode != 0 or not exe.exists():
+        return None
+    return exe
+
+
+def _build_linux_crt_pe_arm32(tmp_path: Path) -> "Path | None":
+    """Cross-compile tests/Linux/03_linux_with_crt/main.c as an ARM32 PE with libc.so.6 imports.
+
+    NOT YET CALLED by any test - parked for the same reason as _build_linux_write_pe_arm32
+    (see its docstring and .superpowers/sdd/2026-10-27-linux-arm-pe-support.md, Task 2 entry):
+    building this PE only needs the clang+lld armv7-w64-mingw32 toolchain (confirmed present),
+    but *running* it needs a real ARM32 Linux ELF test_loader_linux_arm32, which needs an
+    arm-linux-gnueabihf glibc cross-toolchain or the armhf runtime libs — still unavailable in
+    this session's WSL environment as of Task 3 (re-confirmed: no arm-linux-gnueabihf-gcc,
+    dpkg --print-foreign-architectures has no armhf, sudo is non-interactive-only).
+    """
+    stable = _LINUX_PREBUILD_ARM32 / "03_linux_with_crt_arm32.pe"
+    if stable.exists():
+        return stable
+    _LINUX_PREBUILD_ARM32.mkdir(parents=True, exist_ok=True)
+
+    src = TESTS_DIR / "Linux" / "03_linux_with_crt" / "main.c"
+    if not src.exists():
+        return None
+
+    clang = _find_clang_arm32()
+    if not clang:
+        return None
+    llvm_dlltool = str(Path(clang).parent / "llvm-dlltool.exe")
+    if not Path(llvm_dlltool).exists():
+        llvm_dlltool = shutil.which("llvm-dlltool")
+    if not llvm_dlltool:
+        return None
+
+    def_file = tmp_path / "libc_crt_arm32.def"
+    imp_lib  = tmp_path / "liblibc_crt_arm32.a"
+    obj_file = tmp_path / "03_linux_with_crt_arm32.o"
+    def_file.write_text(_LIBC_DEF_CONTENT_CRT, encoding="ascii")
+
+    dt = subprocess.run(
+        [llvm_dlltool, "-m", "arm", "-D", _LIBC_DLL_NAME, "-d", str(def_file), "-l", str(imp_lib)],
+        capture_output=True, timeout=30,
+    )
+    if dt.returncode != 0:
+        return None
+
+    _ARM32_CFLAGS = [
+        "-target", "armv7-w64-mingw32", "-mthumb",
+        "-nostdlib", "-nodefaultlibs", "-nostartfiles",
+        "-fno-unwind-tables", "-fno-asynchronous-unwind-tables",
+    ]
+
+    cc1 = subprocess.run(
+        [clang] + _ARM32_CFLAGS + ["-c", str(src), "-o", str(obj_file)],
+        capture_output=True, timeout=30,
+    )
+    if cc1.returncode != 0:
+        return None
+
+    exe = stable
+    cc2 = subprocess.run(
+        [clang] + _ARM32_CFLAGS + ["-fuse-ld=lld",
+         "-Wl,-e,main", "-Wl,--subsystem,posix",
+         str(obj_file), str(imp_lib), "-o", str(exe)],
+        capture_output=True, timeout=30,
+    )
+    if cc2.returncode != 0 or not exe.exists():
+        return None
+    return exe
+
+
+@pytest.mark.parametrize("arch", ["x64", "x86", "arm64"])
 def test_03_linux_with_crt(arch, tmp_path):
     """Linux C++ shellcode with CRT imports: uses strlen/malloc/free from libc.so.6.
 
     Compiles main.c linking against a libc.so.6 import lib; the Linux import
     resolver dlopen()s libc.so.6 at runtime.  Returns 73 on success.
-    Tested for both x64 and x86.
+    Tested for x64, x86 and arm64 (clang+lld aarch64-w64-mingw32, executed under qemu-aarch64
+    user-mode emulation on x86_64 hosts — see test_01_linux_write's docstring for the toolchain
+    rationale — or natively when the host itself is aarch64).
+    ARM32 is parked, not wired: see _build_linux_crt_pe_arm32's docstring.
     """
     use_wsl = platform.system() == "Windows"
-    exe = (_LINUX_PREBUILD_X64 if arch == "x64" else _LINUX_PREBUILD_X86) / f"03_linux_with_crt_{arch}.pe"
-    loader = (TESTS_DIR / "test_loader_linux"
-              / ("test_loader_linux.pe" if arch == "x64" else "test_loader_linux_32.pe"))
+    qemu_arm64 = None
+    if arch == "x64":
+        exe = _LINUX_PREBUILD_X64 / "03_linux_with_crt_x64.pe"
+        loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux.pe"
+    elif arch == "x86":
+        exe = _LINUX_PREBUILD_X86 / "03_linux_with_crt_x86.pe"
+        loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux_32.pe"
+    else:
+        exe = _LINUX_PREBUILD_ARM64 / "03_linux_with_crt_arm64.pe"
+        loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux_arm64.pe"
+        host_is_arm64 = platform.machine() in ("aarch64", "arm64")
+        if host_is_arm64:
+            # Native aarch64 host (ubuntu-24.04-arm CI / ARM Linux dev boxes): the
+            # loader and the PE are both aarch64 code — run the loader directly.
+            qemu_arm64 = None
+        else:
+            qemu_arm64 = (_find_qemu_user_arm64_wsl() if use_wsl
+                          else (shutil.which("qemu-aarch64-static") or shutil.which("qemu-aarch64")))
+            assert qemu_arm64, \
+                "qemu-aarch64 user-mode emulator not found (needed to run the arm64 loader on this host)"
+        if not Path(loader).exists():
+            # Fresh-clone fallback so `pytest tests/pytest` alone still passes (same
+            # rationale as test_01_linux_write).
+            _ensure_linux_loader_arm64()
 
     assert exe.exists(), f"prebuilt Linux test PE not found: {exe} — run tests/build_tests.sh first"
     assert loader.exists(), f"Linux test_loader not found: {loader} — run tests/build_tests.sh first"
@@ -2395,11 +3097,11 @@ def test_03_linux_with_crt(arch, tmp_path):
     if use_wsl:
         sc_wsl = _win_path_to_wsl(sc)
         loader_wsl = _win_path_to_wsl(loader)
-        result = subprocess.run(
-            ["wsl", "--", loader_wsl, sc_wsl], capture_output=True, timeout=15
-        )
+        cmd = ["wsl", "--"] + ([qemu_arm64, loader_wsl, sc_wsl] if qemu_arm64 else [loader_wsl, sc_wsl])
+        result = subprocess.run(cmd, capture_output=True, timeout=15)
     else:
-        result = subprocess.run([str(loader), str(sc)], capture_output=True, timeout=15)
+        cmd = ([qemu_arm64, str(loader), str(sc)] if qemu_arm64 else [str(loader), str(sc)])
+        result = subprocess.run(cmd, capture_output=True, timeout=15)
 
     assert result.returncode == 0, (
         f"[linux_crt {arch}] loader crashed with code {result.returncode}\n"
@@ -2489,16 +3191,164 @@ def _build_linux_signal_pe(tmp_path: Path, use_wsl: bool, *, arch: str = "x64") 
     return exe
 
 
-@pytest.mark.parametrize("arch", ["x64", "x86"])
+def _build_linux_signal_pe_arm64(tmp_path: Path) -> "Path | None":
+    """Cross-compile tests/Linux/04_linux_signal/main.c as an ARM64 PE with libc.so.6 imports.
+
+    Same clang+lld aarch64-w64-mingw32 + llvm-dlltool toolchain as _build_linux_write_pe_arm64.
+    See _build_linux_crt_pe_arm64's docstring re: main.c's SYSV_ABI attribute being a harmless
+    no-op on AArch64 (Windows ARM64 and Linux ARM64 share the same AAPCS64 convention).
+    """
+    stable = _LINUX_PREBUILD_ARM64 / "04_linux_signal_arm64.pe"
+    if stable.exists():
+        return stable
+    _LINUX_PREBUILD_ARM64.mkdir(parents=True, exist_ok=True)
+
+    src = _LINUX_SIGNAL_SRC
+    if not src.exists():
+        return None
+
+    def_file = tmp_path / "libc_signal_arm64.def"
+    imp_lib  = tmp_path / "liblibc_signal_arm64.a"
+    obj_file = tmp_path / "04_linux_signal_arm64.o"
+    def_file.write_text(_LIBC_DEF_CONTENT_SIGNAL, encoding="ascii")
+
+    clang = _find_clang_arm64()
+    if not clang:
+        if platform.system() != "Windows":
+            return None
+        # Windows host without native aarch64-w64-mingw32 clang: identical
+        # steps through WSL's clang + llvm-dlltool.
+        return _wsl_build_linux_arm64_libc_pe(def_file, imp_lib, obj_file, src, stable)
+    llvm_dlltool = str(Path(clang).parent / "llvm-dlltool.exe")
+    if not Path(llvm_dlltool).exists():
+        llvm_dlltool = shutil.which("llvm-dlltool")
+    if not llvm_dlltool:
+        return None
+
+    dt = subprocess.run(
+        [llvm_dlltool, "-m", "arm64", "-D", _LIBC_DLL_NAME, "-d", str(def_file), "-l", str(imp_lib)],
+        capture_output=True, timeout=30,
+    )
+    if dt.returncode != 0:
+        return None
+
+    cc1 = subprocess.run(
+        [clang, "-target", "aarch64-w64-mingw32", "-nostdlib", "-nodefaultlibs", "-nostartfiles",
+         "-fno-unwind-tables", "-fno-asynchronous-unwind-tables",
+         "-c", str(src), "-o", str(obj_file)],
+        capture_output=True, timeout=30,
+    )
+    if cc1.returncode != 0:
+        return None
+
+    exe = stable
+    cc2 = subprocess.run(
+        [clang, "-target", "aarch64-w64-mingw32", "-nostdlib", "-nodefaultlibs", "-nostartfiles",
+         "-fno-unwind-tables", "-fno-asynchronous-unwind-tables", "-fuse-ld=lld",
+         "-Wl,-e,main", "-Wl,--subsystem,posix",
+         str(obj_file), str(imp_lib), "-o", str(exe)],
+        capture_output=True, timeout=30,
+    )
+    if cc2.returncode != 0 or not exe.exists():
+        return None
+    return exe
+
+
+def _build_linux_signal_pe_arm32(tmp_path: Path) -> "Path | None":
+    """Cross-compile tests/Linux/04_linux_signal/main.c as an ARM32 PE with libc.so.6 imports.
+
+    NOT YET CALLED by any test - parked for the same reason as _build_linux_write_pe_arm32:
+    building succeeds (clang+lld armv7-w64-mingw32, confirmed present) but running it needs a
+    real ARM32 Linux ELF test_loader_linux_arm32, blocked on a missing arm-linux-gnueabihf
+    glibc cross-toolchain in this session's WSL environment (re-confirmed as of Task 3).
+    """
+    stable = _LINUX_PREBUILD_ARM32 / "04_linux_signal_arm32.pe"
+    if stable.exists():
+        return stable
+    _LINUX_PREBUILD_ARM32.mkdir(parents=True, exist_ok=True)
+
+    src = _LINUX_SIGNAL_SRC
+    if not src.exists():
+        return None
+
+    clang = _find_clang_arm32()
+    if not clang:
+        return None
+    llvm_dlltool = str(Path(clang).parent / "llvm-dlltool.exe")
+    if not Path(llvm_dlltool).exists():
+        llvm_dlltool = shutil.which("llvm-dlltool")
+    if not llvm_dlltool:
+        return None
+
+    def_file = tmp_path / "libc_signal_arm32.def"
+    imp_lib  = tmp_path / "liblibc_signal_arm32.a"
+    obj_file = tmp_path / "04_linux_signal_arm32.o"
+    def_file.write_text(_LIBC_DEF_CONTENT_SIGNAL, encoding="ascii")
+
+    dt = subprocess.run(
+        [llvm_dlltool, "-m", "arm", "-D", _LIBC_DLL_NAME, "-d", str(def_file), "-l", str(imp_lib)],
+        capture_output=True, timeout=30,
+    )
+    if dt.returncode != 0:
+        return None
+
+    _ARM32_CFLAGS = [
+        "-target", "armv7-w64-mingw32", "-mthumb",
+        "-nostdlib", "-nodefaultlibs", "-nostartfiles",
+        "-fno-unwind-tables", "-fno-asynchronous-unwind-tables",
+    ]
+
+    cc1 = subprocess.run(
+        [clang] + _ARM32_CFLAGS + ["-c", str(src), "-o", str(obj_file)],
+        capture_output=True, timeout=30,
+    )
+    if cc1.returncode != 0:
+        return None
+
+    exe = stable
+    cc2 = subprocess.run(
+        [clang] + _ARM32_CFLAGS + ["-fuse-ld=lld",
+         "-Wl,-e,main", "-Wl,--subsystem,posix",
+         str(obj_file), str(imp_lib), "-o", str(exe)],
+        capture_output=True, timeout=30,
+    )
+    if cc2.returncode != 0 or not exe.exists():
+        return None
+    return exe
+
+
+@pytest.mark.parametrize("arch", ["x64", "x86", "arm64"])
 def test_04_linux_signal(arch, tmp_path):
     """Linux import resolver: PE imports signal()/raise() from libc.so.6; shellcode installs
     SIGUSR1 handler and raises it; returns 77 (SIGNAL_RETURN_CODE) when handler is called.
-    Tested for both x64 and x86.
+    Tested for x64, x86 and arm64 (see test_01_linux_write for the qemu-aarch64 rationale).
+    ARM32 is parked, not wired: see _build_linux_signal_pe_arm32's docstring.
     """
     use_wsl = platform.system() == "Windows"
-    exe = (_LINUX_PREBUILD_X64 if arch == "x64" else _LINUX_PREBUILD_X86) / f"04_linux_signal_{arch}.pe"
-    loader = (TESTS_DIR / "test_loader_linux"
-              / ("test_loader_linux.pe" if arch == "x64" else "test_loader_linux_32.pe"))
+    qemu_arm64 = None
+    if arch == "x64":
+        exe = _LINUX_PREBUILD_X64 / "04_linux_signal_x64.pe"
+        loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux.pe"
+    elif arch == "x86":
+        exe = _LINUX_PREBUILD_X86 / "04_linux_signal_x86.pe"
+        loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux_32.pe"
+    else:
+        exe = _LINUX_PREBUILD_ARM64 / "04_linux_signal_arm64.pe"
+        loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux_arm64.pe"
+        host_is_arm64 = platform.machine() in ("aarch64", "arm64")
+        if host_is_arm64:
+            # Native aarch64 host (ubuntu-24.04-arm CI / ARM Linux dev boxes): the
+            # loader and the PE are both aarch64 code — run the loader directly.
+            qemu_arm64 = None
+        else:
+            qemu_arm64 = (_find_qemu_user_arm64_wsl() if use_wsl
+                          else (shutil.which("qemu-aarch64-static") or shutil.which("qemu-aarch64")))
+            assert qemu_arm64, \
+                "qemu-aarch64 user-mode emulator not found (needed to run the arm64 loader on this host)"
+        if not Path(loader).exists():
+            # Fresh-clone fallback so `pytest tests/pytest` alone still passes (same
+            # rationale as test_01_linux_write).
+            _ensure_linux_loader_arm64()
 
     assert exe.exists(), f"prebuilt Linux test PE not found: {exe} — run tests/build_tests.sh first"
     assert loader.exists(), f"Linux test_loader not found: {loader} — run tests/build_tests.sh first"
@@ -2509,9 +3359,11 @@ def test_04_linux_signal(arch, tmp_path):
     if use_wsl:
         sc_wsl     = _win_path_to_wsl(sc)
         loader_wsl = _win_path_to_wsl(loader)
-        result = subprocess.run(["wsl", "--", loader_wsl, sc_wsl], capture_output=True, timeout=15)
+        cmd = ["wsl", "--"] + ([qemu_arm64, loader_wsl, sc_wsl] if qemu_arm64 else [loader_wsl, sc_wsl])
+        result = subprocess.run(cmd, capture_output=True, timeout=15)
     else:
-        result = subprocess.run([str(loader), str(sc)], capture_output=True, timeout=15)
+        cmd = ([qemu_arm64, str(loader), str(sc)] if qemu_arm64 else [str(loader), str(sc)])
+        result = subprocess.run(cmd, capture_output=True, timeout=15)
 
     assert result.returncode == 0, (
         f"[linux_signal {arch}] loader crashed with code {result.returncode}\n"
@@ -2527,15 +3379,159 @@ def test_04_linux_signal(arch, tmp_path):
 _LINUX_GLOBAL_CTOR_SRC = TESTS_DIR / "Linux" / "05_linux_global_ctor" / "main.cpp"
 
 
-@pytest.mark.parametrize("arch", ["x64", "x86"])
+def _build_linux_global_ctor_pe_arm64(tmp_path: Path) -> "Path | None":
+    """Compile tests/Linux/05_linux_global_ctor/main.cpp as an ARM64 PE.
+
+    Unlike test 02 (C++ exceptions), this test has no throw/catch - the two Adder global
+    constructors run from .init_array with plain function calls, no C++ exception-handling
+    runtime (__cxa_throw/__cxa_begin_catch/personality routine/typeinfo vtables) involved at
+    all. So, unlike test 02, this ports cleanly to clang + plain lld-link
+    aarch64-w64-mingw32 with
+    -fno-exceptions -fno-rtti and no extra runtime: compile+link produces a clean PE with zero
+    undefined symbols (confirmed empirically - see progress.md's Task 3 entry). The link step
+    MUST be plain lld-link (not clang's -fuse-ld=lld mingw-emulation driver): the driver folds
+    .ctors into other sections, which leaves _detect_pe_features with no ctors section and the
+    chain silently runs the PE with zero static storage - main's fail code exactly.
+    peor's ctors
+    runner (CTORS_RUNNER_ARM64, already wired into _PLATFORM_LINUX_ARM64 by Task 1) is
+    arch-generic and was already proven against this exact .ctors mechanism.
+    No libc imports are needed (main.cpp calls no libc functions), so no dlltool step either.
+    """
+    stable = _LINUX_PREBUILD_ARM64 / "05_linux_global_ctor_arm64.pe"
+    if stable.exists():
+        return stable
+    _LINUX_PREBUILD_ARM64.mkdir(parents=True, exist_ok=True)
+
+    src = _LINUX_GLOBAL_CTOR_SRC
+    if not src.exists():
+        return None
+
+    clang = _find_clang_arm64()
+    if not clang:
+        if platform.system() != "Windows":
+            return None
+        # Windows host without native aarch64-w64-mingw32 clang: identical
+        # steps through WSL's clang.
+        return _wsl_build_linux_arm64_global_ctor_pe(tmp_path / "05_linux_global_ctor_arm64.o",
+                                                     src, stable)
+
+    obj_file = tmp_path / "05_linux_global_ctor_arm64.o"
+    _CXX_FLAGS = [
+        "-target", "aarch64-w64-mingw32", "-nostdlib", "-nodefaultlibs", "-nostartfiles",
+        "-fno-unwind-tables", "-fno-asynchronous-unwind-tables",
+        "-fno-exceptions", "-fno-rtti",
+    ]
+
+    cc1 = subprocess.run(
+        [clang] + _CXX_FLAGS + ["-c", str(src), "-o", str(obj_file)],
+        capture_output=True, timeout=30,
+    )
+    if cc1.returncode != 0:
+        return None
+
+    # Link with plain lld-link, NOT clang's mingw-emulation driver: the latter folds
+    # .ctors into other sections (rdata), which leaves _detect_pe_features with no
+    # ctors section and the chain silently runs the PE with zeroed static storage
+    # (counter={0} -> main's fail code exactly, seen CI-native). Plain lld-link
+    # preserves .ctors as its own section for the ctors runner to consume.
+    exe = stable
+    lld_link = _find_lld_link_arm64()
+    if not lld_link:
+        if platform.system() != "Windows":
+            return None
+        # Windows host with clang but no lld-link is not expected; only WSL fallback.
+        return _wsl_build_linux_arm64_global_ctor_pe(obj_file, src, stable)
+    cc2 = subprocess.run(
+        [lld_link, "/MACHINE:ARM64", "/SUBSYSTEM:POSIX", "/ENTRY:main",
+         str(obj_file), f"-out:{exe}"],
+        capture_output=True, timeout=30,
+    )
+    if cc2.returncode != 0 or not exe.exists():
+        return None
+    return exe
+
+
+def _build_linux_global_ctor_pe_arm32(tmp_path: Path) -> "Path | None":
+    """Compile tests/Linux/05_linux_global_ctor/main.cpp as an ARM32 PE.
+
+    NOT YET CALLED by any test - parked for the same reason as _build_linux_write_pe_arm32:
+    building succeeds (clang+lld armv7-w64-mingw32, confirmed present, no EH runtime needed -
+    see _build_linux_global_ctor_pe_arm64's docstring) but running it needs a real ARM32 Linux
+    ELF test_loader_linux_arm32, blocked on a missing arm-linux-gnueabihf glibc cross-toolchain
+    in this session's WSL environment (re-confirmed as of Task 3).
+    """
+    stable = _LINUX_PREBUILD_ARM32 / "05_linux_global_ctor_arm32.pe"
+    if stable.exists():
+        return stable
+    _LINUX_PREBUILD_ARM32.mkdir(parents=True, exist_ok=True)
+
+    src = _LINUX_GLOBAL_CTOR_SRC
+    if not src.exists():
+        return None
+
+    clang = _find_clang_arm32()
+    if not clang:
+        return None
+
+    obj_file = tmp_path / "05_linux_global_ctor_arm32.o"
+    _CXX_FLAGS = [
+        "-target", "armv7-w64-mingw32", "-mthumb",
+        "-nostdlib", "-nodefaultlibs", "-nostartfiles",
+        "-fno-unwind-tables", "-fno-asynchronous-unwind-tables",
+        "-fno-exceptions", "-fno-rtti",
+    ]
+
+    cc1 = subprocess.run(
+        [clang] + _CXX_FLAGS + ["-c", str(src), "-o", str(obj_file)],
+        capture_output=True, timeout=30,
+    )
+    if cc1.returncode != 0:
+        return None
+
+    exe = stable
+    cc2 = subprocess.run(
+        [clang] + _CXX_FLAGS + ["-fuse-ld=lld",
+         "-Wl,-e,main", "-Wl,--subsystem,posix",
+         str(obj_file), "-o", str(exe)],
+        capture_output=True, timeout=30,
+    )
+    if cc2.returncode != 0 or not exe.exists():
+        return None
+    return exe
+
+
+@pytest.mark.parametrize("arch", ["x64", "x86", "arm64"])
 def test_05_linux_global_ctor(arch, tmp_path):
     """Linux global C++ constructor test: peor's ctors runner fires two Adder constructors
-    before main(); counter reaches 99; main returns 99.  Tested for x64 and x86.
+    before main(); counter reaches 99; main returns 99.  Tested for x64, x86 and arm64
+    (see test_01_linux_write for the qemu-aarch64 rationale).
+    ARM32 is parked, not wired: see _build_linux_global_ctor_pe_arm32's docstring.
     """
     use_wsl = platform.system() == "Windows"
-    exe = (_LINUX_PREBUILD_X64 if arch == "x64" else _LINUX_PREBUILD_X86) / f"05_linux_global_ctor_{arch}.pe"
-    loader = (TESTS_DIR / "test_loader_linux"
-              / ("test_loader_linux.pe" if arch == "x64" else "test_loader_linux_32.pe"))
+    qemu_arm64 = None
+    if arch == "x64":
+        exe = _LINUX_PREBUILD_X64 / "05_linux_global_ctor_x64.pe"
+        loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux.pe"
+    elif arch == "x86":
+        exe = _LINUX_PREBUILD_X86 / "05_linux_global_ctor_x86.pe"
+        loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux_32.pe"
+    else:
+        exe = _LINUX_PREBUILD_ARM64 / "05_linux_global_ctor_arm64.pe"
+        loader = TESTS_DIR / "test_loader_linux" / "test_loader_linux_arm64.pe"
+        host_is_arm64 = platform.machine() in ("aarch64", "arm64")
+        if host_is_arm64:
+            # Native aarch64 host (ubuntu-24.04-arm CI / ARM Linux dev boxes): the
+            # loader and the PE are both aarch64 code — run the loader directly.
+            qemu_arm64 = None
+        else:
+            qemu_arm64 = (_find_qemu_user_arm64_wsl() if use_wsl
+                          else (shutil.which("qemu-aarch64-static") or shutil.which("qemu-aarch64")))
+            assert qemu_arm64, \
+                "qemu-aarch64 user-mode emulator not found (needed to run the arm64 loader on this host)"
+        if not Path(loader).exists():
+            # Fresh-clone fallback so `pytest tests/pytest` alone still passes (same
+            # rationale as test_01_linux_write).
+            _ensure_linux_loader_arm64()
 
     assert exe.exists(), f"prebuilt Linux test PE not found: {exe} — run tests/build_tests.sh first"
     assert loader.exists(), f"Linux test_loader not found: {loader} — run tests/build_tests.sh first"
@@ -2546,9 +3542,11 @@ def test_05_linux_global_ctor(arch, tmp_path):
     if use_wsl:
         sc_wsl     = _win_path_to_wsl(sc)
         loader_wsl = _win_path_to_wsl(loader)
-        result = subprocess.run(["wsl", "--", loader_wsl, sc_wsl], capture_output=True, timeout=15)
+        cmd = ["wsl", "--"] + ([qemu_arm64, loader_wsl, sc_wsl] if qemu_arm64 else [loader_wsl, sc_wsl])
+        result = subprocess.run(cmd, capture_output=True, timeout=15)
     else:
-        result = subprocess.run([str(loader), str(sc)], capture_output=True, timeout=15)
+        cmd = ([qemu_arm64, str(loader), str(sc)] if qemu_arm64 else [str(loader), str(sc)])
+        result = subprocess.run(cmd, capture_output=True, timeout=15)
 
     assert result.returncode == 0, (
         f"[linux_global_ctor {arch}] loader crashed with code {result.returncode}\n"
@@ -2617,15 +3615,24 @@ def test_17_mingw_cpp_exceptions(arch, tmp_path):
 @pytest.mark.parametrize("arch,cmd_path,loader_subdir", [
     ("x64", r"C:\Windows\System32\cmd.exe", "Win_x64"),
     ("x86", r"C:\Windows\SysWOW64\cmd.exe", "Win_x86"),
-], ids=["x64", "x86"])
+    ("arm64", r"C:\Windows\System32\cmd.exe", "Win_ARM64"),
+], ids=["x64", "x86", "arm64"])
 def test_cmdexe(arch, cmd_path, loader_subdir, tmp_path):
     """Windows cmd.exe shellcodified and run; verifies echo command output.
 
-    Shellcodifies the system cmd.exe (System32 for x64, SysWOW64 for x86),
+    Shellcodifies the system cmd.exe (System32 for x64, SysWOW64 for x86, and
+    System32 again for arm64 - on an ARM64 host System32 hosts the native
+    ARM64 cmd.exe; SysWOW64\cmd.exe there is x64, not x86, so no extra case),
     runs via test_loader with stdin piped to 'echo PEOR_CMD_TEST', checks output.
     """
     if platform.system() != "Windows":
         pytest.skip("cmd.exe test is Windows-only")
+    if arch == "arm64" and not _host_runs_arm64():
+        pytest.skip(
+            "ARM64 shellcode execution requires an ARM64 Windows host "
+            "(x64 Windows cannot execute ARM64 PEs; proven instead on "
+            "windows-11-arm CI)"
+        )
     cmd_pe = Path(cmd_path)
     assert cmd_pe.exists(), f"cmd.exe not found at {cmd_path}"
     loader = TESTS_DIR / loader_subdir / "test_loader.exe"
@@ -2646,7 +3653,7 @@ def test_cmdexe(arch, cmd_path, loader_subdir, tmp_path):
     )
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_18_bss_gap(arch, tmp_path):
     """Static zero-initialized array must be zero in shellcode output; returns 88 if all zero."""
     win_dir     = ARCH_DIRS[arch]
@@ -2668,7 +3675,7 @@ def test_18_bss_gap(arch, tmp_path):
     )
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_19_ordinal_imports(arch, tmp_path):
     """EXE imports ByNameFunc by name and OrdinalOnlyFunc by ordinal 7; sum must be 42."""
     win_dir     = ARCH_DIRS[arch]
@@ -2691,7 +3698,7 @@ def test_19_ordinal_imports(arch, tmp_path):
     )
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_20_forwarded_exports(arch, tmp_path):
     """EXE imports GetCurrentProcessId_via_forward from forwarded_helper.dll (a forwarded export
     to KERNEL32.GetCurrentProcessId); verifies peor's resolver handles forwarded exports."""
@@ -2715,7 +3722,7 @@ def test_20_forwarded_exports(arch, tmp_path):
     )
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_21_api_sets(arch, tmp_path):
     """EXE imports HeapAlloc from api-ms-win-core-heap-l1-1-0.dll (virtual API set DLL)."""
     win_dir     = ARCH_DIRS[arch]
@@ -2740,7 +3747,7 @@ def test_21_api_sets(arch, tmp_path):
 # ── Feature detection unit tests ─────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_detect_features_imports(arch):
     """_detect_pe_features must detect has_imports=True for a PE with import directory."""
     pe_path = ARCH_DIRS[arch] / "04_crt_printf_rand.exe"
@@ -2750,7 +3757,7 @@ def test_detect_features_imports(arch):
     assert features.arch == arch
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_detect_features_no_imports(arch):
     """_detect_pe_features must detect has_imports=False for an importless PE."""
     pe_path = ARCH_DIRS[arch] / "01_simple_calc.exe"
@@ -2759,7 +3766,7 @@ def test_detect_features_no_imports(arch):
     assert not features.has_imports, f"[{arch}] expected has_imports=False for importless PE"
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_detect_features_tls(arch):
     """_detect_pe_features must detect has_tls=True for a PE with TLS callbacks."""
     pe_path = ARCH_DIRS[arch] / "10_tls_callbacks.exe"
@@ -2768,16 +3775,27 @@ def test_detect_features_tls(arch):
     assert features.has_tls, f"[{arch}] expected has_tls=True for PE with TLS callbacks"
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_detect_features_relocs(arch):
-    """_detect_pe_features must detect has_relocs=False for a PE built with /FIXED."""
+    """_detect_pe_features must detect has_relocs=False for a /FIXED PE's absence
+    of .reloc on x86/x64. arm64 expectation is inverted on purpose: MSVC's ARM64
+    linker rejects /FIXED outright (LNK1246), so the ARM64 test project keeps its
+    .reloc and must be reported as an ordinary relocated image. The fixture keeps
+    a non-empty .reloc on ARM64 only because main.c's g_selfptr adds one static
+    absolute fixup - without it an ARM64 build of this trivial importless source
+    emits zero relocations and no .reloc section at all."""
     pe_path = ARCH_DIRS[arch] / "06_stripped_relocs.exe"
     assert pe_path.exists(), f"{pe_path.name} not found — build tests/tests.sln first"
     features = _detect_pe_features(PE(str(pe_path)))
-    assert not features.has_relocs, f"[{arch}] expected has_relocs=False for /FIXED PE"
+    if arch == "arm64":
+        assert features.has_relocs, (
+            "[arm64] expected has_relocs=True: ARM64 linkers cannot strip .reloc"
+        )
+    else:
+        assert not features.has_relocs, f"[{arch}] expected has_relocs=False for /FIXED PE"
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_detect_features_delay_imports(arch):
     """_detect_pe_features must detect has_delay_imports=True for a PE with delay-loaded DLLs."""
     pe_path = ARCH_DIRS[arch] / "16_delay_load.exe"
@@ -2801,7 +3819,7 @@ def test_detect_features_ctors():
     assert features.ctors_size is not None and features.ctors_size > 0, "ctors_size should be > 0"
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_detect_features_bss(arch):
     """_detect_pe_features must detect BSS sections (SizeOfRawData=0, VirtualSize>0)."""
     pe_path = ARCH_DIRS[arch] / "18_bss_gap.exe"
@@ -2813,7 +3831,7 @@ def test_detect_features_bss(arch):
 # ── CLI flag tests ───────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_ignore_imports_flag(arch, tmp_path):
     """--ignore-imports (-m) zeros the import directory but shellcode still runs (imports resolver
     resolves nothing).  PE with imports: 04_crt_printf_rand.exe imports msvcrt printf/rand.
@@ -2847,10 +3865,17 @@ def test_ignore_imports_flag(arch, tmp_path):
     )
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_no_imports_flag(arch, tmp_path):
     """--no-imports omits import resolver stubs from shellcode chain.
-    Shellcode is shorter because import resolver blob is excluded."""
+    Shellcode is shorter because import resolver blob is excluded.
+
+    arm64 caveat: the ARM64 chain pads its whole prefix to a 4096-byte multiple
+    ('pe_align', required for AArch64 adrp/ldr page granularity), so dropping
+    the imports stub typically does not cross a page boundary and both variants
+    pad to the same length. The no-imports effect is therefore asserted through
+    padding invariants (page-aligned prefixes, never longer without imports)
+    rather than a strict size decrease."""
     pe_path = ARCH_DIRS[arch] / "04_crt_printf_rand.exe"
     assert pe_path.exists(), f"{pe_path.name} not found — build tests/tests.sln first"
 
@@ -2863,16 +3888,24 @@ def test_no_imports_flag(arch, tmp_path):
     features = _detect_pe_features(pe)
     normal_prefix_len = len(sc_normal.read_bytes()) - features.size_of_image
     no_imp_prefix_len = len(sc_no_imp.read_bytes()) - features.size_of_image
-    assert no_imp_prefix_len < normal_prefix_len, (
-        f"[{arch}] --no-imports should produce shorter prefix: "
-        f"normal={normal_prefix_len}, no_imports={no_imp_prefix_len}"
-    )
+    if arch == "arm64":
+        assert normal_prefix_len > 0 and normal_prefix_len % 4096 == 0, (
+            f"[arm64] --no-imports prefix not page-aligned: {normal_prefix_len}"
+        )
+        assert 0 < no_imp_prefix_len <= normal_prefix_len, (
+            f"[arm64] no_imports prefix {no_imp_prefix_len} out of (0, {normal_prefix_len}]"
+        )
+    else:
+        assert no_imp_prefix_len < normal_prefix_len, (
+            f"[{arch}] --no-imports should produce shorter prefix: "
+            f"normal={normal_prefix_len}, no_imports={no_imp_prefix_len}"
+        )
 
 
 # ── Rejection tests ──────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_kernel_mode_rejected(arch, tmp_path):
     """peor must reject kernel-mode PEs (subsystem 1) with an error message."""
     pe_path = ARCH_DIRS[arch] / "01_simple_calc.exe"
@@ -2981,7 +4014,7 @@ def test_detect_features_cxx_eh():
 # ── Stub computation tests ───────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_compute_stubs_importless_pe(arch):
     """Importless PE must not include 'imports' or 'delay_imports' in required stubs."""
     pe_path = ARCH_DIRS[arch] / "01_simple_calc.exe"
@@ -2996,7 +4029,7 @@ def test_compute_stubs_importless_pe(arch):
     assert 'entrypoint' in stubs, f"[{arch}] entrypoint stub must always be present"
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_compute_stubs_tls_pe(arch):
     """PE with TLS callbacks must include 'tls' in required stubs."""
     pe_path = ARCH_DIRS[arch] / "10_tls_callbacks.exe"
@@ -3019,7 +4052,7 @@ def test_compute_stubs_cxx_eh_pe():
     assert 'cxx_eh_fixer' in stubs, "x64 C++ EH PE should require cxx_eh_fixer stub"
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_compute_stubs_delay_imports_pe(arch):
     """PE with delay-loaded DLLs must include 'delay_imports' in required stubs."""
     pe_path = ARCH_DIRS[arch] / "16_delay_load.exe"
@@ -3043,3 +4076,44 @@ def test_compute_stubs_ctors_pe():
     entry = _select_chain(features)
     stubs = _compute_required_stubs(features, entry)
     assert 'ctors' in stubs, "MinGW x86 C++ PE with .ctors should require ctors stub"
+
+
+# ── Platform dispatch tests (Windows ARM64/ARM32) ───────────────────────────
+#
+# A real ARM64 Windows PE has pe_type == PE32+ (same Magic as x64) but
+# machine == IMAGE_FILE_MACHINE_ARM64; a real ARM32 Windows PE has
+# pe_type == PE32 (same Magic as x86) but machine in
+# (IMAGE_FILE_MACHINE_ARMNT, IMAGE_FILE_MACHINE_ARM_Thumb-2). Before Task 1 of
+# docs/superpowers/plans/2026-10-26-windows-arm-pe-support.md, _select_chain's
+# final fallback branch picked purely by pe_type with no machine check, so a
+# real ARM PE would have silently gotten the x64/x86 chain. These tests assert
+# the fix.
+
+
+def test_select_chain_arm64_not_confused_with_x64():
+    """A real ARM64 Windows PE must resolve to the ARM64 chain, never the x64 one."""
+    pe_path = ARCH_DIRS["arm64"] / "01_simple_calc.exe"
+    assert pe_path.exists(), f"{pe_path.name} not found — build tests/tests.sln (Platform=ARM64) first"
+    features = _detect_pe_features(PE(str(pe_path)))
+    entry = _select_chain(features)
+    assert entry is _SHELLCODES[_PLATFORM_ARM64], (
+        "ARM64 PE resolved to the wrong chain — check _select_chain's fallback machine check"
+    )
+
+
+# NOTE: test_select_chain_arm32_not_confused_with_x86 is intentionally not written as a
+# collected test yet. It would be the ARM32 mirror of the test above:
+#
+#   def test_select_chain_arm32_not_confused_with_x86():
+#       pe_path = ARCH_DIRS["arm32"] / "01_simple_calc.exe"
+#       features = _detect_pe_features(PE(str(pe_path)))
+#       entry = _select_chain(features)
+#       assert entry is _SHELLCODES[_PLATFORM_ARM32]
+#
+# but it needs a real ARM32 Windows PE to read headers from, and producing one via MSVC
+# is BLOCKED-ON-TOOLCHAIN on this dev machine (see the ARCH_DIRS comment above and
+# progress.md for the full toolchain-gap evidence). _select_chain's ARM32 fallback
+# branch (peor/_chain_builder.py) and the ARM32 _SHELLCODES entry are already wired
+# and keystone-verified; only this test is parked, pending either a working local
+# ARM32 SDK or the windows-11-arm CI runner. Promote this docstring to a real,
+# collected test the moment a real ARM32 01_simple_calc.exe can be built.

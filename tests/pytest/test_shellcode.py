@@ -78,10 +78,33 @@ _WM_COMMAND = 0x0111
 _IDOK = 1
 
 
+def _host_runs_arm64() -> bool:
+    """True when this Windows host can execute ARM64 PE code natively.
+
+    x64 Windows cannot emulate ARM64 (the only reverse-direction gap; ARM64
+    Windows runs x86/x64 via Prism emulation), so ARM64 execution proof can only
+    come from an ARM64 host - locally, or CI's windows-11-arm runner.
+    """
+    return platform.machine().lower() in ("arm64", "aarch64")
+
+
 def _skip_if_missing(loader_path: Path, pe_path: Path) -> None:
     """Fail (not skip) when an expected build artifact is missing — see PLAN.md:
     a missing binary means the build step didn't run, not that the test doesn't apply.
+
+    ARM64 execution gate: when the loader is the ARM64 one (Win_ARM64) and the
+    host is not ARM64, the test is skipped cleanly - the shellcodify/conversion
+    side is already proven statically on any host (see the 03-messagebox static
+    companion test), but running ARM64 machine code needs an ARM64 CPU. On
+    windows-11-arm CI these [arm64] params run for real. The existence asserts
+    still apply first for non-arm64 loaders, and on an ARM64 host before skip.
     """
+    if "Win_ARM64" in str(loader_path) and not _host_runs_arm64():
+        pytest.skip(
+            "ARM64 shellcode execution requires an ARM64 Windows host "
+            "(x64 Windows cannot execute ARM64 PEs; proven instead on "
+            "windows-11-arm CI)"
+        )
     assert loader_path.exists(), f"test_loader.exe not found at {loader_path} — build tests/tests.sln first"
     assert pe_path.exists(), f"{pe_path.name} not found at {pe_path} — build tests/tests.sln first"
 
@@ -150,7 +173,7 @@ def _poll_and_dismiss_msgbox(title: str, timeout: float = 10.0) -> dict:
     return result
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 @pytest.mark.parametrize("test_name,expected", _EXIT_CODE_CASES, ids=[t[0] for t in _EXIT_CODE_CASES])
 def test_shellcode_exit_code(arch, test_name, expected, tmp_path):
     win_dir = ARCH_DIRS[arch]
@@ -238,8 +261,12 @@ def test_03_winapi_messagebox_arm64_imports_resolved_statically(tmp_path):
     entry = _select_chain(features)
     assert entry is _SHELLCODES[_PLATFORM_ARM64], "ARM64 PE did not resolve to the ARM64 chain"
     assert entry["imports"], "IMPORTS_ARM64_UM is not wired into the ARM64 chain"
-    assert _compute_required_stubs(features, entry) == ["imports", "relocs", "entrypoint"], (
-        "expected the imports resolver to run before relocs, same ordering imports_resolver64.asm uses"
+    expected_stubs = ["imports", "relocs", "seh", "entrypoint"]
+    assert _compute_required_stubs(features, entry) == expected_stubs, (
+        "expected imports -> relocs -> seh -> entrypoint ordering: the imports "
+        "resolver runs before relocs (same ordering imports_resolver64.asm uses), "
+        "and MSVC ARM64 PEs always carry a .pdata exception table, which wires in "
+        "asm/seh_registrar_arm64.asm before the entrypoint"
     )
 
     shellcode_path = tmp_path / "03_winapi_messagebox_arm64.bin"
@@ -247,7 +274,7 @@ def test_03_winapi_messagebox_arm64_imports_resolved_statically(tmp_path):
     assert shellcode_path.stat().st_size > 0
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_04_crt_printf_rand(arch, tmp_path):
     win_dir = ARCH_DIRS[arch]
     pe_path = win_dir / "04_crt_printf_rand.exe"
@@ -274,7 +301,7 @@ def test_04_crt_printf_rand(arch, tmp_path):
     )
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_05_dll_entry(arch, tmp_path):
     """DLL shellcode: DllMain calls ExitProcess(42) on DLL_PROCESS_ATTACH."""
     win_dir = ARCH_DIRS[arch]
@@ -298,9 +325,13 @@ def test_05_dll_entry(arch, tmp_path):
     )
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_06_stripped_relocs(arch, tmp_path):
-    """EXE with /FIXED (no .reloc section): reloc resolver must skip relocation and jump to OEP."""
+    """x86/x64: EXE built with /FIXED (no .reloc) - resolver must skip relocation
+    and jump to OEP. arm64: the MSVC ARM64 linker refuses /FIXED outright (LNK1246),
+    so this PE keeps its .reloc and the resolver performs real relocations - the
+    no-reloc skip path is x86/x64-only by linker capability; exit code must match
+    either way (same embedded program)."""
     win_dir = ARCH_DIRS[arch]
     pe_path = win_dir / "06_stripped_relocs.exe"
     loader_path = win_dir / "test_loader.exe"
@@ -322,7 +353,7 @@ def test_06_stripped_relocs(arch, tmp_path):
     )
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_07_cpp_exceptions(arch, tmp_path):
     """C++ EXE with try/catch: x64 requires RtlAddFunctionTable for SEH unwind tables."""
     win_dir = ARCH_DIRS[arch]
@@ -346,7 +377,7 @@ def test_07_cpp_exceptions(arch, tmp_path):
     )
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_08_cpp_thread(arch, tmp_path):
     """C++ EXE with std::thread: thread sets result=42, main returns it."""
     win_dir = ARCH_DIRS[arch]
@@ -370,7 +401,7 @@ def test_08_cpp_thread(arch, tmp_path):
     )
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_09_resources(arch, tmp_path):
     """C++ EXE with embedded string resource: reads via __ImageBase HMODULE, returns 42 on match."""
     win_dir = ARCH_DIRS[arch]
@@ -425,7 +456,7 @@ def _sign_pe(source_path: Path, dest_path: Path) -> bool:
         return False
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_certificate_signed_pe(arch, tmp_path):
     """peor must produce correct shellcode from an Authenticode-signed PE."""
     win_dir = ARCH_DIRS[arch]
@@ -452,7 +483,7 @@ def test_certificate_signed_pe(arch, tmp_path):
     )
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_10_tls_callbacks(arch, tmp_path):
     """C++ EXE with TLS callback: callback sets g_result=88, main returns it via a C++ static-local."""
     win_dir = ARCH_DIRS[arch]
@@ -476,7 +507,7 @@ def test_10_tls_callbacks(arch, tmp_path):
     )
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_11_cpp_exceptions(arch, tmp_path):
     """C++ EXE with typed throw/catch: typed catch must return 123; catch(...) returns 456; no-catch 789."""
     win_dir = ARCH_DIRS[arch]
@@ -502,7 +533,7 @@ def test_11_cpp_exceptions(arch, tmp_path):
     )
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_12_seh_exceptions(arch, tmp_path):
     """C++ EXE compiled with /EHa (SEH-integrated): typed catch must fire and return 123."""
     win_dir = ARCH_DIRS[arch]
@@ -528,7 +559,7 @@ def test_12_seh_exceptions(arch, tmp_path):
     )
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_clr_rejection(arch, tmp_path):
     """peor must raise ValueError when DataDir[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR] is non-zero."""
     pe_path = ARCH_DIRS[arch] / "01_simple_calc.exe"
@@ -544,7 +575,7 @@ def test_clr_rejection(arch, tmp_path):
         dump_memory_layout(pe, tmp_path / "clr_rejected.bin")
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_stdout_output(arch, tmp_path):
     """`peor -o -` must write exactly the same bytes as dump_memory_layout to a file."""
     pe_path = ARCH_DIRS[arch] / "01_simple_calc.exe"
@@ -562,7 +593,7 @@ def test_stdout_output(arch, tmp_path):
         f"[{arch}] stdout bytes differ from file bytes"
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_info_mode(arch, tmp_path):
     """`peor --info` must print feature flags and stub sizes without writing a file."""
     pe_path = ARCH_DIRS[arch] / "11_cpp_exceptions.exe"
@@ -660,7 +691,7 @@ def test_packed_pe_features(tmp_path):
 # ── P2 tests ──────────────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_bound_imports(arch, tmp_path):
     """Shellcode from a PE with a non-zero DataDir[BOUND_IMPORT] must still execute correctly."""
     pe_path     = ARCH_DIRS[arch] / "04_crt_printf_rand.exe"
@@ -691,7 +722,7 @@ def test_bound_imports(arch, tmp_path):
         f"[{arch}] unexpected stdout: {stdout!r}"
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_13_tls_multi_callbacks(arch, tmp_path):
     """Five ordered TLS callbacks accumulate g = g*10 + i (i=1..5); main returns g == 12345."""
     win_dir     = ARCH_DIRS[arch]
@@ -713,7 +744,7 @@ def test_13_tls_multi_callbacks(arch, tmp_path):
     )
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_14_global_ctors(arch, tmp_path):
     """File-scope C++ object constructor runs before main; sets g_value=42, main returns it."""
     win_dir     = ARCH_DIRS[arch]
@@ -735,7 +766,7 @@ def test_14_global_ctors(arch, tmp_path):
     )
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_15_nested_exceptions(arch, tmp_path):
     """Nested try/rethrow: inner catch rethrows, outer catch must fire and return 55."""
     win_dir     = ARCH_DIRS[arch]
@@ -782,7 +813,7 @@ def test_large_pe_disp32_guard():
 # ── P2-14 ─────────────────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_16_delay_load(arch, tmp_path):
     """Delay-loaded GetTickCount must be resolved before the entry point; returns 1..250."""
     win_dir     = ARCH_DIRS[arch]
@@ -807,7 +838,7 @@ def test_16_delay_load(arch, tmp_path):
 # ── P3-17 ─────────────────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_custom_entry(arch, tmp_path):
     """--entry selects a named export (DllMain) instead of OEP; must return 42."""
     win_dir     = ARCH_DIRS[arch]
@@ -3556,15 +3587,24 @@ def test_17_mingw_cpp_exceptions(arch, tmp_path):
 @pytest.mark.parametrize("arch,cmd_path,loader_subdir", [
     ("x64", r"C:\Windows\System32\cmd.exe", "Win_x64"),
     ("x86", r"C:\Windows\SysWOW64\cmd.exe", "Win_x86"),
-], ids=["x64", "x86"])
+    ("arm64", r"C:\Windows\System32\cmd.exe", "Win_ARM64"),
+], ids=["x64", "x86", "arm64"])
 def test_cmdexe(arch, cmd_path, loader_subdir, tmp_path):
     """Windows cmd.exe shellcodified and run; verifies echo command output.
 
-    Shellcodifies the system cmd.exe (System32 for x64, SysWOW64 for x86),
+    Shellcodifies the system cmd.exe (System32 for x64, SysWOW64 for x86, and
+    System32 again for arm64 - on an ARM64 host System32 hosts the native
+    ARM64 cmd.exe; SysWOW64\cmd.exe there is x64, not x86, so no extra case),
     runs via test_loader with stdin piped to 'echo PEOR_CMD_TEST', checks output.
     """
     if platform.system() != "Windows":
         pytest.skip("cmd.exe test is Windows-only")
+    if arch == "arm64" and not _host_runs_arm64():
+        pytest.skip(
+            "ARM64 shellcode execution requires an ARM64 Windows host "
+            "(x64 Windows cannot execute ARM64 PEs; proven instead on "
+            "windows-11-arm CI)"
+        )
     cmd_pe = Path(cmd_path)
     assert cmd_pe.exists(), f"cmd.exe not found at {cmd_path}"
     loader = TESTS_DIR / loader_subdir / "test_loader.exe"
@@ -3585,7 +3625,7 @@ def test_cmdexe(arch, cmd_path, loader_subdir, tmp_path):
     )
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_18_bss_gap(arch, tmp_path):
     """Static zero-initialized array must be zero in shellcode output; returns 88 if all zero."""
     win_dir     = ARCH_DIRS[arch]
@@ -3607,7 +3647,7 @@ def test_18_bss_gap(arch, tmp_path):
     )
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_19_ordinal_imports(arch, tmp_path):
     """EXE imports ByNameFunc by name and OrdinalOnlyFunc by ordinal 7; sum must be 42."""
     win_dir     = ARCH_DIRS[arch]
@@ -3630,7 +3670,7 @@ def test_19_ordinal_imports(arch, tmp_path):
     )
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_20_forwarded_exports(arch, tmp_path):
     """EXE imports GetCurrentProcessId_via_forward from forwarded_helper.dll (a forwarded export
     to KERNEL32.GetCurrentProcessId); verifies peor's resolver handles forwarded exports."""
@@ -3654,7 +3694,7 @@ def test_20_forwarded_exports(arch, tmp_path):
     )
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_21_api_sets(arch, tmp_path):
     """EXE imports HeapAlloc from api-ms-win-core-heap-l1-1-0.dll (virtual API set DLL)."""
     win_dir     = ARCH_DIRS[arch]
@@ -3679,7 +3719,7 @@ def test_21_api_sets(arch, tmp_path):
 # ── Feature detection unit tests ─────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_detect_features_imports(arch):
     """_detect_pe_features must detect has_imports=True for a PE with import directory."""
     pe_path = ARCH_DIRS[arch] / "04_crt_printf_rand.exe"
@@ -3689,7 +3729,7 @@ def test_detect_features_imports(arch):
     assert features.arch == arch
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_detect_features_no_imports(arch):
     """_detect_pe_features must detect has_imports=False for an importless PE."""
     pe_path = ARCH_DIRS[arch] / "01_simple_calc.exe"
@@ -3698,7 +3738,7 @@ def test_detect_features_no_imports(arch):
     assert not features.has_imports, f"[{arch}] expected has_imports=False for importless PE"
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_detect_features_tls(arch):
     """_detect_pe_features must detect has_tls=True for a PE with TLS callbacks."""
     pe_path = ARCH_DIRS[arch] / "10_tls_callbacks.exe"
@@ -3707,16 +3747,24 @@ def test_detect_features_tls(arch):
     assert features.has_tls, f"[{arch}] expected has_tls=True for PE with TLS callbacks"
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_detect_features_relocs(arch):
-    """_detect_pe_features must detect has_relocs=False for a PE built with /FIXED."""
+    """_detect_pe_features must detect has_relocs=False for a /FIXED PE's absence
+    of .reloc on x86/x64. arm64 expectation is inverted on purpose: MSVC's ARM64
+    linker rejects /FIXED outright (LNK1246), so the ARM64 test project keeps its
+    .reloc and must be reported as an ordinary relocated image."""
     pe_path = ARCH_DIRS[arch] / "06_stripped_relocs.exe"
     assert pe_path.exists(), f"{pe_path.name} not found — build tests/tests.sln first"
     features = _detect_pe_features(PE(str(pe_path)))
-    assert not features.has_relocs, f"[{arch}] expected has_relocs=False for /FIXED PE"
+    if arch == "arm64":
+        assert features.has_relocs, (
+            "[arm64] expected has_relocs=True: ARM64 linkers cannot strip .reloc"
+        )
+    else:
+        assert not features.has_relocs, f"[{arch}] expected has_relocs=False for /FIXED PE"
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_detect_features_delay_imports(arch):
     """_detect_pe_features must detect has_delay_imports=True for a PE with delay-loaded DLLs."""
     pe_path = ARCH_DIRS[arch] / "16_delay_load.exe"
@@ -3740,7 +3788,7 @@ def test_detect_features_ctors():
     assert features.ctors_size is not None and features.ctors_size > 0, "ctors_size should be > 0"
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_detect_features_bss(arch):
     """_detect_pe_features must detect BSS sections (SizeOfRawData=0, VirtualSize>0)."""
     pe_path = ARCH_DIRS[arch] / "18_bss_gap.exe"
@@ -3752,7 +3800,7 @@ def test_detect_features_bss(arch):
 # ── CLI flag tests ───────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_ignore_imports_flag(arch, tmp_path):
     """--ignore-imports (-m) zeros the import directory but shellcode still runs (imports resolver
     resolves nothing).  PE with imports: 04_crt_printf_rand.exe imports msvcrt printf/rand.
@@ -3786,10 +3834,17 @@ def test_ignore_imports_flag(arch, tmp_path):
     )
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_no_imports_flag(arch, tmp_path):
     """--no-imports omits import resolver stubs from shellcode chain.
-    Shellcode is shorter because import resolver blob is excluded."""
+    Shellcode is shorter because import resolver blob is excluded.
+
+    arm64 caveat: the ARM64 chain pads its whole prefix to a 4096-byte multiple
+    ('pe_align', required for AArch64 adrp/ldr page granularity), so dropping
+    the imports stub typically does not cross a page boundary and both variants
+    pad to the same length. The no-imports effect is therefore asserted through
+    padding invariants (page-aligned prefixes, never longer without imports)
+    rather than a strict size decrease."""
     pe_path = ARCH_DIRS[arch] / "04_crt_printf_rand.exe"
     assert pe_path.exists(), f"{pe_path.name} not found — build tests/tests.sln first"
 
@@ -3802,16 +3857,24 @@ def test_no_imports_flag(arch, tmp_path):
     features = _detect_pe_features(pe)
     normal_prefix_len = len(sc_normal.read_bytes()) - features.size_of_image
     no_imp_prefix_len = len(sc_no_imp.read_bytes()) - features.size_of_image
-    assert no_imp_prefix_len < normal_prefix_len, (
-        f"[{arch}] --no-imports should produce shorter prefix: "
-        f"normal={normal_prefix_len}, no_imports={no_imp_prefix_len}"
-    )
+    if arch == "arm64":
+        assert normal_prefix_len > 0 and normal_prefix_len % 4096 == 0, (
+            f"[arm64] --no-imports prefix not page-aligned: {normal_prefix_len}"
+        )
+        assert 0 < no_imp_prefix_len <= normal_prefix_len, (
+            f"[arm64] no_imports prefix {no_imp_prefix_len} out of (0, {normal_prefix_len}]"
+        )
+    else:
+        assert no_imp_prefix_len < normal_prefix_len, (
+            f"[{arch}] --no-imports should produce shorter prefix: "
+            f"normal={normal_prefix_len}, no_imports={no_imp_prefix_len}"
+        )
 
 
 # ── Rejection tests ──────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_kernel_mode_rejected(arch, tmp_path):
     """peor must reject kernel-mode PEs (subsystem 1) with an error message."""
     pe_path = ARCH_DIRS[arch] / "01_simple_calc.exe"
@@ -3920,7 +3983,7 @@ def test_detect_features_cxx_eh():
 # ── Stub computation tests ───────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_compute_stubs_importless_pe(arch):
     """Importless PE must not include 'imports' or 'delay_imports' in required stubs."""
     pe_path = ARCH_DIRS[arch] / "01_simple_calc.exe"
@@ -3935,7 +3998,7 @@ def test_compute_stubs_importless_pe(arch):
     assert 'entrypoint' in stubs, f"[{arch}] entrypoint stub must always be present"
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_compute_stubs_tls_pe(arch):
     """PE with TLS callbacks must include 'tls' in required stubs."""
     pe_path = ARCH_DIRS[arch] / "10_tls_callbacks.exe"
@@ -3958,7 +4021,7 @@ def test_compute_stubs_cxx_eh_pe():
     assert 'cxx_eh_fixer' in stubs, "x64 C++ EH PE should require cxx_eh_fixer stub"
 
 
-@pytest.mark.parametrize("arch", ["x86", "x64"])
+@pytest.mark.parametrize("arch", ["x86", "x64", "arm64"])
 def test_compute_stubs_delay_imports_pe(arch):
     """PE with delay-loaded DLLs must include 'delay_imports' in required stubs."""
     pe_path = ARCH_DIRS[arch] / "16_delay_load.exe"

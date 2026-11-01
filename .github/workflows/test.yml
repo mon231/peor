@@ -64,6 +64,12 @@ jobs:
         working-directory: tests
         run: msbuild tests.sln /p:Configuration=Release /p:Platform=ARM64 /m /nologo /verbosity:minimal
 
+      # test-bins artifact consumers (windows-11-arm jobs) run test_detect_features_ctors /
+      # test_compute_stubs_ctors_pe, which parse Win_x86_MinGW\17_mingw_cpp_exceptions.exe; the
+      # ARM64 runners have no MSYS2 i686 toolchain, so build_windows produces + uploads it.
+      - name: Build MinGW/clang-cl prebuilt test PEs (build_tests.py)
+        run: python tests/build_tests.py --target windows
+
       - name: Upload Release test binaries
         uses: actions/upload-artifact@v4
         with:
@@ -72,6 +78,8 @@ jobs:
             tests/Win_x86
             tests/Win_x64
             tests/Win_ARM64
+            tests/Win_x64_MinGW
+            tests/Win_x86_MinGW
           retention-days: 1
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -123,6 +131,31 @@ jobs:
         working-directory: tests
         run: msbuild tests.sln /p:Configuration=Debug /p:Platform=ARM64 /m /nologo /verbosity:minimal
 
+      # test-bins artifact consumers (windows-11-arm jobs) run test_detect_features_ctors /
+      # test_compute_stubs_ctors_pe, which parse Win_x86_MinGW\17_mingw_cpp_exceptions.exe; the
+      # ARM64 runners have no MSYS2 i686 toolchain, so build_windows-debug produces + uploads it.
+      - name: Set up MSYS2 MinGW-w64 (x86_64 + i686) for the MinGW prebuilt fixtures
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc mingw-w64-i686-gcc
+
+      - name: Expose mingw32 gcc/g++-posix aliases on PATH
+        shell: msys2 {0}
+        run: |
+          # mingw-w64-{x86_64,i686}-gcc already ship gcc.exe as the same file as the
+          # triple-prefixed name, so only alias what's actually missing (the "-posix"
+          # suffixed g++ name Debian's alternatives system uses, which MSYS2 doesn't).
+          [ -e /mingw64/bin/x86_64-w64-mingw32-gcc.exe ] || cp /mingw64/bin/gcc.exe /mingw64/bin/x86_64-w64-mingw32-gcc.exe
+          [ -e /mingw32/bin/i686-w64-mingw32-gcc.exe ]   || cp /mingw32/bin/gcc.exe /mingw32/bin/i686-w64-mingw32-gcc.exe
+          [ -e /mingw64/bin/x86_64-w64-mingw32-g++-posix.exe ] || cp /mingw64/bin/g++.exe /mingw64/bin/x86_64-w64-mingw32-g++-posix.exe
+          [ -e /mingw32/bin/i686-w64-mingw32-g++-posix.exe ]   || cp /mingw32/bin/g++.exe /mingw32/bin/i686-w64-mingw32-g++-posix.exe
+          echo "$(cygpath -w /mingw64/bin)" >> "$GITHUB_PATH"
+          echo "$(cygpath -w /mingw32/bin)" >> "$GITHUB_PATH"
+
+      - name: Build MinGW/clang-cl prebuilt test PEs (build_tests.py)
+        run: python tests/build_tests.py --target windows
+
       - name: Upload Debug test binaries
         uses: actions/upload-artifact@v4
         with:
@@ -131,6 +164,8 @@ jobs:
             tests/Win_x86
             tests/Win_x64
             tests/Win_ARM64
+            tests/Win_x64_MinGW
+            tests/Win_x86_MinGW
           retention-days: 1
 
   test-windows:

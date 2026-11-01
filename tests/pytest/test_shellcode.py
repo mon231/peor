@@ -3753,7 +3753,10 @@ def test_detect_features_relocs(arch):
     """_detect_pe_features must detect has_relocs=False for a /FIXED PE's absence
     of .reloc on x86/x64. arm64 expectation is inverted on purpose: MSVC's ARM64
     linker rejects /FIXED outright (LNK1246), so the ARM64 test project keeps its
-    .reloc and must be reported as an ordinary relocated image."""
+    .reloc and must be reported as an ordinary relocated image. The fixture keeps
+    a non-empty .reloc on ARM64 only because main.c's g_selfptr adds one static
+    absolute fixup - without it an ARM64 build of this trivial importless source
+    emits zero relocations and no .reloc section at all."""
     pe_path = ARCH_DIRS[arch] / "06_stripped_relocs.exe"
     assert pe_path.exists(), f"{pe_path.name} not found — build tests/tests.sln first"
     features = _detect_pe_features(PE(str(pe_path)))

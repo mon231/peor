@@ -69,6 +69,18 @@ tracking per-task progress and review state.
   real `Exists()` checks). ARM32 asm/wiring is written and keystone/capstone
   verified but parked, not build-tested. Revisit with an older SDK (<=10.0.22621)
   or the `windows-11-arm` CI runner once stood up.
+- `arm_support` itself — **ARM64 usermode chain COMPLETED directly on this branch
+  (2026-11-01)**: the remaining stubs (`imports_resolver_arm64_delayload.asm`,
+  `seh_registrar_arm64.asm`, `tls_callbacks_arm64.asm`,
+  `cxx_eh_fixer_arm64.asm`) are written, wired into `_PLATFORM_ARM64`, and
+  verified against the full MSVC-compiled ARM64 test binary set (01-21;
+  winbox/03-messagebox deliberately stays static-only — see its companion test).
+  All Windows test projects now carry ARM64 configs (06/21 with their ARM64
+  link constraints), every Windows usermode/feature pytest suite gained an
+  `[arm64]` param gated on host capability (`_host_runs_arm64()`), and
+  `test-windows-arm{,-debug}` CI jobs run those params on real
+  `windows-11-arm` hardware. MinGW/clang-cl ARM64 builds are the only deferred
+  follow-up (need a MinGW aarch64 build path in `tests/build_tests.py`).
 
 **Design doc (read this first for the full rationale/decisions):**
 `docs/superpowers/specs/2026-10-26-windows-arm-support-design.md`

@@ -499,8 +499,10 @@ object for memory-layout reads (`pe.get_data()`, `pe.sections`).
 
 All tests live in `tests/` and are driven by `pytest`.  Each test:
 1. Calls `dump_memory_layout` to produce a shellcode binary.
-2. Executes it via `tests/Win_x86/test_loader.exe` or
-   `tests/Win_x64/test_loader.exe`.
+2. Executes it via `tests/Win_x86/test_loader.exe`,
+   `tests/Win_x64/test_loader.exe`, or `tests/Win_ARM64/test_loader.exe`
+   (ARM64 loaders run on ARM64 Windows hosts — the `windows-11-arm` CI
+   runner; x64 hosts skip ARM64 execution cases cleanly).
 3. Asserts on the process exit code.
 
 Build the test PEs first (see **Building**), then run:
@@ -511,28 +513,28 @@ pytest tests/pytest -v
 
 | # | Test | Arch | What it verifies | Expected exit |
 |---|---|---|---|---|
-| 01 | `01_simple_calc` | x86, x64 | Importless EXE; loop 0–99, no relocations needed | 4950 |
-| 02 | `02_relocs_functions` | x86, x64 | Importless EXE with static globals and `.reloc` section; tests relocation resolver | 90 |
+| 01 | `01_simple_calc` | x86, x64, arm64 | Importless EXE; loop 0–99, no relocations needed | 4950 |
+| 02 | `02_relocs_functions` | x86, x64, arm64 | Importless EXE with static globals and `.reloc` section; tests relocation resolver | 90 |
 | 03 | `03_winapi_messagebox` | x86, x64 | EXE calling `MessageBoxA`; tests import resolver and interactive dialog | 0 (skipped in CI) |
-| 04 | `04_crt_printf_rand` | x86, x64 | CRT EXE (`printf` + `rand`); tests full CRT startup with imports | 0 (stdout = `Random: <n>`) |
-| 05 | `05_dll_entry` | x86, x64 | DLL whose `DllMain` calls `ExitProcess(42)`; tests DLL entry dispatch | 42 |
-| 06 | `06_stripped_relocs` | x86, x64 | EXE compiled `/FIXED` (no `.reloc` section); resolver must skip relocation | 99 |
-| 07 | `07_cpp_exceptions` | x86, x64 | `__try`/`__except` with `RaiseException(77,...)`; tests SEH registrar | 77 |
-| 08 | `08_cpp_thread` | x86, x64 | `std::thread` lambda sets `result=42`; tests CRT thread machinery | 42 |
-| 09 | `09_resources` | x86, x64 | EXE reads string resource 100 from its own `.rsrc` section via `__ImageBase`; tests resource preservation | 42 |
-| 10 | `10_tls_callbacks` | x86, x64 | TLS callback sets `g_result=88`; tests TLS callback invoker runs before `main` | 88 |
-| 11 | `11_cpp_exceptions` | x86, x64 | Typed C++ `throw`/`catch`; tests that the correct catch branch fires | 123 |
-| 12 | `12_seh_exceptions` | x86, x64 | Same as 11 but compiled `/EHa` (SEH-integrated C++ exceptions) | 123 |
-| 13 | `13_tls_multi_callbacks` | x86, x64 | Five TLS callbacks in sequence with ordering check | computed sum |
-| 14 | `14_global_ctors` | x86, x64 | File-scope C++ constructor runs before `main` | 42 |
-| 15 | `15_nested_exceptions` | x64 | Nested/rethrown C++ exceptions test multi-frame unwind | 55 |
-| 16 | `16_delay_load` | x86, x64 | Delay-loaded `winmm.dll!timeGetTime`; tests delay-load IAT pre-patching | 1..250 |
-| — | `certificate_signed_pe` | x86, x64 | PE with a dummy `WIN_CERTIFICATE` appended; verifies security directory is handled | 90 |
+| 04 | `04_crt_printf_rand` | x86, x64, arm64 | CRT EXE (`printf` + `rand`); tests full CRT startup with imports | 0 (stdout = `Random: <n>`) |
+| 05 | `05_dll_entry` | x86, x64, arm64 | DLL whose `DllMain` calls `ExitProcess(42)`; tests DLL entry dispatch | 42 |
+| 06 | `06_stripped_relocs` | x86, x64, arm64 | EXE: x86/x64 compiled `/FIXED` (no `.reloc`), resolver must skip relocation; the arm64 linker cannot strip `.reloc` (LNK1246) so the arm64 case exercises real relocations instead | 99 |
+| 07 | `07_cpp_exceptions` | x86, x64, arm64 | `__try`/`__except` with `RaiseException(77,...)`; tests SEH registrar | 77 |
+| 08 | `08_cpp_thread` | x86, x64, arm64 | `std::thread` lambda sets `result=42`; tests CRT thread machinery | 42 |
+| 09 | `09_resources` | x86, x64, arm64 | EXE reads string resource 100 from its own `.rsrc` section via `__ImageBase`; tests resource preservation | 42 |
+| 10 | `10_tls_callbacks` | x86, x64, arm64 | TLS callback sets `g_result=88`; tests TLS callback invoker runs before `main` | 88 |
+| 11 | `11_cpp_exceptions` | x86, x64, arm64 | Typed C++ `throw`/`catch`; tests that the correct catch branch fires | 123 |
+| 12 | `12_seh_exceptions` | x86, x64, arm64 | Same as 11 but compiled `/EHa` (SEH-integrated C++ exceptions) | 123 |
+| 13 | `13_tls_multi_callbacks` | x86, x64, arm64 | Five TLS callbacks in sequence with ordering check | computed sum |
+| 14 | `14_global_ctors` | x86, x64, arm64 | File-scope C++ constructor runs before `main` | 42 |
+| 15 | `15_nested_exceptions` | x86, x64, arm64 | Nested/rethrown C++ exceptions test multi-frame unwind | 55 |
+| 16 | `16_delay_load` | x86, x64, arm64 | Delay-loaded `winmm.dll!timeGetTime`; tests delay-load IAT pre-patching | 1..250 |
+| — | `certificate_signed_pe` | x86, x64, arm64 | PE with a dummy `WIN_CERTIFICATE` appended; verifies security directory is handled | 90 |
 | — | `clr_pe_rejection` | — | CLR/managed PE raises `ValueError` | ValueError |
 | — | `disp32_overflow` | — | Relocs resolver disp32 overflow check raises `ValueError` | ValueError |
-| — | `custom_entry` | x64 | `--entry DllMain` calls a named export instead of OEP | 42 |
-| — | `mingw_simple_calc` | x64 | MinGW cross-compiled importless EXE; uses WSL on Windows, native compiler on Linux CI; Linux loader prints full int to stdout | stdout=4950 |
-| — | `clangcl_simple_calc` | x64 | clang-cl `/MT` compiled EXE with static CRT; Windows-only (skipped if `clang-cl` absent) | 4950 |
+| — | `custom_entry` | x86, x64, arm64 | `--entry DllMain` calls a named export instead of OEP | 42 |
+| — | `mingw_simple_calc` | x64 | MinGW cross-compiled importless EXE; uses WSL on Windows, native compiler on Linux CI; Linux loader prints full int to stdout (arm64 case pending a MinGW aarch64 build path) | stdout=4950 |
+| — | `clangcl_simple_calc` | x64 | clang-cl `/MT` compiled EXE with static CRT; Windows-only (skipped if `clang-cl` absent; arm64 case pending a clang-cl aarch64 cross path) | 4950 |
 | — | `01_linux_write` | x64 | Linux-platform PE (subsystem 7) importing `write` from `libc.so.6`; shellcode finds `dlsym`/`dlopen` itself via `/proc/self/maps`; asserts "PEOR\n" in stdout | stdout=PEOR |
 | — | `01_linux_write_x86` | x86 | Same as above but compiled as PE32 with i686-w64-mingw32-gcc; uses x86 Linux chain and 32-bit loader | stdout=PEOR |
 | — | `01_linux_write_arm64` | arm64 | Same as above but cross-compiled with clang+lld (`aarch64-w64-mingw32`) and llvm-dlltool; uses the ARM64 Linux chain (page-aligned PE base, see ADRP alignment note above) and runs under `qemu-aarch64` user-mode emulation | stdout=PEOR |
@@ -657,20 +659,28 @@ and the native `test_loader.exe` for execution.
 
 ¹ ARM64/ARM32 Windows GUI/console EXE/DLL support is landing incrementally
 (see `docs/superpowers/plans/2026-10-26-windows-arm-pe-support.md`). **ARM64**:
-relocations, the entry-point dispatcher (`DllMain`/OEP), `.init_array` ctors,
-and usermode import resolution (`imports_resolver_arm64.asm`) are wired and
-verified against a real MSVC-compiled ARM64 PE (build + static shellcode
-conversion; execution is blocked on this x86\_64 dev machine - ARM64 Windows
-binaries cannot run here, there is no reverse-direction emulation). **ARM32**:
-relocations, the entry-point dispatcher, and ctors are wired; ARM32 is
-otherwise deferred (not in scope) pending a Windows SDK that still ships
-32-bit ARM import libraries (this machine's only installed SDK removed them -
-see the Task 1/2 progress ledger). Delay-load imports, TLS callbacks, SEH and
-C++ EH land in later tasks of that plan for both architectures.
-`_select_chain` correctly dispatches a real ARM64/ARM32 Windows PE to its own
-chain instead of silently falling through to x64/x86 (same `pe_type` — PE32+/
-PE32 — but a different `machine` field) regardless of how much of the chain
-is implemented so far.
+the full usermode Windows chain is wired — relocations, usermode + delay-load
+imports (`imports_resolver_arm64.asm`,
+`imports_resolver_arm64_delayload.asm`), the C++ EH fixer that hooks the
+`RtlPcToFileHeader` IAT slot (`cxx_eh_fixer_arm64.asm`; MSVC ARM64 C++ PEs
+reference that function through the IAT exactly like their x64 counterparts),
+SEH registration via `ntdll!RtlAddFunctionTable`
+(`seh_registrar_arm64.asm`; AArch64 `RUNTIME_FUNCTION` is 2 DWORDs, so
+EntryCount is `DataDir[3].Size / 8`), TLS callbacks, `.init_array` ctors,
+and the `DllMain`/OEP dispatcher — all verified against real MSVC-compiled
+ARM64 test PEs (01–21 build with `Platform=ARM64`; every PE round-trips
+through peor's conversion deterministically, and the feature table drives the
+exact same stub chain x64 uses). Execution proof lands on the
+`windows-11-arm` CI runner (x86_64 hosts cannot run ARM64 PE code — there is
+no reverse-direction emulation locally), where the `[arm64]` pytest params of
+the Windows usermode/feature suites run for real. **ARM32**: relocations, the
+entry-point dispatcher, and ctors are wired; ARM32 is otherwise deferred (not
+in scope) pending a Windows SDK that still ships 32-bit ARM import libraries
+(this machine's only installed SDK removed them - see the Task 1/2 progress
+ledger). `_select_chain` correctly dispatches a real ARM64/ARM32 Windows PE to
+its own chain instead of silently falling through to x64/x86 (same `pe_type`
+— PE32+/PE32 — but a different `machine` field) regardless of how much of the
+chain is implemented so far.
 
 Attempting to convert unsupported combinations raises `ValueError` or `PeorUnsupportedError` with a descriptive message.
 

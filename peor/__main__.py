@@ -11,6 +11,7 @@ from peor._pe_features import (
     _find_export_rva,
     _PLATFORM_LINUX,
     _PLATFORM_EFI,
+    _PLATFORM_KERNEL, _PLATFORM_KERNEL_32,
 )
 from peor._chain_builder import (
     _select_chain,
@@ -23,7 +24,7 @@ from peor._chain_builder import (
     _SHELLCODES,
 )
 
-_SUPPORTED_PLATFORMS = (_PLATFORM_LINUX, _PLATFORM_EFI)
+_SUPPORTED_PLATFORMS = (_PLATFORM_LINUX, _PLATFORM_EFI, _PLATFORM_KERNEL, _PLATFORM_KERNEL_32)
 
 
 def _print_features(f: PeFeatures, required_stubs: "list | None" = None) -> None:
@@ -81,7 +82,7 @@ def parse_arguments():
     parser.add_argument(      '--info',            action='store_true',     help='Print resolver sizes without writing output')
     parser.add_argument('--platform',              type=str, default=None,
                         choices=_SUPPORTED_PLATFORMS,
-                        help='Override target platform (linux | efi); auto-detected from subsystem otherwise')
+                        help='Override target platform (linux | efi | kernel64 | kernel32); auto-detected from subsystem otherwise')
     return parser.parse_args()
 
 

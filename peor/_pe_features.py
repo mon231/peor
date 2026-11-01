@@ -41,6 +41,8 @@ _PLATFORM_LINUX_32  = 'linux32'
 _PLATFORM_EFI_32    = 'efi32'
 _PLATFORM_EFI_ARM64 = 'efi_arm64'
 _PLATFORM_EFI_ARM32 = 'efi_arm32'
+_PLATFORM_KERNEL    = 'kernel64'
+_PLATFORM_KERNEL_32 = 'kernel32'
 
 
 class PeorUnsupportedError(ValueError):
@@ -258,5 +260,18 @@ def _validate_pe_features(features: PeFeatures, platform: "str | None" = None) -
         raise PeorUnsupportedError(msg)
     if features.is_clr:
         raise ValueError("CLR/managed PE is not supported")
-    if features.subsystem == _NATIVE_SUBSYSTEM and platform is None:
-        raise ValueError(f"Kernel-mode PE (subsystem {features.subsystem}) is not yet supported")
+    if features.subsystem == _NATIVE_SUBSYSTEM:
+        # Kernel-mode PE: only the kernel platforms accept it (auto-selected
+        # when no --platform override is given).
+        if platform not in (None, _PLATFORM_KERNEL, _PLATFORM_KERNEL_32):
+            raise ValueError(
+                f"Kernel-mode PE (subsystem {features.subsystem}) "
+                f"cannot be converted for platform '{platform}'"
+            )
+        return
+    if platform in (_PLATFORM_KERNEL, _PLATFORM_KERNEL_32):
+        raise PeorUnsupportedError(
+            f"--platform {platform} requires a kernel-mode PE "
+            f"(subsystem {_NATIVE_SUBSYSTEM}), but this PE's subsystem is "
+            f"{features.subsystem}"
+        )

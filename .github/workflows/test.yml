@@ -706,6 +706,161 @@ jobs:
         run: pytest tests/pytest -v --timeout=360 -k "efi and (arm64 or arm32)"
 
 # ─────────────────────────────────────────────────────────────────────────────
+# test-windows-arm{,-debug}: run the non-EFI Windows-usermode tests with their
+# [arm64] params active on real windows-11-arm hardware. Build-windows(⑴ -debug)
+# already builds and uploads tests/Win_ARM64 binaries (x64 runners cannot
+# execute ARM64 PEs, so only here can they run), so both jobs just download
+# those artifacts and run pytest — no MSBuild here.
+#
+# Toolchain shape mirrors test-efi-windows-arm above (same runner quirks
+# already encoded there, referenced by the inline comments):
+#   - no WSL2 on this runner → no WSL-based fallbacks;
+#   - keystone-engine has no win_arm64 wheel → pip builds it from source,
+#     which needs CMake 3.3x (CMP0051 OLD; VS-bundled CMake 4.x hard-fails)
+#     and an MSVC dev env (ilammy/msvc-dev-cmd@v1 arch: arm64);
+#   - ilammy/msvc-dev-cmd@v1 clobbers PATH entries added BEFORE it →
+#     the toolchain PATH additions happen after that step.
+#
+# pytest filter drops the not-yet-ported MinGW/clang-cl suites (test_mingw_*,
+# test_clangcl_*, test_17_mingw_*): their fixture build paths are x64/x86-only
+# and their ARM64 ports need a mingw aarch64 toolchain — next follow-up, not a
+# blocker for the MSVC test-PE coverage that drives this objective.
+# The [arm64] case of every other test runs for real here; on x64 CI hosts
+# those params skip via test_shellcode.py's _skip_if_missing/_host_runs_arm64
+# gate (x64 Windows cannot execute ARM64 PE code).
+# ─────────────────────────────────────────────────────────────────────────────
+  test-windows-arm-release:
+    runs-on: windows-11-arm
+    needs: build-windows
+
+    steps:
+      - name: Cache native toolchain (LLVM/clang+lld, CMake 3.31) — shared with test-efi-windows-arm
+        id: cache-native-toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:\Program Files\LLVM
+            C:\Program Files\CMake
+          key: native-toolchain-windows-11-arm-llvm-cmake3316-v2
+
+      - uses: actions/checkout@v4
+
+      - name: Install native toolchain via chocolatey (only on cache miss)
+        if: steps.cache-native-toolchain.outputs.cache-hit != 'true'
+        shell: pwsh
+        # cmake is what keystone-engine's source build actually needs here; llvm
+        # rides along because it shares this cache entry with test-efi-windows-arm.
+        run: |
+          choco install cmake --version=3.31.6 --installargs 'ADD_CMAKE_TO_PATH=System' -y --no-progress --force
+          choco install llvm -y --no-progress
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cache pip wheel cache (keystone-engine build-from-source is slow)
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\pip\Cache
+          key: pip-wheels-windows-11-arm-${{ hashFiles('pyproject.toml', 'setup.py') }}
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: arm64
+
+      # PATH additions AFTER ilammy/msvc-dev-cmd@v1 (see its note on the efi job above).
+      - name: Add native toolchain to PATH
+        shell: pwsh
+        run: |
+          echo "C:\Program Files\LLVM\bin" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
+          echo "C:\Program Files\CMake\bin" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
+
+      - name: Install Python dependencies
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pip install -e .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pip install pytest pytest-cov pytest-timeout
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Download Release test binaries (from build-windows)
+        uses: actions/download-artifact@v4
+        with:
+          name: test-bins-windows-release
+          path: tests
+
+      - name: Run usermode shellcode tests (ARM64 params active, MinGW/clang-cl suites deferred)
+        run: pytest tests/pytest/ -v --cov=peor --cov-report=xml --cov-report=term-missing --timeout=60 -k "not linux and not efi and not mingw and not clangcl"
+
+  test-windows-arm-debug:
+    runs-on: windows-11-arm
+    needs: build-windows-debug
+
+    steps:
+      - name: Cache native toolchain (LLVM/clang+lld, CMake 3.31) — shared with test-efi-windows-arm
+        id: cache-native-toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:\Program Files\LLVM
+            C:\Program Files\CMake
+          key: native-toolchain-windows-11-arm-llvm-cmake3316-v2
+
+      - uses: actions/checkout@v4
+
+      - name: Install native toolchain via chocolatey (only on cache miss)
+        if: steps.cache-native-toolchain.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          choco install cmake --version=3.31.6 --installargs 'ADD_CMAKE_TO_PATH=System' -y --no-progress --force
+          choco install llvm -y --no-progress
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cache pip wheel cache (keystone-engine build-from-source is slow)
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\pip\Cache
+          key: pip-wheels-windows-11-arm-${{ hashFiles('pyproject.toml', 'setup.py') }}
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: arm64
+
+      - name: Add native toolchain to PATH
+        shell: pwsh
+        run: |
+          echo "C:\Program Files\LLVM\bin" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
+          echo "C:\Program Files\CMake\bin" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
+
+      - name: Install Python dependencies
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pip install -e .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pip install pytest pytest-timeout
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Download Debug test binaries (from build-windows-debug)
+        uses: actions/download-artifact@v4
+        with:
+          name: test-bins-windows-debug
+          path: tests
+
+      - name: Run usermode shellcode tests (ARM64 params active, MinGW/clang-cl suites deferred)
+        run: pytest tests/pytest/ -v --timeout=60 -k "not linux and not efi and not mingw and not clangcl"
+
+# ─────────────────────────────────────────────────────────────────────────────
 # test-summary: single required gate — fails unless every job above PASSED.
 # No test in this workflow is allowed to silently skip (missing binaries/toolchains
 # are hard failures, see PLAN.md), so "success" is the only acceptable result here.
@@ -722,6 +877,8 @@ jobs:
       - test-linux-arm64
       - test-efi-qemu
       - test-efi-windows-arm
+      - test-windows-arm-release
+      - test-windows-arm-debug
     steps:
       - name: Verify every job passed
         run: |

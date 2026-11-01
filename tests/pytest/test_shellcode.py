@@ -847,7 +847,8 @@ def test_custom_entry(arch, tmp_path):
     _skip_if_missing(loader_path, pe_path)
 
     pe = PE(str(pe_path))
-    export_name = "DllMain" if arch == "x64" else "_DllMain@12"
+    # Arm64 exports C symbols undecorated (same as x64); only x86 decorates.
+    export_name = "_DllMain@12" if arch == "x86" else "DllMain"
     override_ep_rva = _find_export_rva(pe, export_name)
 
     shellcode_path = tmp_path / f"custom_entry_{arch}.bin"

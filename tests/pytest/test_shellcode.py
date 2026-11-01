@@ -2873,8 +2873,8 @@ def test_no_imports_flag(arch, tmp_path):
 
 
 @pytest.mark.parametrize("arch", ["x86", "x64"])
-def test_kernel_mode_rejected(arch, tmp_path):
-    """peor must reject kernel-mode PEs (subsystem 1) with an error message."""
+def test_kernel_mode_accepted(arch, tmp_path):
+    """Kernel support (subsystem 1): peor accepts NATIVE PEs and emits shellcode."""
     pe_path = ARCH_DIRS[arch] / "01_simple_calc.exe"
     assert pe_path.exists(), f"{pe_path.name} not found — build tests/tests.sln first"
 
@@ -2885,14 +2885,15 @@ def test_kernel_mode_rejected(arch, tmp_path):
     km_path = tmp_path / f"kernel_{arch}.exe"
     km_path.write_bytes(bytes(pe_bytes))
 
+    out = tmp_path / "out.bin"
     result = subprocess.run(
-        [sys.executable, "-m", "peor", "-i", str(km_path), "-o", str(tmp_path / "out.bin")],
+        [sys.executable, "-m", "peor", "-i", str(km_path), "-o", str(out)],
         capture_output=True, text=True, timeout=30,
     )
-    assert result.returncode != 0, "peor should reject kernel-mode PE but returned 0"
-    assert "kernel" in result.stderr.lower() or "subsystem" in result.stderr.lower(), (
-        f"Expected 'kernel' or 'subsystem' in stderr:\n{result.stderr}"
+    assert result.returncode == 0, (
+        f"peor should accept kernel-mode PE; stderr:\n{result.stderr}"
     )
+    assert out.exists() and out.stat().st_size > 0
 
 
 def test_find_export_rva_not_found(tmp_path):

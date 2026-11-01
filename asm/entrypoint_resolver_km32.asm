@@ -11,11 +11,11 @@
 ; Stack contract: the 4 prologue pushes (EBX/EBP/ESI/EDI) are still on the
 ; stack below everything this stub does; the final pops unwind them in reverse
 ; order so `ret` lands back in the kernel loader. DriverEntry is __stdcall on
-; x86, so it cleans its own two arguments off the stack.
+; x86, so it cleans its own two arguments off the stack — no caller-side epilogue
+; is needed after the call.
 
 %define EP_RVA_MAGIC        0xcececece  ; patched by peor: DriverEntry RVA
 %define E_LFANEW_OFFSET     0x3C        ; DOS header e_lfanew offset
-%define NTAPI_ARGUMENTS     0x08        ; stdcall: 2 stack arguments
 
     mov  esi, dword [ebx + E_LFANEW_OFFSET]
     add  esi, ebx                        ; ESI = NT headers
@@ -25,7 +25,7 @@
     push 0                               ; arg2: RegistryPath = NULL
     push 0                               ; arg1: DriverObject = NULL
     call eax                             ; DriverEntry(NULL, NULL) -> NTSTATUS
-    add  esp, NTAPI_ARGUMENTS            ; no-op for stdcall, kept defensive
+                                         ; (stdcall: DriverEntry rets 8 itself)
 
     pop  edi
     pop  esi

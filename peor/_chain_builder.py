@@ -189,9 +189,13 @@ _SHELLCODES = {
     },
     # Kernel-mode chains (subsystem IMAGE_SUBSYSTEM_NATIVE drivers). The
     # prologue saves the loader's callee-save registers; the kernel entrypoint
-    # restores them and returns DriverEntry's NTSTATUS to the loader. Kernel
-    # PE features beyond imports (delay-load, TLS, SEH, ctors, C++ EH) are
-    # not supported yet — their stub entries stay empty/unset.
+    # restores them and returns DriverEntry's NTSTATUS to the loader.
+    # Exceptions work like the EFI/user-mode chains: cxx_eh_fixer64 hooks
+    # RtlPcToFileHeader in the IAT (resolved by the kernel import resolver from
+    # ntoskrnl) so RtlDrawException's ThrowInfo RVA math AND x64 SEH unwind
+    # (RtlLookupFunctionEntry -> RtlPcToFileHeader) find this non-registered
+    # image. No new asm is needed: the fixer is runtime-agnostic (only needs
+    # RBX = PE base, set by relocations_resolver64 earlier in the chain).
     _PLATFORM_KERNEL: {
         'prefix':            KM_PREFIX_64,
         'relocs':            RELOCS_64,
@@ -201,11 +205,17 @@ _SHELLCODES = {
         'seh':               b'',
         'seh_always':        False,
         'tls':               b'',
+        'cxx_eh_fixer':      CXX_EH_FIXER_64,
+        'cxx_pe_size_magic': _CXX_EH_PE_SIZE_MAGIC_64,
+        'cxx_iat_rva_magic': _CXX_EH_IAT_RVA_MAGIC_64,
         'tail':              _IMPORTS_TAIL_32,
         'dir_array_offset':  112,
         'disp32_off':        9,
         'ep_rva_magic':      _EP_RVA_MAGIC,
     },
+    # x86 kernel: no cxx_eh_fixer (like EFI32): kernel32 C++ EH/SEH needs the
+    # KTHREAD.ExceptionList in KPCR/GS-based memory, which cannot be linked
+    # into self-contained shellcode the way executables with a TEB can.
     _PLATFORM_KERNEL_32: {
         'prefix':            KM_PREFIX_32,
         'relocs':            RELOCS_32,

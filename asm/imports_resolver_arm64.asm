@@ -26,13 +26,19 @@
 // imports_resolver64.asm's own offset comments field-by-field (see each
 // %define below, each commented with its x64-resolver analog).
 //
-// No registers need saving/restoring at entry or exit: like
-// entrypoint_resolver_arm64.asm, this stub never touches SP, and AAPCS64
-// needs no shadow space (an x64-Windows-ABI-only quirk), so SP stays
-// 16-byte-aligned (as the OS guarantees at process entry) across every
-// internal `blr` call into GetProcAddress/LoadLibraryA. Nothing downstream
-// (relocations_resolver_arm64.asm) depends on any of this stub's registers,
-// so x19-x29 are used freely as scratch/persistent state.
+// x30 carries the loader's return address from test_loader's indirect call.
+// Every `blr` below overwrites it (that high value survives in x30 even after
+// the callee returns), so a PE whose leaf `main` ends in `ret` would land back
+// inside this stub and loop forever with the entrypoint stub (the real
+// windows-11-arm CI hang in test_19/20/21 - CRT-based PEs never return through
+// x30 because the CRT exits via ExitProcess, which is why only the import-only
+// leaf-main PEs hung). Fix: stash x30 on the stack at entry, reload it in
+// _done right before the fall-through. Like entrypoint_resolver_arm64.asm,
+// AAPCS64 needs no shadow space (an x64-Windows-ABI-only quirk); the 16-byte
+// save keeps SP 16-byte-aligned (as the OS guarantees at process entry) across
+// every internal `blr` call into GetProcAddress/LoadLibraryA. Nothing
+// downstream (relocations_resolver_arm64.asm) depends on this stub's
+// registers except x30, which is restored - so x19-x29 are used freely.
 //
 // Register map (persistent across this stub's body):
 //   x20 = current IAT write-destination cursor (thunk-walk phase)
@@ -81,6 +87,10 @@
 %define IMPORT_BY_NAME_HINT_SIZE      0x02   ; skip IMAGE_IMPORT_BY_NAME.Hint to reach its Name
 %define IMAGE_ORDINAL_FLAG64_BIT      63     ; high bit of a PE32+ thunk entry = import-by-ordinal
 %define ORDINAL_NUMBER_MASK           0xFFFF
+
+    ; -- x30 save (see header): loader return address must survive the blrs.
+    sub sp, sp, #0x10
+    str x30, [sp]
 
     ; -- Phase 1: PEB walk (x18 = TEB pointer, already valid on ARM64 -
     ; no memory read needed for the base, unlike x64's "mov rax,[gs:0x60]")
@@ -219,6 +229,7 @@ _next_desc:
     b _desc_loop
 
 _done:
+    ldr x30, [sp], #0x10                           ; restore the loader's return address
     ret                                               ; terminal (c0 03 5f d6) - stripped by peor
                                                         ; (_IMPORTS_TAIL_ARM64, already defined in
                                                         ; _chain_builder.py for the Linux ARM64 chain)

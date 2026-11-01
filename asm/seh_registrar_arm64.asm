@@ -23,11 +23,13 @@
 // TEB access: x18 directly HOLDS the TEB pointer on ARM64 Windows (see the comment
 // block on imports_resolver_arm64.asm) - no memory read needed for the base.
 //
-// AAPCS64 needs no shadow space; SP is never touched, so it stays 16-byte-aligned
-// (as the OS guarantees at process entry) at the `blr` call. x30 is clobbered by the
-// blr, same accepted pattern as every other call-bearing ARM64 stub in this chain.
-// x19 is preserved verbatim (never written) - the ARM64 analog of the x64 registrar
-// preserving RBX across this stub.
+// AAPCS64 needs no shadow space; x30 is stashed on the stack at entry (16-byte
+// aligned SP once #0x10 is subtracted, as the OS guarantees at process entry) and
+// reloaded in _done before the fall-through: the `blr` below would otherwise
+// overwrite the loader's return address and strand a leaf-main PE's `ret` back in
+// this stub, looping forever with the entrypoint stub (the real windows-11-arm CI
+// hang behind test_19/20/21). x19 is preserved verbatim (never written) - the
+// ARM64 analog of the x64 registrar preserving RBX across this stub.
 //
 // Register map:
 //   x9, x10, x11, x12, x13, x14, x15 = lookup / loop scratch (not preserved)
@@ -55,6 +57,11 @@
 %define EXPORT_ADDR_NAME_ORDINALS_OFF     0x24
 %define RAFT_STR_LEN                      0x14   ; len("RtlAddFunctionTable\0") = 20 (19 chars + NUL)
 %define ARM64_RUNTIME_FUNCTION_SIZE       0x8    ; IMAGE_ARM64_RUNTIME_FUNCTION_ENTRY = 2 DWORDs
+
+    ; -- x30 save: the single `blr x24` below would clobber the loader's return
+    ; address; _done reloads it before the fall-through.
+    sub sp, sp, #0x10
+    str x30, [sp]
 
     ldr w9, [x19, PE_E_LFANEW_OFFSET]
     add x9, x19, x9                               ; x9 = PE's NT headers VA
@@ -126,3 +133,4 @@ _raft_cmp:
     blr x24                                       ; RtlAddFunctionTable(FT, count, base)
 
 _done:
+    ldr x30, [sp], #0x10                           ; restore the loader's return address

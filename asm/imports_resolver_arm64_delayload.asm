@@ -12,6 +12,10 @@
 // callee-saved because x86 stubs downstream depend on them; here nothing downstream
 // (cxx_eh_fixer/seh/tls/ctors/entrypoint) depends on x20-x28, and AAPCS64 needs no
 // shadow space, so the same free use of x20-x29 as imports_resolver_arm64.asm applies.
+// Exception: x30 carries the loader's return address and every `blr` below clobbers
+// it, so it is stashed on the stack at entry and reloaded in _done before the
+// fall-through (same x30 discipline imports_resolver_arm64.asm's header documents;
+// without it a leaf-main PE loops forever between its ret and the entrypoint stub).
 //
 // ImgDelayDescr layout (grAttrs=1, RVA format, modern MSVC - same struct the x64
 // resolver documents):
@@ -56,6 +60,10 @@
 %define IMPORT_BY_NAME_HINT_SIZE      0x02   ; skip IMAGE_IMPORT_BY_NAME.Hint to reach its Name
 %define IMAGE_ORDINAL_FLAG64_BIT      63     ; high bit of a PE32+ thunk entry = import-by-ordinal
 %define ORDINAL_NUMBER_MASK           0xFFFF
+
+    ; -- x30 save (see header): loader return address must survive the blrs.
+    sub sp, sp, #0x10
+    str x30, [sp]
 
     ; -- Phase 1: PEB walk (x18 = TEB) -> kernel32 DllBase in x21.
     ; Same three-hop module-list walk imports_resolver_arm64.asm uses (the running
@@ -170,4 +178,5 @@ _next_desc:
     b _desc_loop
 
 _done:
+    ldr x30, [sp], #0x10                            ; restore the loader's return address
     ret                                           ; terminal (c0 03 5f d6) - stripped by peor

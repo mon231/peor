@@ -15,9 +15,11 @@
 // NT+24+112, entry 9 at NT+24+112+9*8 = NT+0xD0 - the same value tls_callbacks64.asm
 // uses, independent of machine type.
 //
-// x30 is clobbered by the `blr` calls, exactly like every earlier stub in the ARM64
-// chain's call-bearing pieces (imports resolver, ctors runner) that already handle
-// being scheduled after such clobbering.
+// x30 is stashed on the stack at entry and reloaded in _done before the fall-through:
+// the `blr` calls would otherwise overwrite the loader's return address and strand a
+// leaf-main PE's `ret` back in the chain, looping with the entrypoint stub (the real
+// windows-11-arm CI hang behind test_19/20/21). The 16-byte save keeps SP 16-byte
+// aligned across every internal `blr` call into a callback.
 //
 // Register map:
 //   x9  = NT headers VA
@@ -30,6 +32,10 @@
 %define IMAGE_TLS_DIRECTORY64_CALLBACKS_OFF  0x18    ; IMAGE_TLS_DIRECTORY64.AddressOfCallBacks
 %define DLL_PROCESS_ATTACH                   0x01
 %define CALLBACK_SLOT_SIZE                   0x08    ; 64-bit callback pointer array entries
+
+    ; -- x30 save: the `blr` below would clobber the loader's return address.
+    sub sp, sp, #0x10
+    str x30, [sp]
 
     ldr w9, [x19, PE_E_LFANEW_OFFSET]
     add x9, x19, x9                               ; x9 = NT headers VA
@@ -50,4 +56,5 @@ _loop:
     b _loop
 
 _done:
+    ldr x30, [sp], #0x10                           ; restore the loader's return address
     ; x19 = PE base; fall through to next shellcode.

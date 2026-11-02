@@ -29,6 +29,8 @@ NOT built here — needs MSBuild, see tests/tests.sln:
 """
 import sys
 import importlib.util
+import shutil
+import platform
 import subprocess
 from pathlib import Path
 
@@ -198,7 +200,19 @@ def build_linux_test_pes() -> None:
     gpp32_cmd, gpp32_wsl = ts._find_mingw_gpp_posix_32()
 
     def _use_wsl_or(cmd, wsl):
-        return bool(wsl) if cmd is not None else None
+        if cmd is None:
+            return None
+        if wsl:
+            return True
+        # MSYS2's mingw64\bin has no cross-prefixed dlltool/etc. (they live in
+        # x86_64-w64-mingw32\bin, not on PATH), so the linux-PE helpers would
+        # crash with FileNotFoundError. Flip to the WSL cross toolchain, which
+        # is the reference baseline for these targets.
+        if platform.system() == "Windows" and "msys" in (shutil.which(cmd[0]) or "").lower() \
+                and ts._wsl_bash_run(f"which {cmd[0]}",
+                                     capture_output=True, timeout=60).returncode == 0:
+            return True
+        return False
 
     # 01: dedicated helpers already exist for both arches.
     if gcc64_cmd is not None:

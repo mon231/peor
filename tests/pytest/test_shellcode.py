@@ -1987,8 +1987,15 @@ def _compile_cpp_pe(gcc_src: Path, out: Path, use_wsl: Optional[bool],
     freestanding_src = _CPP_EH_SUPPORT_DIR / "freestanding.c"
     seh_linux64_src  = _CPP_EH_SUPPORT_DIR / "seh_linux64.c"
 
-    arch_tag = arch  # "x64" or "x86" — used in temp file names to avoid conflicts
+    arch_tag = arch  # "x64" or "x86" - used in temp file names to avoid conflicts
     use_wsl = use_wsl or False
+    if (is_efi or is_linux) and not use_wsl and platform.system() == "Windows" \
+            and "msys" in (shutil.which(gpp) or "").lower() \
+            and _wsl_bash_run(f"which {gpp}", capture_output=True, timeout=60).returncode == 0:
+        # MSYS2 GCC 16's mingwex/libsupc++ drag Windows CRT imports that
+        # freestanding.c does not cover for EFI/Linux chains; the WSL
+        # cross-g++ links these targets cleanly (the reference baseline).
+        use_wsl = True
 
     # On i686 MinGW COFF, C symbols get a leading underscore prefix, so the
     # linker entry point name must include it.  x64 COFF has no such prefix.

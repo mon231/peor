@@ -1111,6 +1111,44 @@ def _build_linux_write_pe(tmp_path: Path, use_wsl: bool) -> "Path | None":
     return exe
 
 
+_LLVM_DLLTOOL_VERSION_CANDIDATES = range(21, 14, -1)  # llvm-dlltool-21 .. llvm-dlltool-15
+
+
+def _find_llvm_dlltool(clang_path: str) -> "str | None":
+    """Return a path to llvm-dlltool matching clang_path's toolchain, or None.
+
+    The Windows LLVM installer ships an unversioned llvm-dlltool.exe next to clang.exe,
+    but Ubuntu's clang/llvm packages (used by every ARM64/ARM32 Linux CI job) typically
+    install only version-suffixed binary names (llvm-dlltool-21) with no plain
+    "llvm-dlltool" on PATH - so this tries several resolution strategies rather than
+    assuming either shape.
+    """
+    windows_sibling = Path(clang_path).parent / "llvm-dlltool.exe"
+    if windows_sibling.exists():
+        return str(windows_sibling)
+    found = shutil.which("llvm-dlltool")
+    if found:
+        return found
+    unix_sibling = Path(clang_path).parent / "llvm-dlltool"
+    if unix_sibling.exists():
+        return str(unix_sibling)
+    # Debian/Ubuntu version-suffixed name: try clang's own suffix first (e.g.
+    # "clang-18" -> "llvm-dlltool-18"), then a few recent versions as a fallback.
+    clang_name = Path(clang_path).name
+    suffix = clang_name[len("clang"):] if clang_name.startswith("clang") else ""
+    candidates = [f"llvm-dlltool{suffix}"] if suffix else []
+    candidates += [f"llvm-dlltool-{v}" for v in _LLVM_DLLTOOL_VERSION_CANDIDATES]
+    for name in candidates:
+        found = shutil.which(name)
+        if found:
+            return found
+    for llvm_bin_dir in sorted(Path("/usr/lib").glob("llvm-*/bin"), reverse=True):
+        candidate = llvm_bin_dir / "llvm-dlltool"
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
 def _build_linux_write_pe_arm64(tmp_path: Path) -> "Path | None":
     """Cross-compile tests/Linux/01_linux_write/main.c as an ARM64 PE with libc.so.6 imports.
 
@@ -1148,9 +1186,7 @@ def _build_linux_write_pe_arm64(tmp_path: Path) -> "Path | None":
         # Windows host without native aarch64-w64-mingw32 clang (no clang on PATH here):
         # run the identical steps through WSL's clang + llvm-dlltool.
         return _wsl_build_linux_arm64_libc_pe(def_file, imp_lib, obj_file, src, stable)
-    llvm_dlltool = str(Path(clang).parent / "llvm-dlltool.exe")
-    if not Path(llvm_dlltool).exists():
-        llvm_dlltool = shutil.which("llvm-dlltool")
+    llvm_dlltool = _find_llvm_dlltool(clang)
     if not llvm_dlltool:
         return None
 
@@ -1237,9 +1273,7 @@ def _build_linux_write_pe_arm32(tmp_path: Path) -> "Path | None":
     clang = _find_clang_arm32()
     if not clang:
         return None
-    llvm_dlltool = str(Path(clang).parent / "llvm-dlltool.exe")
-    if not Path(llvm_dlltool).exists():
-        llvm_dlltool = shutil.which("llvm-dlltool")
+    llvm_dlltool = _find_llvm_dlltool(clang)
     if not llvm_dlltool:
         return None
 
@@ -2838,9 +2872,7 @@ def _build_linux_crt_pe_arm64(tmp_path: Path) -> "Path | None":
         # Windows host without native aarch64-w64-mingw32 clang: identical
         # steps through WSL's clang + llvm-dlltool.
         return _wsl_build_linux_arm64_libc_pe(def_file, imp_lib, obj_file, src, stable)
-    llvm_dlltool = str(Path(clang).parent / "llvm-dlltool.exe")
-    if not Path(llvm_dlltool).exists():
-        llvm_dlltool = shutil.which("llvm-dlltool")
+    llvm_dlltool = _find_llvm_dlltool(clang)
     if not llvm_dlltool:
         return None
 
@@ -2896,9 +2928,7 @@ def _build_linux_crt_pe_arm32(tmp_path: Path) -> "Path | None":
     clang = _find_clang_arm32()
     if not clang:
         return None
-    llvm_dlltool = str(Path(clang).parent / "llvm-dlltool.exe")
-    if not Path(llvm_dlltool).exists():
-        llvm_dlltool = shutil.which("llvm-dlltool")
+    llvm_dlltool = _find_llvm_dlltool(clang)
     if not llvm_dlltool:
         return None
 
@@ -3107,9 +3137,7 @@ def _build_linux_signal_pe_arm64(tmp_path: Path) -> "Path | None":
         # Windows host without native aarch64-w64-mingw32 clang: identical
         # steps through WSL's clang + llvm-dlltool.
         return _wsl_build_linux_arm64_libc_pe(def_file, imp_lib, obj_file, src, stable)
-    llvm_dlltool = str(Path(clang).parent / "llvm-dlltool.exe")
-    if not Path(llvm_dlltool).exists():
-        llvm_dlltool = shutil.which("llvm-dlltool")
+    llvm_dlltool = _find_llvm_dlltool(clang)
     if not llvm_dlltool:
         return None
 
@@ -3162,9 +3190,7 @@ def _build_linux_signal_pe_arm32(tmp_path: Path) -> "Path | None":
     clang = _find_clang_arm32()
     if not clang:
         return None
-    llvm_dlltool = str(Path(clang).parent / "llvm-dlltool.exe")
-    if not Path(llvm_dlltool).exists():
-        llvm_dlltool = shutil.which("llvm-dlltool")
+    llvm_dlltool = _find_llvm_dlltool(clang)
     if not llvm_dlltool:
         return None
 

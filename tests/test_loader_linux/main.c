@@ -78,7 +78,46 @@ int main(int argc, char *argv[]) {
        No arguments needed from the loader.  The x86-32 loader is built with
        -no-pie so PLT stubs use absolute addresses instead of [ebx+N]; this
        makes the relocs-resolver's EBX=PE_base side-effect harmless. */
-    int result = ((int (*)(void))mem)();
+    /* The shellcode violates the SysV callee-saved ABI: the chain hands off
+       state in callee-saved registers (e.g. the x64 relocs resolver sets
+       RBX = PE base and falls through instead of returning).  Save/restore
+       all callee-saved registers around the call so this main() can return
+       its own exit status instead of the clobbered one. */
+#ifdef __x86_64__
+    int result;
+    asm volatile(
+        "push %%rbx\n\t"
+        "push %%rbp\n\t"
+        "push %%r12\n\t"
+        "push %%r13\n\t"
+        "push %%r14\n\t"
+        "push %%r15\n\t"
+        "call *%1\n\t"
+        "pop %%r15\n\t"
+        "pop %%r14\n\t"
+        "pop %%r13\n\t"
+        "pop %%r12\n\t"
+        "pop %%rbp\n\t"
+        "pop %%rbx\n\t"
+        : "=a"(result)
+        : "r"(mem)
+        : "memory", "cc");
+#else
+    int result;
+    asm volatile(
+        "push %%ebx\n\t"
+        "push %%esi\n\t"
+        "push %%edi\n\t"
+        "push %%ebp\n\t"
+        "call *%1\n\t"
+        "pop %%ebp\n\t"
+        "pop %%edi\n\t"
+        "pop %%esi\n\t"
+        "pop %%ebx\n\t"
+        : "=a"(result)
+        : "r"(mem)
+        : "memory", "cc");
+#endif
 
     munmap(mem, vtotal);
 

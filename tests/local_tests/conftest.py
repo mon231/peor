@@ -37,8 +37,12 @@ def wdk():
 
 
 @pytest.fixture(scope="session")
-def vm():
-    """VM harness; skips the test when the machine cannot be reached."""
+def vm(wdk):
+    """VM harness; skips the test when the machine cannot be reached.
+
+    Also trusts the local test-signing certificate in the VM's
+    Root/TrustedPeople stores, so sc start can load signed drivers.
+    """
     try:
         harness = _vmharness.VmHarness.from_env()
     except _vmharness.VmError as e:
@@ -47,6 +51,9 @@ def vm():
         pytest.skip(
             f"VM {harness._target} unreachable; boot it / start OpenSSH"
         )
+    import _signing
+    _signing.ensure_cert()
+    _signing.install_on_vm(harness)
     return harness
 
 

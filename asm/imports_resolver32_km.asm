@@ -32,7 +32,13 @@
 %define E_LFANEW_OFFSET      0x3C        ; DOS header e_lfanew offset
 %define MAX_E_LFANEW         0x400       ; reject false-positive MZ matches
 %define PAGE_SIZE            0x1000
-%define MAX_BASE_SCAN_PAGES  0x0800      ; backward MZ scan guard (pages)
+%define MAX_BASE_SCAN_PAGES  0x1000      ; backward MZ scan guard (pages).
+                                         ; IDT gate 0's handler sits deep inside
+                                         ; ntoskrnl .text: RVA 0xBCB100 on Win11
+                                         ; 26100 (0xBCB pages above the base,
+                                         ; measured with kd), so the old 0x0800
+                                         ; guard never reached the MZ and every
+                                         ; import stayed unresolved.
 %define NT32_EXPORT_DIR_RVA  0x78        ; PE32: NT headers + 0x78 = DataDir[0]
 %define NT32_IMPORT_DIR_RVA  0x80        ; PE32: NT headers + 0x80 = DataDir[1]
 %define EXP_NUMNAMES_RVA     0x18        ; export dir: NumberOfNames

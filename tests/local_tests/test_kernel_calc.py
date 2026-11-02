@@ -11,6 +11,8 @@ import uuid
 
 import pytest
 
+import _signing
+
 pytest.importorskip("peor")          # repo root is on sys.path via conftest
 
 pytestmark = pytest.mark.usefixtures("clean_vm_markers")
@@ -32,6 +34,7 @@ def test_real_kernel_calc_on_vm(wdk, vm, chain_build, tmp_path):
     """calc a+b==5 executes on the VM's real kernel via the peor chain."""
     kb = chain_build
     loader = _build(wdk, kb, tmp_path)
+    _signing.sign(wdk, loader)
 
     # VM prep: stale artifacts out of the way.
     remote_sys = rf"C:\Windows\Temp\{loader.name}"

@@ -24,7 +24,7 @@ EXTERN_C NTSTATUS NTAPI DriverEntry(PDRIVER_OBJECT Loader, PUNICODE_STRING RegPa
     UNREFERENCED_PARAMETER(Loader);
     UNREFERENCED_PARAMETER(RegPath);
     const CHAR* hexCharset = "0123456789ABCDEF";
-    const CHAR* prefix      = "PEOR_CALC=";
+    const CHAR* prefix      = "PEOR_CALC=0x";
     UNICODE_STRING path;
     CHAR           text[32];
     ULONG          dosError;

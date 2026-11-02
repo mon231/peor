@@ -12,6 +12,8 @@ import uuid
 
 import pytest
 
+import _signing
+
 pytest.importorskip("peor")
 
 pytestmark = pytest.mark.usefixtures("clean_vm_markers")
@@ -32,6 +34,7 @@ def test_real_process_run_on_vm(wdk, vm, chain_build, tmp_path):
     """A real process runs for real on the VM because of the peor chain."""
     kb = chain_build
     loader = _build(wdk, kb, tmp_path)
+    _signing.sign(wdk, loader)
 
     remote_sys = rf"C:\Windows\Temp\{loader.name}"
     remote_svc = "peorSpawnLoader" + uuid.uuid4().hex[:6]

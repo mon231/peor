@@ -73,6 +73,19 @@ NT_BASE    = 0x002D0000
 HANDLER    = NT_BASE + 0x40
 SINK       = 0x00300000
 
+# The real VM's IDT base lives in the shadow-memory KSEG (nt base minus ~2 GiB),
+# so the resolver's anchor is the gate-0 HANDLER, which sits deep inside
+# ntoskrnl .text: RVA 0xBCB100 on Win11 26100 (measured with kd).  The fake
+# default layout keeps the handler right next to the fake nt base (0x40), so a
+# deep-handler variant is built separately below: the backward MZ walk must
+# cover the whole handler-to-base distance, and the emulated guard limit is
+# exercised with an eight-megabyte-plus-one-page spacing.
+DEEP_NT_BASE  = 0x00F00000
+DEEP_NT_PAGES = 0x00900             # mapped pages of the deep fake nt image
+DEEP_HANDLER_RVA = 0x00810000       # gate-0 offset: 0x810 pages (> old 0x800)
+DEEP_HANDLER  = DEEP_NT_BASE + DEEP_HANDLER_RVA
+DEEP_NT_MAP   = DEEP_HANDLER_RVA + 0x2000
+
 DEADBEEF       = 0xDEADBEEF
 CALC_RESULT    = 5                # RtlUlongAdd(3, 2) fake-stub return
 PROC_NTSTATUS  = 0
@@ -338,18 +351,19 @@ _ARCH_SETUP = {
 }
 
 
-def _run_kernel_chain(kind: str, arch: str, blob: bytes, features, tmp_path):
+def _run_kernel_chain(kind: str, arch: str, blob: bytes, features, tmp_path,
+                      nt_base=NT_BASE, nt_map=0x2000, handler=HANDLER):
     setup = _ARCH_SETUP[arch]
     fake_nt, stub_rva = _build_fake_ntoskrnl(_EXPORT_KIND_NAME[kind], _STUBS[kind][arch])
-    stub_va = NT_BASE + stub_rva
+    stub_va = nt_base + stub_rva
 
     uc = Uc(UC_ARCH_X86, setup['mode'])
     uc.mem_map(SC_BASE, SC_SIZE)
     uc.mem_write(SC_BASE, blob)
     uc.mem_map(STACK_BASE, STACK_SIZE)
     uc.mem_map(IDT_BASE, 0x1000)
-    uc.mem_map(NT_BASE, 0x2000)
-    uc.mem_write(NT_BASE, fake_nt)
+    uc.mem_map(nt_base, nt_map)
+    uc.mem_write(nt_base, fake_nt)
     uc.mem_map(SINK, 0x1000)
     uc.mem_write(SINK, b'\xc3')
 
@@ -368,8 +382,8 @@ def _run_kernel_chain(kind: str, arch: str, blob: bytes, features, tmp_path):
 
     _write_idtr(uc, IDT_BASE)
     gate = bytearray(setup['gate_size'])                     # x64 gate 16 B / x86 8 B
-    struct.pack_into('<H', gate, 0x00, HANDLER & 0xFFFF)     # low16
-    struct.pack_into('<H', gate, 0x06, (HANDLER >> 16) & 0xFFFF)
+    struct.pack_into('<H', gate, 0x00, handler & 0xFFFF)     # low16
+    struct.pack_into('<H', gate, 0x06, (handler >> 16) & 0xFFFF)
     uc.mem_write(IDT_BASE, bytes(gate))
 
     hits = []
@@ -441,6 +455,27 @@ def test_kernel_calc(arch, tmp_path):
         f"calc result {uc.reg_read(ax_reg):#x} != 5"
     )
     _assert_iat_slot(uc, chain_len, arch, NT_BASE + _NT_STUB_RVA)
+
+
+@pytest.mark.parametrize("arch", ["x64", "x86"])
+def test_kernel_idt_gate_far_from_nt_base(arch, tmp_path):
+    """Gate-0 handler 8 MiB + 1 page above the nt base (real-VM geometry).
+
+    Win11 26100 puts the gate-0 handler at nt RVA 0xBCB100 (~12 MiB, measured
+    with kd), so the backward MZ walk must cover more than the old 0x0800
+    guard.  The handler here sits 0x810 pages above the fake nt base: barely
+    beyond the old guard, well inside the mapping.
+    """
+    raw = _build_driver('calc', arch)
+    features = _detect_pe_features(PE(str(_to(tmp_path, 'calc', arch, raw))))
+    sc = _shellcodify('calc', arch, raw, tmp_path)
+    uc, chain_len, stub_va, ax_reg = _run_kernel_chain(
+        'calc', arch, sc, features, tmp_path,
+        nt_base=DEEP_NT_BASE, nt_map=DEEP_NT_MAP, handler=DEEP_HANDLER)
+    assert uc.reg_read(ax_reg) == CALC_RESULT, (
+        f"deep-nt calc result {uc.reg_read(ax_reg):#x} != 5"
+    )
+    _assert_iat_slot(uc, chain_len, arch, stub_va)
 
 
 @pytest.mark.parametrize("arch", ["x64", "x86"])

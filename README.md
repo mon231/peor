@@ -513,9 +513,9 @@ pytest tests/pytest -v
 | — | `01_linux_write_x86` | x86 | Same as above but compiled as PE32 with i686-w64-mingw32-gcc; uses x86 Linux chain and 32-bit loader | stdout=PEOR |
 | — | `01_linux_write_arm64` | arm64 | Same as above but cross-compiled with clang+lld (`aarch64-w64-mingw32`) and llvm-dlltool; uses the ARM64 Linux chain (page-aligned PE base, see ADRP alignment note above) and runs under `qemu-aarch64` user-mode emulation | stdout=PEOR |
 | — | `02_linux_cpp_exceptions` | x64, x86 | Linux C++ shellcode: `throw`/`catch` a custom type, return code 42 for typed catch, 88 for catch-all; x64 uses Windows-SEH emulator (`seh_linux64.c`) | 42 |
-| — | `03_linux_with_crt` | x64, x86 | Linux PE using `strlen`/`malloc`/`free`/`memcpy` from `libc.so.6`; tests multi-symbol dlopen/dlsym resolver | 73 |
-| — | `04_linux_signal` | x64, x86 | Linux PE installing SIGUSR1 handler via `signal()`, raising it via `raise()`, returns 77; tests signal-handling imports | 77 |
-| — | `05_linux_global_ctor` | x64, x86 | Linux C++ PE with a global constructor that increments a counter; `main` asserts `counter == 99`; tests `.init_array` runner | 99 |
+| — | `03_linux_with_crt` | x64, x86, arm64 | Linux PE using `strlen`/`malloc`/`free`/`memcpy` from `libc.so.6`; tests multi-symbol dlopen/dlsym resolver; arm64 cross-compiled with clang+lld, runs under `qemu-aarch64` | 73 |
+| — | `04_linux_signal` | x64, x86, arm64 | Linux PE installing SIGUSR1 handler via `signal()`, raising it via `raise()`, returns 77; tests signal-handling imports | 77 |
+| — | `05_linux_global_ctor` | x64, x86, arm64 | Linux C++ PE with a global constructor that increments a counter; `main` asserts `counter == 99`; tests `.init_array` runner; arm64 build has no C++ EH runtime involved (no throw/catch), so it needs none of 02's blockers (see note below) | 99 |
 | — | `01_efi_hello` | x64, x86, arm64, arm32 | Minimal EFI application PE; peor converts it; EFI loader with embedded shellcode boots under QEMU+OVMF/AAVMF; shellcode calls ResetSystem(Shutdown) | QEMU exit 0 |
 | — | `02_efi_print` | x64, x86, arm64, arm32 | EFI shellcode uses ConOut->OutputString to print "PEOR\_EFI\_HELLO"; checks QEMU stdout | PEOR\_EFI\_HELLO in stdout |
 | — | `03_efi_simple_calc` | x64, x86, arm64, arm32 | EFI shellcode computes sum(0..99)=4950, prints "PEOR\_4950" via ConOut; checks QEMU stdout | PEOR\_4950 in stdout |
@@ -534,6 +534,28 @@ runner.  Building the Linux PE test binaries requires `gcc-mingw-w64-x86-64`,
 `g++-mingw-w64-i686`, `gcc`, and `gcc-multilib`.  EFI QEMU tests additionally
 require `qemu-system-x86` and `ovmf`.  On Windows, tests use WSL for compilation
 and the native Windows loader for execution.
+
+**Linux ARM64**: `01_linux_write`, `03_linux_with_crt`, `04_linux_signal`, and
+`05_linux_global_ctor` additionally run as `arm64`, built with `clang`+`lld`
+(`aarch64-w64-mingw32`, since real mingw-w64 has no aarch64 target) and
+`llvm-dlltool`, and executed natively (`ubuntu-24.04-arm` CI) or under
+`qemu-aarch64` user-mode emulation elsewhere. **`02_linux_cpp_exceptions` is
+deliberately not ported to arm64 or arm32**: x64/x86 get their C++
+exception-handling runtime (`__cxa_throw`/`__cxa_begin_catch`/
+`__gxx_personality_seh0`/typeinfo vtables) from real mingw-w64 GCC's statically
+linked `libgcc_eh.a`/`libsupc++.a`, and no such library exists for
+`aarch64-w64-mingw32` or `armv7-w64-mingw32` under clang+lld — confirmed
+empirically (linking a trivial throw/catch for that target fails with the
+entire C++ EH ABI undefined, not one missing piece). Building a general-purpose
+EH runtime for either cross target would be its own dedicated research effort
+(see `tests/cpp_eh_support/sjlj_arm32.c`, the EFI ARM32 precedent, for what that
+costs even for one fixed function's codegen), out of scope here. **Linux
+ARM32** is written but parked everywhere (build helpers exist, not wired into
+pytest's parametrize lists): building the PE itself only needs the
+`armv7-w64-mingw32` clang+lld toolchain (already used by the EFI ARM32 tests),
+but *running* it needs a real ARM32 Linux ELF test loader, which needs an
+`arm-linux-gnueabihf` glibc cross-toolchain or the `armhf` runtime libraries —
+unavailable in this project's dev environment as of this writing.
 
 ---
 

@@ -184,6 +184,7 @@ def build_linux_loaders() -> None:
     loader_arm64 = ts._ensure_linux_loader_arm64()
     _report(
         "linux loader arm64", loader_arm64 is not None,
+        "" if loader_arm64 is not None else
         "aarch64 loader not built (need gcc on an aarch64 host, cross aarch64-linux-gnu-gcc "
         "on x86_64 Linux, or aarch64-linux-gnu-gcc inside WSL on Windows)",
     )

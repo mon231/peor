@@ -91,7 +91,15 @@ typedef struct _PEOR_UPP {
 } PEOR_UPP;
 #pragma pack(pop)
 
+#ifdef _WIN64
 typedef char peor_upp_layout_check[(sizeof(PEOR_UPP) == 0x88) ? 1 : -1];
+#define PEOR_UPP_SIZE 0x88
+#else
+/* x86 (32-bit) pointers shrink every PVOID field; the struct size changes,
+ * the documented x64 layout does not apply. */
+typedef char peor_upp_layout_check[(sizeof(PEOR_UPP) == 0x50) ? 1 : -1];
+#define PEOR_UPP_SIZE 0x50
+#endif
 
 /* String-composition slots inside the allocated params page. */
 #define PEOR_STR_IMAGE      0x200
@@ -162,7 +170,7 @@ static VOID PeorFillProcessParameters(PVOID ParamsBase,
     PEOR_UPP* upp = (PEOR_UPP*)ParamsBase;
 
     upp->MaximumLength         = PEOR_PARAMS_ALLOCSZ;     /* whole page */
-    upp->Length                = 0x88;                    /* struct size */
+    upp->Length                = PEOR_UPP_SIZE;           /* struct size */
     upp->Flags                 = PEOR_UPP_NORMALIZED;
     upp->DebugFlags            = 0;
     upp->ConsoleHandle         = NULL;
@@ -373,8 +381,14 @@ EXTERN_C NTSTATUS NTAPI DriverEntry(PDRIVER_OBJECT Loader, PUNICODE_STRING RegPa
         PeorAppendHexA(text, &at, sizeof(text),
                        (ULONG)(((ULONG_PTR)imageBase) & 0xFFFFFFFF));
         PeorAppendStrA(text, &at, sizeof(text), "+0x");
+#ifdef _WIN64
         PeorAppendHexA(text, &at, sizeof(text),
                        (ULONG)(((ULONG_PTR)imageBase) >> 32));
+#else
+        /* x86 image bases have no high word; shifting a 32-bit ptr by 32
+         * would be C4293 (treated as an error under the WDK's /WX). */
+        PeorAppendHexA(text, &at, sizeof(text), 0);
+#endif
         PeorAppendStrA(text, &at, sizeof(text), " ENTRYRVA=");
         PeorAppendHexA(text, &at, sizeof(text), entryRva);
     }

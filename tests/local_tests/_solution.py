@@ -28,6 +28,8 @@ _MSBUILD_DEFAULT = (
 )
 _SOLUTION_NAME = "peor_kernel_tests.sln"
 _OUT_DIRNAME = "out"
+_DEF_PATH = (
+    pathlib.Path(__file__).resolve().parent / "solution" / "ntoskrnl_x86.def")
 
 # The worst chain prologue peor emits, per target platform. km64: the
 # chain saves the full callee-saved set (push rbx, rbp, rsi, rdi, then
@@ -71,6 +73,40 @@ def verify_kernel_chain_prologue(blob: bytes, platform: str) -> None:
             f"peor chain output unexpected prologue: {blob[:8].hex()}")
 
 
+def _find_vc_lib() -> pathlib.Path:
+    """lib.exe beside MSBuild: newest VS VC host tools first."""
+    cands = sorted(_MSBUILD_DEFAULT.parents[3].glob(
+        r"VC\Tools\MSVC\*\bin\HostX64\x64\lib.exe"), reverse=True)
+    if cands:
+        return cands[0]
+    raise SolutionError(
+        "lib.exe not found: install Visual Studio with the C++ toolset")
+
+
+def _ensure_win32_import_libs(solution_dir: pathlib.Path) -> None:
+    """Generate the WDK's removed x86 kernel import libs from the .def.
+
+    The WDK 10.0.28000.0 no longer ships lib\\km\\x86, so the Win32
+    configurations link against stubs generated from solution\\ntoskrnl_x86.def
+    (see win32_kernel.props for the full story). Regenerates only when the
+    .def is newer than the generated library.
+    """
+    def_file = solution_dir / "ntoskrnl_x86.def"
+    lib_file = solution_dir / _OUT_DIRNAME / "libs" / "Win32" / "ntoskrnl.lib"
+    if lib_file.is_file() and lib_file.stat().st_mtime >= def_file.stat().st_mtime:
+        return
+    lib_file.parent.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.run(
+        [str(_find_vc_lib()), f"/def:{def_file.absolute()}", "/machine:x86",
+         f"/out:{lib_file.absolute()}"],
+        capture_output=True, text=True, timeout=120,
+    )
+    if proc.returncode != 0:
+        raise SolutionError(
+            f"lib.exe /def:{def_file.name} failed rc={proc.returncode}\n"
+            f"{proc.stdout[-2000:]}\n{proc.stderr[-1000:]}")
+
+
 class SolutionBuild:
     """Artifacts of one solution build (config x platform)."""
 
@@ -105,6 +141,8 @@ class Solution:
             raise SolutionError(f"unknown config {config!r}")
         if platform not in _CHAIN_PROLOGUE:
             raise SolutionError(f"unknown platform {platform!r}")
+        if platform == "Win32":
+            _ensure_win32_import_libs(self.root)
         proc = subprocess.run(
             [str(self.msbuild), str(self.sln),
              "/p:Configuration=" + config, "/p:Platform=" + platform,

@@ -8,6 +8,8 @@ arch prologue bytes the peor CLI always emits.
 """
 from __future__ import annotations
 
+import re
+
 import pytest
 
 import _solution
@@ -39,3 +41,39 @@ def test_solution_build_produces_drivers_and_chains(config, platform, solution):
     release_bin = solution.build("Release", platform).chain_bin("calc")
     debug_bin = solution.build("Debug", platform).chain_bin("calc")
     assert release_bin != debug_bin  # per-config OutDir, no shared artifact
+
+
+@pytest.mark.parametrize("name", ["loader", "calc", "spawn"])
+def test_win32_stub_def_covers_x64_kernel_imports(solution, name):
+    """ntoskrnl_x86.def must cover every ntoskrnl import the x64 build makes.
+
+    The x86 stubs are hand-maintained (WKD ships no km\\x86 anymore); a
+    payload growing an import the .def misses would break the Win32 link for
+    a driver that still links on x64.
+    """
+    pefile = pytest.importorskip("pefile")
+    built = solution.build("Release", "x64")
+    sys_imports = set()
+    pe = pefile.PE(str(built.sys(name)), fast_load=True)
+    pe.parse_data_directories(
+        [pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"]])
+    for entry in getattr(pe, "DIRECTORY_ENTRY_IMPORT", []):
+        sys_imports.update(
+            imp.name.decode() for imp in entry.imports)
+
+    def_names = set()
+    in_exports = False
+    for line in _solution._DEF_PATH.read_text(encoding="utf-8").splitlines():
+        token = line.strip()
+        if not token or token.startswith(";"):
+            continue
+        if token == "EXPORTS":
+            in_exports = True
+            continue
+        if not in_exports:
+            continue
+        m = re.match(r"^@?([A-Za-z_][A-Za-z0-9_$]*?)(?:@\d+)?$", token)
+        if m:
+            def_names.add(m.group(1))
+    missing = sys_imports - def_names
+    assert not missing, f"ntoskrnl_x86.def missing: {sorted(missing)}"

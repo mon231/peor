@@ -59,10 +59,13 @@ def _assemble_shellcodes():
     """Assemble all ASM resolver sources into peor/_shellcodes.py via keystone."""
     import keystone
 
-    def assemble(asm_path, arch, mode, patch_pe_offset=False):
+    def assemble(asm_path_or_src, arch, mode, patch_pe_offset=False, src_is_string=False):
         ks = keystone.Ks(arch, mode)
         ks.syntax = keystone.KS_OPT_SYNTAX_NASM
-        src = _preprocess_asm(Path(asm_path).read_text())
+        if src_is_string:
+            src = asm_path_or_src
+        else:
+            src = _preprocess_asm(Path(asm_path_or_src).read_text())
         encoding, _ = ks.asm(src)
         if encoding is None:
             raise RuntimeError(f"keystone assembly failed for {asm_path}")
@@ -139,14 +142,32 @@ def _assemble_shellcodes():
     dl32     = assemble(ASM_DIR / 'imports_resolver32_delayload.asm', keystone.KS_ARCH_X86, keystone.KS_MODE_32)
     dl64     = assemble(ASM_DIR / 'imports_resolver64_delayload.asm', keystone.KS_ARCH_X86, keystone.KS_MODE_64)
 
+    # Kernel-mode (subsystem NATIVE) chain: import + entrypoint resolvers, plus
+    # the callee-save prologue that always opens the kernel chain. The prologue
+    # is restored by entrypoint_resolver_km{32,64}, so it must be runnable as
+    # the first stub of the chain (same pattern as the ARM32 EFI prefix).
+    i64_km   = assemble(ASM_DIR / 'imports_resolver64_km.asm',        keystone.KS_ARCH_X86, keystone.KS_MODE_64)
+    i32_km   = assemble(ASM_DIR / 'imports_resolver32_km.asm',        keystone.KS_ARCH_X86, keystone.KS_MODE_32)
+    km_prefix_64 = assemble("push rbx\npush rbp\npush rsi\npush rdi\n"
+                            "push r12\npush r13\npush r14\npush r15",
+                            keystone.KS_ARCH_X86, keystone.KS_MODE_64,
+                            src_is_string=True)
+    km_prefix_32 = assemble("push ebx\npush ebp\npush esi\npush edi",
+                            keystone.KS_ARCH_X86, keystone.KS_MODE_32,
+                            src_is_string=True)
+
     e32_raw  = assemble(ASM_DIR / 'entrypoint_resolver32.asm',        keystone.KS_ARCH_X86, keystone.KS_MODE_32)
     e64_raw  = assemble(ASM_DIR / 'entrypoint_resolver64.asm',        keystone.KS_ARCH_X86, keystone.KS_MODE_64)
+    e_km64_raw = assemble(ASM_DIR / 'entrypoint_resolver_km64.asm',   keystone.KS_ARCH_X86, keystone.KS_MODE_64)
+    e_km32_raw = assemble(ASM_DIR / 'entrypoint_resolver_km32.asm',   keystone.KS_ARCH_X86, keystone.KS_MODE_32)
     e_efi64_raw     = assemble(ASM_DIR / 'entrypoint_resolver_efi64.asm',      keystone.KS_ARCH_X86, keystone.KS_MODE_64)
     e_efi32_raw     = assemble(ASM_DIR / 'entrypoint_resolver_efi32.asm',      keystone.KS_ARCH_X86, keystone.KS_MODE_32)
     # Verify EP_RVA_MAGIC appears exactly once in each entrypoint resolver (peor patches it at conversion time)
     for ep_name, ep_raw in [
         ('entrypoint_resolver32.asm',          e32_raw),
         ('entrypoint_resolver64.asm',          e64_raw),
+        ('entrypoint_resolver_km64.asm',       e_km64_raw),
+        ('entrypoint_resolver_km32.asm',       e_km32_raw),
         ('entrypoint_resolver_efi64.asm',      e_efi64_raw),
         ('entrypoint_resolver_efi32.asm',      e_efi32_raw),
         ('entrypoint_resolver_efi_arm64.asm',  e_efi_arm64_raw),
@@ -156,6 +177,8 @@ def _assemble_shellcodes():
             raise RuntimeError(f"Expected exactly one EP_RVA_MAGIC 0xCECECECE in {ep_name}")
     e32         = e32_raw
     e64         = e64_raw
+    e_km64      = e_km64_raw
+    e_km32      = e_km32_raw
     e_efi64     = e_efi64_raw
     e_efi32     = e_efi32_raw
     e_efi_arm64 = e_efi_arm64_raw
@@ -218,6 +241,12 @@ def _assemble_shellcodes():
         f"DELAY_IMPORTS_64_UM    = bytes.fromhex('{dl64.hex()}')\n"
         f"ENTRYPOINT_32          = bytes.fromhex('{e32.hex()}')\n"
         f"ENTRYPOINT_64          = bytes.fromhex('{e64.hex()}')\n"
+        f"ENTRYPOINT_KM64        = bytes.fromhex('{e_km64.hex()}')\n"
+        f"ENTRYPOINT_KM32        = bytes.fromhex('{e_km32.hex()}')\n"
+        f"IMPORTS_64_KM          = bytes.fromhex('{i64_km.hex()}')\n"
+        f"IMPORTS_32_KM          = bytes.fromhex('{i32_km.hex()}')\n"
+        f"KM_PREFIX_64           = bytes.fromhex('{km_prefix_64.hex()}')\n"
+        f"KM_PREFIX_32           = bytes.fromhex('{km_prefix_32.hex()}')\n"
         f"ENTRYPOINT_EFI64       = bytes.fromhex('{e_efi64.hex()}')\n"
         f"ENTRYPOINT_EFI32       = bytes.fromhex('{e_efi32.hex()}')\n"
         f"SEH_REGISTRAR_32       = bytes.fromhex('{s32.hex()}')\n"

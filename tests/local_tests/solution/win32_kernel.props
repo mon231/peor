@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Win32 (x86) kernel-build overrides for the WDK 10.0.28000.0 targets.
+
+The installed WDK removed x86 kernel-mode support: its
+WindowsDriver.Common.targets errors on kernel x86 whenever
+WindowsTargetPlatformVersion > 10.0.22000.0, and lib\km\x86 no longer
+ships ntoskrnl/hal/wmilib/BufferOverflowFastFailK. Imported by each
+.vcxproj only for Win32 configurations. x64 keeps the stock WDK path.
+
+Resolution:
+ - WindowsTargetPlatformVersion pinned at the WDK's TargetPlatformVersion_CO
+   (10.0.22000.0, == not >) so the x86-kernel error block never fires. No
+   build\10.0.22000.0 folder is needed; WDKBuildFolder stays 10.0.28000.0.
+ - Import libs are generated from solution\ntoskrnl_x86.def (kernel API
+   names + stdcall arg counts) into out\libs\Win32 before each build
+   (Solution.build in _solution.py runs lib.exe for this).
+ - /GS- /guard:cf- drop the security-cookie and CFG symbols that normally
+   come from BufferOverflowFastFailK.lib, so the driver links against
+   ntoskrnl import stubs only; the entry point is our own NTAPI
+   DriverEntry@8 instead of the (removed) GsDriverEntry@8 wrapper.
+-->
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup Condition="'$(Platform)'=='Win32'">
+    <WindowsTargetPlatformVersion>10.0.22000.0</WindowsTargetPlatformVersion>
+    <PeorX86LibDir>$(SolutionDir)out\libs\Win32\</PeorX86LibDir>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Platform)'=='Win32'">
+    <ClCompile>
+      <AdditionalOptions>/GS- /guard:cf- %(AdditionalOptions)</AdditionalOptions>
+      <ControlFlowGuard></ControlFlowGuard>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>$(PeorX86LibDir)ntoskrnl.lib</AdditionalDependencies>
+      <EntryPointSymbol>DriverEntry@8</EntryPointSymbol>
+      <!-- No guard lib (BufferOverflowFastFailK) backs /guard:cf on x86: no
+           load config symbol, LNK4266. The stock WDK x64 build keeps CFG. -->
+      <TreatLinkerWarningAsErrors>false</TreatLinkerWarningAsErrors>
+    </Link>
+  </ItemDefinitionGroup>
+  <!-- only still-missing symbol after dropping BufferOverflowFastFailK.lib -->
+  <ItemGroup Condition="'$(Platform)'=='Win32'">
+    <ClCompile Include="$(MSBuildThisFileDirectory)..\kernelsrc\win32_crt.c" />
+  </ItemGroup>
+</Project>

@@ -10,14 +10,19 @@ from peor._pe_features import (
     IMAGE_DIRECTORY_ENTRY_IMPORT,
     _PLATFORM_LINUX, _PLATFORM_EFI,
     _PLATFORM_LINUX_32, _PLATFORM_EFI_32, _PLATFORM_EFI_ARM64, _PLATFORM_EFI_ARM32,
-    _POSIX_CUI_SUBSYSTEM, _EFI_SUBSYSTEMS, _MACHINE_ARM64, _MACHINE_ARMNT, _MACHINE_ARMTHUMB,
+    _PLATFORM_KERNEL, _PLATFORM_KERNEL_32,
+    _POSIX_CUI_SUBSYSTEM, _EFI_SUBSYSTEMS, _NATIVE_SUBSYSTEM,
+    _MACHINE_I386, _MACHINE_AMD64, _MACHINE_ARM64, _MACHINE_ARMNT, _MACHINE_ARMTHUMB,
 )
 from peor._shellcodes import (
     RELOCS_32, RELOCS_64,
     IMPORTS_32_UM, IMPORTS_64_UM,
     IMPORTS_64_LINUX, IMPORTS_32_LINUX,
+    IMPORTS_64_KM, IMPORTS_32_KM,
     DELAY_IMPORTS_32_UM, DELAY_IMPORTS_64_UM,
     ENTRYPOINT_32, ENTRYPOINT_64,
+    ENTRYPOINT_KM64, ENTRYPOINT_KM32,
+    KM_PREFIX_64, KM_PREFIX_32,
     ENTRYPOINT_EFI64, ENTRYPOINT_EFI32,
     SEH_REGISTRAR_32, SEH_REGISTRAR_64,
     TLS_CALLBACKS_32, TLS_CALLBACKS_64,
@@ -182,6 +187,49 @@ _SHELLCODES = {
         'ep_rva_magic':      _EP_RVA_MAGIC,
         'pe_align':          4096,
     },
+    # Kernel-mode chains (subsystem IMAGE_SUBSYSTEM_NATIVE drivers). The
+    # prologue saves the loader's callee-save registers; the kernel entrypoint
+    # restores them and returns DriverEntry's NTSTATUS to the loader.
+    # Exceptions work like the EFI/user-mode chains: cxx_eh_fixer64 hooks
+    # RtlPcToFileHeader in the IAT (resolved by the kernel import resolver from
+    # ntoskrnl) so RtlDrawException's ThrowInfo RVA math AND x64 SEH unwind
+    # (RtlLookupFunctionEntry -> RtlPcToFileHeader) find this non-registered
+    # image. No new asm is needed: the fixer is runtime-agnostic (only needs
+    # RBX = PE base, set by relocations_resolver64 earlier in the chain).
+    _PLATFORM_KERNEL: {
+        'prefix':            KM_PREFIX_64,
+        'relocs':            RELOCS_64,
+        'imports':           IMPORTS_64_KM,
+        'delay_imports':     b'',
+        'entrypoint':        ENTRYPOINT_KM64,
+        'seh':               b'',
+        'seh_always':        False,
+        'tls':               b'',
+        'cxx_eh_fixer':      CXX_EH_FIXER_64,
+        'cxx_pe_size_magic': _CXX_EH_PE_SIZE_MAGIC_64,
+        'cxx_iat_rva_magic': _CXX_EH_IAT_RVA_MAGIC_64,
+        'tail':              _IMPORTS_TAIL_32,
+        'dir_array_offset':  112,
+        'disp32_off':        9,
+        'ep_rva_magic':      _EP_RVA_MAGIC,
+    },
+    # x86 kernel: no cxx_eh_fixer (like EFI32): kernel32 C++ EH/SEH needs the
+    # KTHREAD.ExceptionList in KPCR/GS-based memory, which cannot be linked
+    # into self-contained shellcode the way executables with a TEB can.
+    _PLATFORM_KERNEL_32: {
+        'prefix':            KM_PREFIX_32,
+        'relocs':            RELOCS_32,
+        'imports':           IMPORTS_32_KM,
+        'delay_imports':     b'',
+        'entrypoint':        ENTRYPOINT_KM32,
+        'seh':               b'',
+        'seh_always':        False,
+        'tls':               b'',
+        'tail':              _IMPORTS_TAIL_32,
+        'dir_array_offset':  96,
+        'disp32_off':        8,
+        'ep_rva_magic':      _EP_RVA_MAGIC,
+    },
 }
 
 
@@ -209,6 +257,18 @@ def _select_chain(features: PeFeatures, platform: "str | None" = None) -> dict:
         return _SHELLCODES[_PLATFORM_EFI_32 if features.pe_type == OPTIONAL_HEADER_MAGIC_PE else _PLATFORM_EFI]
     if features.subsystem == _POSIX_CUI_SUBSYSTEM:
         return _SHELLCODES[_PLATFORM_LINUX_32 if features.pe_type == OPTIONAL_HEADER_MAGIC_PE else _PLATFORM_LINUX]
+    if features.subsystem == _NATIVE_SUBSYSTEM:
+        # Kernel-mode drivers: auto-select from the subsystem, or honor an
+        # explicit --platform kernel64/kernel32 (validation already checked
+        # the combination is legal).
+        if platform in (_PLATFORM_KERNEL, _PLATFORM_KERNEL_32):
+            return _SHELLCODES[platform]
+        if features.machine not in (_MACHINE_AMD64, _MACHINE_I386):
+            raise ValueError(
+                f"Kernel-mode PE with machine 0x{features.machine:04X} is not "
+                "supported (only x86 and x64)"
+            )
+        return _SHELLCODES[_PLATFORM_KERNEL_32 if features.pe_type == OPTIONAL_HEADER_MAGIC_PE else _PLATFORM_KERNEL]
     entry = _SHELLCODES.get(features.pe_type)
     if entry is None:
         raise ValueError(f"Unsupported PE type: 0x{features.pe_type:04X}")

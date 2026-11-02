@@ -1987,8 +1987,15 @@ def _compile_cpp_pe(gcc_src: Path, out: Path, use_wsl: Optional[bool],
     freestanding_src = _CPP_EH_SUPPORT_DIR / "freestanding.c"
     seh_linux64_src  = _CPP_EH_SUPPORT_DIR / "seh_linux64.c"
 
-    arch_tag = arch  # "x64" or "x86" — used in temp file names to avoid conflicts
+    arch_tag = arch  # "x64" or "x86" - used in temp file names to avoid conflicts
     use_wsl = use_wsl or False
+    if (is_efi or is_linux) and not use_wsl and platform.system() == "Windows" \
+            and "msys" in (shutil.which(gpp) or "").lower() \
+            and _wsl_bash_run(f"which {gpp}", capture_output=True, timeout=60).returncode == 0:
+        # MSYS2 GCC 16's mingwex/libsupc++ drag Windows CRT imports that
+        # freestanding.c does not cover for EFI/Linux chains; the WSL
+        # cross-g++ links these targets cleanly (the reference baseline).
+        use_wsl = True
 
     # On i686 MinGW COFF, C symbols get a leading underscore prefix, so the
     # linker entry point name must include it.  x64 COFF has no such prefix.
@@ -2873,8 +2880,8 @@ def test_no_imports_flag(arch, tmp_path):
 
 
 @pytest.mark.parametrize("arch", ["x86", "x64"])
-def test_kernel_mode_rejected(arch, tmp_path):
-    """peor must reject kernel-mode PEs (subsystem 1) with an error message."""
+def test_kernel_mode_accepted(arch, tmp_path):
+    """Kernel support (subsystem 1): peor accepts NATIVE PEs and emits shellcode."""
     pe_path = ARCH_DIRS[arch] / "01_simple_calc.exe"
     assert pe_path.exists(), f"{pe_path.name} not found — build tests/tests.sln first"
 
@@ -2885,14 +2892,15 @@ def test_kernel_mode_rejected(arch, tmp_path):
     km_path = tmp_path / f"kernel_{arch}.exe"
     km_path.write_bytes(bytes(pe_bytes))
 
+    out = tmp_path / "out.bin"
     result = subprocess.run(
-        [sys.executable, "-m", "peor", "-i", str(km_path), "-o", str(tmp_path / "out.bin")],
+        [sys.executable, "-m", "peor", "-i", str(km_path), "-o", str(out)],
         capture_output=True, text=True, timeout=30,
     )
-    assert result.returncode != 0, "peor should reject kernel-mode PE but returned 0"
-    assert "kernel" in result.stderr.lower() or "subsystem" in result.stderr.lower(), (
-        f"Expected 'kernel' or 'subsystem' in stderr:\n{result.stderr}"
+    assert result.returncode == 0, (
+        f"peor should accept kernel-mode PE; stderr:\n{result.stderr}"
     )
+    assert out.exists() and out.stat().st_size > 0
 
 
 def test_find_export_rva_not_found(tmp_path):

@@ -1,0 +1,25 @@
+LIBRARY ntoskrnl
+; x86 import names for the Win32 kernel-build stubs. Generated with:
+;   lib.exe /def:ntoskrnl_x86.def /machine:x86 /out:out\libs\Win32\ntoskrnl.lib
+; Names + stdcall arg-byte counts must match the runtime exports of the
+; 32-bit ntoskrnl.exe the VM kernel32 drivers load against. Keep in sync with
+; the x64 build (the driver sources are shared). FASTCALL imports carry the
+; '@'-prefix decoration (x86 only).
+
+EXPORTS
+    DbgPrint
+    memset
+    RtlInitUnicodeString@8
+    ExAllocatePool2@16
+    ExFreePoolWithTag@8
+    ZwCreateFile@44
+    ZwQueryInformationFile@20
+    ZwReadFile@36
+    ZwWriteFile@36
+    ZwClose@4
+    RtlNtStatusToDosError@4
+    MmGetSystemRoutineAddress@4
+    ObReferenceObjectByHandle@24
+    @ObfDereferenceObject@4
+    KeStackAttachProcess@8
+    KeUnstackDetachProcess@4

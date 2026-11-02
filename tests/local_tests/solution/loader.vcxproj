@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Kernel-mode SCM loader for the peor local tests: the FIXED driver.
+     Reads the peor chain shellcode from C:\shellcode at run time
+     (kernelsrc/loader_core.c); Carries no payload data. -->
+<Project DefaultTargets="Build" ToolsVersion="12.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|Win32">
+      <Configuration>Debug</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|Win32">
+      <Configuration>Release</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{B7134C9F-1FC1-4A6B-A03E-9CBBFC26A0F5}</ProjectGuid>
+    <WindowsTargetPlatformVersion>10.0.28000.0</WindowsTargetPlatformVersion>
+    <WDKBuildFolder>10.0.28000.0</WDKBuildFolder>
+    <ProjectName>loader</ProjectName>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Driver</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <DriverType>WDM</DriverType>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <Import Project="$(MSBuildThisFileDirectory)win32_kernel.props" />
+  <PropertyGroup>
+    <TargetName>peor_$(ProjectName)</TargetName>
+    <OutDir>$(SolutionDir)out\$(Configuration)\$(PlatformName)\</OutDir>
+    <IntDir>$(SolutionDir)out\$(Configuration)\$(PlatformName)\obj\$(ProjectName)\</IntDir>
+    <AdditionalIncludeDirectories>$(ProjectDir)..\kernelsrc;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    <Inf2Cat>false</Inf2Cat>
+    <SignMode>Off</SignMode>
+  </PropertyGroup>
+  <ItemGroup>
+    <ClCompile Include="..\kernelsrc\loader_core.c" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

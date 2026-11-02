@@ -12,7 +12,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
 #define NOP_SLED_MAX_OFFSET 1024
@@ -30,13 +29,17 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    struct stat st;
-    if (fstat(fd, &st) < 0 || st.st_size <= 0) {
+    /* glibc's fstat wrapper can fail on 32-bit builds against modern
+       filesystem/kernel combinations (statx-based, seen on WSL2 drvfs), so
+       probe the size with lseek instead. */
+    off_t fsize = lseek(fd, 0, SEEK_END);
+    if (fsize <= 0) {
         fprintf(stderr, "bad file size\n");
         close(fd);
         return 1;
     }
-    size_t size = (size_t)st.st_size;
+    lseek(fd, 0, SEEK_SET);
+    size_t size = (size_t)fsize;
 
     /* Keep nop_offset 16-byte aligned so the PE image is always 16-byte aligned
        for MOVDQA/MOVAPS instructions in the shellcode. */
